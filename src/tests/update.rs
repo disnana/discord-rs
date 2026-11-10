@@ -18,6 +18,39 @@ async fn scheduler_advances_jobs_automatically() {
 }
 
 #[tokio::test]
+async fn failed_candidate_records_its_error_and_keeps_serving() {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target-codex-verify")
+        .join(format!("worker-failure-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let file = directory.join("worker-path.txt");
+    let missing = directory.join("does-not-exist.exe");
+    std::fs::write(&file, missing.to_string_lossy().as_bytes()).unwrap();
+    let manager = Manager::start_pool(PathBuf::from(env!("CARGO_BIN_EXE_src")), 1)
+        .await
+        .unwrap();
+    let task = tokio::spawn(manager.clone().watch(file.clone()));
+    let error_path = src::worker::error_file(&file);
+    for _ in 0..50 {
+        if error_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(error_path).unwrap()).unwrap();
+    assert_eq!(value["path"].as_str(), missing.to_str());
+    assert!(!value["error"].as_str().unwrap().is_empty());
+    assert_eq!(
+        manager.dispatch("!ping".into()).await.unwrap().as_deref(),
+        Some("Pong! 🦀")
+    );
+    task.abort();
+    drop(manager);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn switches_real_workers_and_retains_old_worker_on_failure() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_src"));
     let directory =

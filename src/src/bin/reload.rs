@@ -54,6 +54,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut status_path = file.as_os_str().to_owned();
     status_path.push(".status");
     let status_path = PathBuf::from(status_path);
+    let mut error_path = status_path.as_os_str().to_owned();
+    error_path.push(".error");
+    let error_path = PathBuf::from(error_path);
     println!("Botに切り替えを依頼しました。確認中...");
     for _ in 0..100 {
         if fs::read_to_string(&status_path)
@@ -61,6 +64,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             println!("更新しました！ Workerのビルド: {build}");
             return Ok(());
+        }
+        if let Ok(content) = fs::read_to_string(&error_path)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&content)
+            && value["path"].as_str() == Some(binary.to_string_lossy().as_ref())
+        {
+            let reason = value["error"].as_str().unwrap_or("不明なエラー");
+            return Err(format!(
+                "Worker更新に失敗しました: {reason}（更新要求は残っており、コアが再試行します）"
+            )
+            .into());
         }
         thread::sleep(Duration::from_millis(200));
     }

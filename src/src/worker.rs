@@ -29,6 +29,12 @@ pub fn status_file(file: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+pub fn error_file(file: &Path) -> PathBuf {
+    let mut path = status_file(file).into_os_string();
+    path.push(".error");
+    PathBuf::from(path)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
@@ -328,8 +334,17 @@ impl Manager {
                             {
                                 eprintln!("Workerの状態を記録できません: {error}");
                             }
+                            let _ = tokio::fs::remove_file(error_file(&file)).await;
                         }
-                        Err(error) => eprintln!("Workerの更新に失敗しました: {error}"),
+                        Err(error) => {
+                            eprintln!("Workerの更新に失敗しました: {error}");
+                            let detail = serde_json::json!({"path": path.to_string_lossy(), "error": error.to_string()});
+                            if let Err(write_error) =
+                                tokio::fs::write(error_file(&file), detail.to_string()).await
+                            {
+                                eprintln!("更新エラーを記録できません: {write_error}");
+                            }
+                        }
                     }
                 }
                 Ok(_) => eprintln!("Worker指定ファイルが空です"),

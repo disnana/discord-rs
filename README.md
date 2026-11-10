@@ -2,19 +2,33 @@
 
 ## 起動
 
-以前のBotを起動している場合は、最初に一度停止してください。管理コンソールは、そのコンソールから起動したBotだけを管理します。PowerShellで `src` フォルダを開き、トークンを環境変数に設定して管理コンソールを起動します。
+以前のBotを手動で起動している場合は、最初に一度停止してください。コアは自分が起動したBotだけを管理します。PowerShellで `src` フォルダを開き、トークンを環境変数に設定して起動します。
 
 ```powershell
 cd "D:\data-backup\code\コード保存\discord-rs\src"
 $env:DISCORD_TOKEN = 'Botのトークン'
-cargo run --bin manage
+cargo run --bin manage -- start
 ```
 
-コンソールに `start` と入力するとBotをビルドして起動します。その後は `status`（プロセスの状態）、`update`（Worker更新）、`stop`（停止）、`restart`（親プロセスの再起動）、`help`、`quit`（Botを停止して管理コンソールを終了）が使えます。Botのログも同じ画面に表示されます。終了には `quit` を使ってください。強制終了やウィンドウを閉じた場合、Botが残る可能性があります。`stop`・`restart`・`quit` は親を停止するため、メモリ内のジョブや状態は消えます。`status` はプロセスの生存確認であり、Discordへの接続成功を保証しません。
+コマンド実行後は端末に戻り、コアとBotは裏で動き続けます。以後は別の端末からでも同じフォルダで次を実行できます。
+
+```powershell
+cargo run --bin manage -- status
+cargo run --bin manage -- update
+cargo run --bin manage -- logs
+cargo run --bin manage -- stop
+cargo run --bin manage -- start
+cargo run --bin manage -- restart
+cargo run --bin manage -- shutdown
+```
+
+`stop` はBotだけを止め、コアは維持します。`shutdown` は両方を終了します。`stop`・`restart`・`shutdown` は親を停止するため、メモリ内のジョブや状態は消えます。`restart` は現在の親バイナリを再起動し、コードの再ビルドはしません。`status` はプロセスの生存確認と直近の異常終了を表示しますが、Discordへの接続成功を保証しません。ログは `src/core-runtime/core.log` に記録されます。Botが異常終了した場合、コアは最大3回自動再起動を試し、60秒の安定稼働後に回数をリセットします。
+
+現在のコアは管理要求を直列で処理するため、`update` のビルド中は `status` などの他の管理要求とBotの異常終了監視が待機します。Botの通常処理自体は別プロセスで続きます。
 
 ## 更新
 
-Botを起動したまま、例えば `src/cogs/general.rs` の `!ping` の応答を変更し、管理コンソールで `update` と入力します。別のPowerShellから更新する場合は次を実行します。
+Botを起動したまま、例えば `src/cogs/general.rs` の `!ping` の応答を変更し、`cargo run --bin manage -- update` を実行します。Workerの更新コマンドを直接使う場合は次を実行します。
 
 ```powershell
 cd "D:\data-backup\code\コード保存\discord-rs\src"
@@ -43,4 +57,4 @@ Workerごとの要求は直列で、親全体の処理待ちは最大64件です
 
 Worker障害時は最後に応答を受け取った状態から再起動を試みます。この状態は親のメモリにしかなく、親の停止では失われます。失敗・タイムアウトした要求の結果は不明で、自動再送しません。現在再開できるのは上記の計算ジョブのみで、任意の関数の実行途中や外部API呼び出しを移動するものではありません。仕事に外部への副作用を追加する場合は、重複を防ぐ設計が別途必要です。永続キュー、Discord上の更新コマンドは未実装です。Discordやプロセスの障害まで含む無停止・無損失は保証しません。Worker数の変更時は担当先が変わるため、状態を分配し直す仕組みも必要です。
 
-更新用ファイル `worker-path.txt` と `workers` フォルダは、信頼できる管理者のみが書き込める場所に置いてください。これらへの書き込みは任意のプログラム実行につながります。`DISCORD_WORKER_FILE` を指定する場合は、Botと更新コマンドの両方に同じ絶対パスを設定してください。
+更新用ファイル `worker-path.txt` と `workers` フォルダは、信頼できる管理者のみが書き込める場所に置いてください。これらへの書き込みは任意のプログラム実行につながります。`core-runtime/core.json` はローカル管理用の認証情報を含みます。Windowsでは親フォルダのアクセス権を継承するため、他のユーザーが読み書きできないようにしてください。`DISCORD_WORKER_FILE` を指定する場合は、コアと更新コマンドの両方に同じ絶対パスを設定してください。コアはローカルのTCPポート39483を使い、別ポートが必要なら `DISCORD_CORE_PORT` を各コマンドで統一してください。

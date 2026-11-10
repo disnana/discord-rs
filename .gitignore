@@ -1,6 +1,7 @@
 src/target/
 src/target-codex-verify/
 src/workers/
+src/core-runtime/
 src/worker-path.txt*
 .idea/
 .vscode/
