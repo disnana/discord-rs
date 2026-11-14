@@ -30,8 +30,8 @@
 ユーザー指示: 「Claude が PM。コードは基本的に Claude が直接書かず、CLI ツールを使って並列に進める。承認を求めず自律的に」。本番デプロイ・破壊的操作・秘密情報の変更のみ事前確認する。
 
 ### ツール併用・モデル方針
-- **Codex CLI の利用枠状況**: 利用枠が尽きた（2026-11-18 18:17 頃まで中断）。
-- **Codex 利用方針（再開後）**: コスパ重視とし、**Luna max の高速モードを主**、**Terra は medium**、**Astra は設計・最終チェックのみ**とする。
+- **Codex CLI の位置づけ（2026-11-14 更新）**: ユーザーの ChatGPT プランが Pro から Plus に下がり、5 時間の利用制限もあるため、Codex は主戦力にしない。軽い作業の補助に限る（使う場合は Terra=medium、設計精査のみ Astra）。
+- **実装の主体**: Claude 本体＋Claude のサブエージェント（モデル指定なし。Haiku は Claude Code の再起動後に使える）＋ agy。大きな作業（Gateway と Core の分離など）も Claude が段階に分けて進める。
 - **Antigravity CLI（agy）の併用**: Codex が使えない間および併用時は Antigravity CLI を使用する。
   - コマンド例: `agy -p "<prompt>" --model gemini-3.8-flash-high --mode accept-edits`
   - 利用可能モデル: `gemini-3.8-flash-high`（主）, `gemini-3.8-flash-medium`, `gemini-3.8-flash-low`, `claude-opus-4-6-thinking`, `claude-sonnet-4-6`。
@@ -131,3 +131,9 @@ cargo run --bin doctor -- examples/placement.toml --resolved-shards bot-two=1
 | [quorum-evaluation.md](quorum-evaluation.md) / [shard-runtime-design.md](shard-runtime-design.md) / [local-response-management.md](local-response-management.md) | 設計・評価 |
 | [developer-guide.md](developer-guide.md) / [operator-guide.md](operator-guide.md) | 利用ガイド |
 | [real-discord-verification.md](real-discord-verification.md) | 実 Discord 検証手順書（ユーザー実施用） |
+
+### 検証環境（2026-11-14 追加）
+- **WSL2 の Ubuntu 24.04（systemd 動作）**: Rust 1.90.0 導入済み。ソースは `git archive` で WSL 内（`~/discord-rs`）に展開してビルドする（`/mnt/d` 上のビルドは遅い）。ビルドは `-j 6`〜`8` 程度で短時間に。重い全体試験の繰り返しは GitHub Actions に任せる。
+- 実 systemd の確認: `deploy/dev/wsl-systemd-smoke.sh`（模擬 Discord、終了時に後片付け）。実 Discord を使う本番相当の試験は `docs/real-operations-verification.md`。token は `deploy/dev/set-token.sh` で `/etc/discord-rs/botd.env`（0640）に保存し、チャットやコマンドに書かない。
+- 実 Discord の結果（2026-11-14）: 常駐・`/ping`・`!ping`・`!count`・ワーカーの `kill -9` からの復旧は成功。Gateway の `kill -9` は、実 Discord では自動復旧しない（Identify の許可が未接続）→ 修正中。Gateway/botd の再起動で `!count` が 0 に戻る（Core が Gateway の子で、状態が Gateway のメモリ上にあるため。設計の Gateway/Core 分離が通常経路では未実装）→ 設計書を作成中（`docs/gateway-core-separation-design.md`）。
+
