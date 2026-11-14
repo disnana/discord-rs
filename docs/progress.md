@@ -248,3 +248,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
   - サブエージェントの作業ツリー `.claude/worktrees/agent-a8a6c25f16f001e16`: Gateway と Core の分離の設計書（`docs/gateway-core-separation-design.md`）。
   - 上の 2 つは、完了時にコミットされる想定。作業ツリーに未コミットの変更が残っていれば、内容を確認してから取り込む。
 - **次にやること（優先順）**: (a) `wip/identify-merge` の CI 結果を確認して main に反映 → WSL で Gateway の `kill -9` を再試験。(b) 永続化のブランチを取り込み、WSL でビルド・対象試験 → CI → 実機で `!count` が再起動後も続くか確認。(c) 設計書を読み、Gateway と Core の分離を段階実装（実装の主体は Claude とサブエージェント。Codex は Plus で 5 時間制限のため補助のみ）。(d) Gateway の無停止更新（セッション引き継ぎと Resume）は分離の後。
+
+### 追記（終了直前）
+- 永続化のサブエージェントが完了: ブランチ `worktree-agent-accc796218e0e2c02`（ac1588b、`src/src/core_state.rs` ほか。保存は約 0.5 秒ごとに変化を検知し最短 2 秒間隔、停止時に必ず保存、起動時に復元。イベントのジャーナル・カーソルは保存せず、`kill -9` では最大約 2.5 秒分が失われる）。
+- Identify 許可と永続化を合わせた版を `wip/combined`（origin に push 済み）で CI 実行中。**この版は main に未反映。CI が全ジョブ緑になったら main に反映し、WSL で Gateway の `kill -9` と、再起動後の `!count` 継続を実機で確認する。**
+- 設計書のサブエージェント（`docs/gateway-core-separation-design.md`）は作業中。完了していれば `worktree-agent-a8a6c25f16f001e16` に出る。
