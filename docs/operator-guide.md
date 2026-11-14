@@ -93,7 +93,7 @@ botctl status --secret-file ABS_SECRET --port PORT --json
 
 既定ではdaemon起動時にローカルShardを起動します。`--no-autostart` を追加すると、起動を `botctl start` まで保留できます。`startup_ok` は初回起動要求の結果であり、以後の実状態は `status` で確認します。Gatewayの環境は初期化し、通常モードではそのBot用のtokenとBot/Shard/起動世代だけを注入します。`PATH` や他Botの環境は継承しません（過去のWindows開発機用コードには `SystemRoot` を追加継承する処理が存在しますが、Windowsはサポート外です）。identity用4変数はtoken参照名に使えません。
 
-Gatewayが起動するWorkerはさらに `env_clear` するため、任意名のBot tokenもCoreへ渡しません。状態・Worker更新監視ファイル・計画上のIPC/管理パスはBot/Shard別です。業務状態はメモリ内であり、状態パスの割当が永続化やGateway再起動時の復元を意味するわけではありません。
+Gatewayが起動するWorkerはさらに `env_clear` するため、任意名のBot tokenもCoreへ渡しません。状態・Worker更新監視ファイル・計画上のIPC/管理パスはBot/Shard別です。業務状態の大半はメモリ内であり、状態パスの割当そのものが永続化を意味するわけではありません。例外として、Gatewayは `--state-path`（`gateway-state`）配下の `core-state.json` に、確認済みスナップショット（snapshot-v3 の `!count` カウンターと `!job` 計算状態のみ）を保存し、Gateway／botd の再起動後の最初のWorkerへ復元します（詳細は後述の「確認済みスナップショットの永続化」）。
 
 ### Discordに接続しない模擬実行
 
@@ -280,6 +280,17 @@ reloadはreleaseビルド → `src/workers/` への成果物コピー → `src/w
 実Gatewayで使う成果物にはWorkerのReady/Helloで `api-result-v1`、`command-dispatch-v1`、`slash-arguments-v1`、`ready-event-v1` を確認できることが必要です。初回起動・更新・復旧で不足する候補は採用前に拒否し、更新時の旧Workerの状態・受付を維持します。汎用Manager APIの旧v5互換は残りますが、それだけを実Gateway用成果物の適合性確認とは扱わないでください。
 
 引き継ぎ対象は `!count` のカウンターと `!job` の計算状態です。`!job start` はチャンネルごとに1個の計算を開始し、Workerの約1秒周期で進みます。`!job status`、更新、再度statusで明示的checkpointの継続を確認できます。任意のFutureや外部APIの実行途中を移動しません。StateMap/Cogの状態はsnapshot対象外です。
+
+### 確認済みスナップショットの永続化（Gateway／botd 再起動後の `!count`）
+
+Core（Worker）だけを `kill -9` した場合は、Gatewayがメモリに持つ確認済みスナップショットから新Workerへ引き継ぐため、`!count` は維持されます。Gateway プロセスや botd を再起動するとメモリは失われるため、次の永続化を追加しました。
+
+- 対象：snapshot-v3 の `!count` と `!job` の状態だけ（Bot token・イベントジャーナル・framework の `StateStore` の内容は含みません）。framework のファイル永続 StateStore とは別機構です。イベントジャーナル／カーソルは保存しません（再起動後は Discord から新しく届くイベントで再開します）。
+- 保存先：Gateway の `--state-path`（通常 `gateway-state`）直下の `core-state.json`（モード 0600、1 MiB 上限。超えたら保存せず警告のみ）。`--state-path` なしの単体起動では何も保存しません。Bot ID・Shard ID・total shards・Worker数に束縛し、別Shardのファイルは読みません。
+- 保存頻度：確認済みの状態が変化したときだけ、約0.5秒周期で検査し、書き込みは最短2秒間隔に間引きます（`!job` の約1秒周期の進行で毎回は書きません）。書き込みは一時ファイルへ書いて fsync し、rename で置換します（原子的）。コマンド処理は待ちません。Gateway 停止時（`shutdown`）は間引かずに最終状態を書きます。
+- 復元：Gateway（Manager）の起動時、最初のWorkerが受付を始める前に読み込み、既存の `Restore` 手順で各Workerへ渡します。ファイルが無い・壊れている・版や束縛が一致しない・シンボリックリンク・読めない場合は無視して空の状態で起動し、起動は失敗しません。
+- 限界：`kill -9` や電源断など `shutdown` を経ない停止では、最後の書き込み以降（最大でおよそ2.5秒分）の変化が失われます。保存の失敗は標準エラーへ警告を出すだけで処理は継続し、次の変化または停止時に再試行します。複数ホスト間の共有や quorum／lease とは無関係で、各ノードのローカルディスクのみです。
+- 検証状況：ローカル未ビルドで、CI（GitHub Actions）の検証待ちです。実Discordでの Gateway／botd 再起動後の `!count` 継続は未確認です。
 
 `DISCORD_WORKER_FILE` を使う場合は親とreloadに同じ絶対パスを渡します。更新指定ファイルと `workers/` は任意バイナリ実行につながるため、信頼する管理者だけに書込権限を限定してください。Windows ACL はサポート外（Windows非対応）です。成果物の署名検証、全ログ経路の秘密マスクは検証・実装が残っています。
 
