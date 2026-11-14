@@ -89,6 +89,7 @@ bctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json | grep
 find /var/lib/discord-rs -name gateway.log -exec tail -8 {} \;
 ```
 - **期待**：`restarts` が 1 に増え、`state: Running` に戻る。`gateway.log` に `--- gateway generation 2 ---` と `ログイン成功`。数秒〜数十秒で `/ping` が返る。
+- **ローカル Identify 許可**：同じ Bot の Identify は 30 秒以上空け、1 時間に最大 10 回（単一ホスト専用・Resume なし）。botd の初回起動から 30 秒以内に kill すると、復旧は `Pending` で 30 秒経つまで待ってから再起動する（待つ間は `restarts` が増えず、`Degraded` にならない）。1 時間に 10 回を超えると `restart_exhausted: true`（`IdentifyUnavailable`）で止まる。これは実 Discord では未検証で、CI で確認するまでローカル未ビルド。
 - **止める基準**：`restarts` が増え続ける（無限再起動）、`startup_failures` が増える、401/4004/4014 が `gateway.log` に出る。**繰り返し試さない**（Identify の消費と、短時間の再接続の繰り返しを避ける）。
 
 ## 試験 4：botd 異常終了からの自動復旧
