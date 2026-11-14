@@ -253,3 +253,6 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 永続化のサブエージェントが完了: ブランチ `worktree-agent-accc796218e0e2c02`（ac1588b、`src/src/core_state.rs` ほか。保存は約 0.5 秒ごとに変化を検知し最短 2 秒間隔、停止時に必ず保存、起動時に復元。イベントのジャーナル・カーソルは保存せず、`kill -9` では最大約 2.5 秒分が失われる）。
 - Identify 許可と永続化を合わせた版を `wip/combined`（origin に push 済み）で CI 実行中。**この版は main に未反映。CI が全ジョブ緑になったら main に反映し、WSL で Gateway の `kill -9` と、再起動後の `!count` 継続を実機で確認する。**
 - 設計書のサブエージェント（`docs/gateway-core-separation-design.md`）は作業中。完了していれば `worktree-agent-a8a6c25f16f001e16` に出る。
+
+### 訂正（終了直後）
+- Gateway と Core の分離の設計書は、サブエージェントが停止され、**未作成**（成果物なし）。次回、あらためて作成する（読み取り調査 → `docs/gateway-core-separation-design.md`）。上の『作業中』の記述は、この訂正を正とする。
