@@ -794,7 +794,11 @@ async fn run() -> Result<(), AppError> {
     } else {
         None
     };
-    let deployment = options.deployment()?;
+    let mut deployment = options.deployment()?;
+    if let Some(state) = options.path("--state-path") {
+        // Confirmed count/job state survives Gateway and botd restarts.
+        deployment = deployment.with_state_dir(state);
+    }
     let bot_id = deployment.bot_id.0;
     let shard_identity = deployment.shard;
     let watch_file = if let Some(state) = options.path("--state-path") {

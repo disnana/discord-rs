@@ -4,6 +4,7 @@ pub mod child_recovery;
 pub mod cluster;
 pub mod cluster_runtime;
 mod cogs;
+pub mod core_state;
 pub mod daemon;
 pub mod daemon_metrics;
 pub mod drain;

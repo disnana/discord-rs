@@ -60,6 +60,7 @@ pub struct DeploymentIdentity {
     core_launch: Option<crate::shard_runtime::test_switch::CoreLaunch>,
     interaction_state: Option<InteractionStateConfig>,
     recovery_config: RecoveryConfig,
+    state_dir: Option<PathBuf>,
 }
 impl DeploymentIdentity {
     pub fn from_env() -> Result<Self, AppError> {
@@ -102,7 +103,17 @@ impl DeploymentIdentity {
             core_launch: None,
             interaction_state: None,
             recovery_config: RecoveryConfig::default(),
+            state_dir: None,
         })
+    }
+
+    /// Persist the confirmed snapshot-v3 (legacy count/job) state of this Shard
+    /// under `dir` (`core-state.json`) and restore it before the first Core is
+    /// admitted. Credential-free; separate from the framework StateStore.
+    /// Ignored for the mock Gateway switch launch.
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
+        self.state_dir = Some(dir);
+        self
     }
 
     /// Trusted launch configuration, retained across replacement and recovery.
@@ -1359,6 +1370,7 @@ pub struct Manager {
     instance_id: String,
     gateway_admission: Option<StdMutex<GatewayAdmission>>,
     core_recovery: Vec<StdMutex<CoreRecovery>>,
+    persist: Option<crate::core_state::Persister>,
 }
 
 struct GatewayAdmission {
@@ -1563,6 +1575,26 @@ impl Manager {
         if count == 0 {
             return Err(failure("Worker数は1以上にしてください"));
         }
+        // Confirmed legacy count/job state persisted by an earlier Manager of
+        // this exact Shard. Any defect yields empty state, never a failure.
+        let (persist, restored) = match deployment
+            .state_dir
+            .clone()
+            .filter(|_| deployment.core_launch.is_none())
+        {
+            Some(dir) => {
+                let _ = tokio::fs::create_dir_all(&dir).await;
+                let binding = crate::core_state::Binding {
+                    bot_id: deployment.bot_id.0,
+                    shard_id: deployment.shard.id(),
+                    total_shards: deployment.shard.total(),
+                    workers: count,
+                };
+                let (persister, loaded) = crate::core_state::Persister::open(dir, binding).await;
+                (Some(persister), loaded)
+            }
+            None => (None, vec![None; count]),
+        };
         let mut workers = Vec::with_capacity(count);
         let mut generations = Vec::with_capacity(count);
         let mut core_recovery = Vec::with_capacity(count);
@@ -1578,6 +1610,17 @@ impl Manager {
                 })
                 .ok_or_else(|| failure("Core initial spawn failed"))?;
             process.prepare(&deployment, launch_policy).await?;
+            if let Some(Some(state)) = restored.get(index) {
+                // Reuse the established restore path: it re-confirms the state
+                // with the worker and records it as the checkpoint before any
+                // application work is admitted.
+                if let Err(error) = process.restore(STATE_VERSION, state.clone()).await {
+                    if process.broken {
+                        return Err(error);
+                    }
+                    eprintln!("警告: 永続化された状態を復元できないため空の状態で起動します");
+                }
+            }
             owner.confirm(&process)?;
             let generation = Generation::new(path.clone(), process);
             generations.push(RegisteredGeneration {
@@ -1612,9 +1655,11 @@ impl Manager {
             management: Mutex::new(ManagementRecord::default()),
             gateway_admission,
             core_recovery,
+            persist,
         });
         let owner = Arc::downgrade(&manager);
         tokio::spawn(async move {
+            let mut ticks = 0u8;
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 let Some(manager) = owner.upgrade() else {
@@ -1624,9 +1669,41 @@ impl Manager {
                     break;
                 }
                 manager.poll_core_recovery().await;
+                // Persist about every 500 ms; the persister itself throttles
+                // actual writes and only writes after a confirmed change.
+                ticks += 1;
+                if ticks >= 5 {
+                    ticks = 0;
+                    manager.persist_checkpoints(false).await;
+                }
             }
         });
         Ok(manager)
+    }
+
+    /// Hand the active generations' confirmed checkpoints to the persister.
+    /// Never blocks command processing: it only reads a cloned `Arc` and the
+    /// checkpoint under a short std lock, and the file write runs on a
+    /// blocking thread. Failures are warnings inside the persister.
+    async fn persist_checkpoints(&self, force: bool) {
+        let Some(persist) = &self.persist else {
+            return;
+        };
+        for (index, worker) in self.workers.iter().enumerate() {
+            let generation = if force {
+                match worker.try_read() {
+                    Ok(active) => active.clone(),
+                    Err(_) => continue,
+                }
+            } else {
+                worker.read().await.clone()
+            };
+            let transfer = generation.transfer.lock().unwrap();
+            if let Some(state) = transfer.checkpoint.as_ref() {
+                persist.observe(index, state);
+            }
+        }
+        persist.flush(force).await;
     }
 
     fn core_recovery_authorized(&self) -> bool {
@@ -2446,7 +2523,7 @@ impl Manager {
             });
             debug_assert!(candidate.is_none());
         }
-        timeout(DRAIN_DEADLINE, async {
+        let result = timeout(DRAIN_DEADLINE, async {
             let _replacement = self.replace_lock.lock().await;
             let _recovery = self.update.lock().await;
             let generations: Vec<_> = self
@@ -2515,7 +2592,12 @@ impl Manager {
             }
         })
         .await
-        .map_err(|_| failure("worker shutdown timed out"))?
+        .map_err(|_| failure("worker shutdown timed out"))
+        .and_then(|inner| inner);
+        // Final confirmed state is written unconditionally (not throttled),
+        // whether or not the drain succeeded; a write failure only warns.
+        self.persist_checkpoints(true).await;
+        result
     }
     pub async fn dispatch(&self, content: String) -> Result<Option<String>, AppError> {
         self.dispatch_key(0, content).await
