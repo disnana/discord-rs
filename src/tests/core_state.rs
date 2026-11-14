@@ -130,7 +130,11 @@ fn oversize_state_is_not_encoded_or_stored() {
     assert!(!dir.file().exists());
     // An oversize file on disk is never read.
     std::fs::write(dir.file(), vec![b' '; core_state::MAX_FILE_BYTES + 1]).unwrap();
-    assert!(core_state::load(&dir.0, &binding()).iter().all(Option::is_none));
+    assert!(
+        core_state::load(&dir.0, &binding())
+            .iter()
+            .all(Option::is_none)
+    );
 }
 
 #[test]
@@ -164,7 +168,11 @@ fn file_is_private_and_symbolic_links_are_not_followed() {
     let target = elsewhere.0.join("target.json");
     std::fs::rename(dir.file(), &target).unwrap();
     symlink(&target, dir.file()).unwrap();
-    assert!(core_state::load(&dir.0, &binding()).iter().all(Option::is_none));
+    assert!(
+        core_state::load(&dir.0, &binding())
+            .iter()
+            .all(Option::is_none)
+    );
 
     // Writing replaces the link itself and never writes through it.
     let before = std::fs::read(&target).unwrap();
