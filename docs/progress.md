@@ -237,3 +237,14 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `deploy/dev/wsl-systemd-smoke.sh` を追加（Actions の `systemd-smoke.yml` と同じ内容を手元で繰り返せる）。WSL に build-essential・pkg-config・jq と Rust 1.90.0 を導入（ユーザー許可のうえ、`wsl -u root` で apt。Rust は一般ユーザー）。release ビルドは `-j 8` で 1 分 20 秒。
 - 結果（main 69f7f74、模擬 Discord）：unit の起動（Type=notify、Watchdog）、Core ワーカーの `kill -9`（補充、Gateway は不変）、Gateway の `kill -9`（再起動）、botd の `kill -9`（systemd が再起動、`NRestarts=1`、予約が整理され Gateway が復帰）、`systemctl stop`（`Result=success`、残りプロセス 0）がすべて成功。後片付け（専用ユーザー・/etc・/opt・/var/lib・unit・プロセス）が残らないことを確認。
 
+
+## 2026-11-14 終了時点の状態と、次回の再開手順
+- **main（検証済み）**: cd4bfb7。CI（Ubuntu）全ジョブ成功、実 systemd smoke（自動復旧を含む）成功、実 Discord の基本動作（ログイン、`/ping`、`!ping`、`!count`、ワーカーの `kill -9` 復旧、`botctl stop`）は、ユーザーのサーバと WSL で確認済み。
+- **実機（WSL2 Ubuntu 24.04）**: botd は停止済み（`systemctl stop botd`、`Result=success`、残りプロセス 0）。unit、`/etc/discord-rs/{botd.env,botd.secret,bots.toml}`、`/opt/discord-rs/bin`、専用ユーザー `discord-rs` は残してある（token は `/etc/discord-rs/botd.env`、0640。値は誰にも見せていない）。再開は `sudo systemctl start botd`。不要になれば `userdel discord-rs; rm -rf /etc/discord-rs /opt/discord-rs /var/lib/discord-rs /etc/systemd/system/botd.service`。
+- **実機で見つかった未解決（修正中）**: (1) 実 Discord では Gateway の `kill -9` から自動復旧しない（`try_acquire_identify` が実 Discord の自動復旧を意図的に拒否）。(2) Gateway/botd の再起動で `!count` が 0 に戻る（Core が Gateway の子で、状態が Gateway のメモリ上。設計上の Gateway/Core 分離が通常経路では未実装）。
+- **未マージの作業**:
+  - ブランチ `wip/identify-merge`（70ee9f5）: (1) の修正（ローカルの Identify 許可: 最短 30 秒間隔・1 時間 10 回。`src/src/local_identify.rs`、`daemon.rs`）。`ci-verify` で CI と systemd smoke を実行中。緑なら main に反映し、WSL で再度 Gateway の `kill -9` を試験する（Identify を 1 回消費）。
+  - サブエージェントの作業ツリー `.claude/worktrees/agent-accc796218e0e2c02`（未コミットの可能性）: Core の確認済みスナップショット（count/job）の永続化（`src/src/core_state.rs`、`worker.rs`）。
+  - サブエージェントの作業ツリー `.claude/worktrees/agent-a8a6c25f16f001e16`: Gateway と Core の分離の設計書（`docs/gateway-core-separation-design.md`）。
+  - 上の 2 つは、完了時にコミットされる想定。作業ツリーに未コミットの変更が残っていれば、内容を確認してから取り込む。
+- **次にやること（優先順）**: (a) `wip/identify-merge` の CI 結果を確認して main に反映 → WSL で Gateway の `kill -9` を再試験。(b) 永続化のブランチを取り込み、WSL でビルド・対象試験 → CI → 実機で `!count` が再起動後も続くか確認。(c) 設計書を読み、Gateway と Core の分離を段階実装（実装の主体は Claude とサブエージェント。Codex は Plus で 5 時間制限のため補助のみ）。(d) Gateway の無停止更新（セッション引き継ぎと Resume）は分離の後。
