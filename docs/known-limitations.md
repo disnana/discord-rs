@@ -79,4 +79,5 @@
   - M5（**実装済み・CI 検証待ち**）：Bot 発の全送信（prefix の `create_message`、`!workers`、`update_response`、ephemeral 応答）に `AllowedMentions::default()` を明示（メンション解析なし）。follow-up は現状使っていない。実 Discord での挙動は未検証。ローカル未ビルド。
   - M6：token の環境変数名が不一致（Gateway と `register` は `DISCORD_TOKEN`、`discord_smoke` の既定は `DISCORD_TEST_BOT_TOKEN`）。手順書に明記した。名前の統一は未実施。
 - **低**：再接続バックオフにジッターなし（上限約 255 秒、回数の上限なし）。Identify 枠が尽きていると起動後に最大 `reset_after`（最長 24 時間）黙って待つ。単体起動は SIGTERM 未処理。DM の prefix コマンドは動かない（DIRECT_MESSAGES Intent なし）。`register` の説明文が固定。Gateway 子の環境に token があり、`/proc/PID/environ` から同一ユーザーまたは root が読める。HTTP プロキシ非対応（twilight 側）。
+- **実 Discord の Gateway 自動復旧（ローカル Identify 許可）**：実 Discord の Gateway 自動復旧は、単一ホスト・単一 botd 専用のローカル Identify 許可（Bot 単位。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回。超えると `IdentifyUnavailable` で `Degraded`）の下で有効です。初回起動と手動 start は常に許可して記録します。複数プロセス・複数ホスト間の調整は未実装、botd 再起動で履歴は消えます。セッションの Resume は未実装で、再起動のたびに Identify を 1 回消費します。ローカル未ビルドで GitHub Actions の検証待ちで、実 Discord・実機では未検証です。
 - **未実装（再掲）**：プロセス再起動をまたぐ Resume（session はメモリのみ。再起動は毎回新規 Identify）、複数プロセス・複数ホスト間の Identify 調整（プロセス内のみ）。

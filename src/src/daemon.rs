@@ -2315,6 +2315,7 @@ pub struct Daemon<C = MonotonicClock> {
     recovery_events: VecDeque<DaemonRecoveryEvent>,
     recovery_events_dropped: u64,
     require_shared_recovery_admission: bool,
+    local_identify: crate::local_identify::LocalIdentifyRegistry,
     last_now: Duration,
     clock_failed: bool,
     instance: [u8; 16],
@@ -2349,6 +2350,7 @@ struct ProcessRecoveryHost<'a, S> {
     sequence: &'a mut u64,
     manual: Option<&'a ShardKey>,
     require_shared_admission: bool,
+    local_identify: &'a mut crate::local_identify::LocalIdentifyRegistry,
     errors: BTreeMap<ShardKey, DaemonError>,
 }
 impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
@@ -2363,8 +2365,12 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         false
     }
     fn try_acquire_identify(&mut self, key: ChildKey) -> IdentifyAdmission {
-        // This legacy launcher has no Resume/Identify wire contract. botd gates
-        // automatic real-Discord recovery until such an adapter is installed.
+        // This legacy launcher has no Resume/Identify wire contract (no Resume:
+        // every start is a fresh Identify). Automatic real-Discord recovery is
+        // admitted only by the single-host, in-memory LocalIdentifyRegistry
+        // (min interval + rolling-window cap); there is no cross-process or
+        // cross-host coordination. Initial and explicit operator starts are
+        // always granted but recorded, so a crash right after them is spaced.
         // Explicit token-free simulation and trusted process-only callers keep
         // their existing lifecycle contract; neither is a Discord admission.
         let entry = self
@@ -2377,11 +2383,23 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         let since = *entry
             .admission_since
             .get_or_insert_with(std::time::Instant::now);
-        if self.require_shared_admission
-            && entry.mock_discord.is_none()
-            && self.manual != Some(&entry.snapshot.key)
-        {
-            IdentifyAdmission::Unavailable
+        let mut admission = IdentifyAdmission::Granted;
+        if entry.mock_discord.is_none() {
+            let now = std::time::Instant::now();
+            let bot = entry.snapshot.key.bot_id.as_str();
+            if self.require_shared_admission && self.manual != Some(&entry.snapshot.key) {
+                use crate::local_identify::LocalAdmission;
+                admission = match self.local_identify.try_acquire(bot, now) {
+                    LocalAdmission::Granted => IdentifyAdmission::Granted,
+                    LocalAdmission::Pending { .. } => IdentifyAdmission::Pending,
+                    LocalAdmission::Exhausted { .. } => IdentifyAdmission::Unavailable,
+                };
+            } else {
+                self.local_identify.record(bot, now);
+            }
+        }
+        if admission != IdentifyAdmission::Granted {
+            admission
         } else {
             entry.admission_since = None;
             if let Some(feed) = &entry.feed {
@@ -2621,6 +2639,7 @@ impl<C: Clock> Daemon<C> {
             recovery_events: VecDeque::new(),
             recovery_events_dropped: 0,
             require_shared_recovery_admission: false,
+            local_identify: crate::local_identify::LocalIdentifyRegistry::default(),
             last_now,
             clock_failed: false,
             instance,
@@ -2718,6 +2737,15 @@ impl<C: Clock> Daemon<C> {
     /// use the shared Bot scheduler for initial, update and recovery admission.
     pub fn require_shared_recovery_admission(&mut self) {
         self.require_shared_recovery_admission = true;
+    }
+
+    /// Replace the local Identify admission limits (clears recorded history).
+    /// Intended for tests; production uses the documented defaults.
+    pub fn set_local_identify_policy(
+        &mut self,
+        policy: crate::local_identify::LocalIdentifyPolicy,
+    ) {
+        self.local_identify.set_policy(policy);
     }
 
     pub fn take_recovery_events(&mut self) -> Vec<DaemonRecoveryEvent> {
@@ -2947,6 +2975,7 @@ impl<C: Clock> Daemon<C> {
             sequence: &mut self.sequence,
             manual,
             require_shared_admission: self.require_shared_recovery_admission,
+            local_identify: &mut self.local_identify,
             errors: BTreeMap::new(),
         };
         let mut events = self.recovery.poll(&mut host);

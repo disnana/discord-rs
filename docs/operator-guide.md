@@ -285,6 +285,8 @@ reloadはreleaseビルド → `src/workers/` への成果物コピー → `src/w
 
 ## 復旧と検証の境界
 
-`child_recovery` はdaemonのGateway監視とWorker側の復旧経路に接続されています。再試行・予算・degraded状態の観測は、孤児の再採用やホスト障害からの安全な分散復旧を意味しません。`metrics_feed` はライブラリとテストがありますがdaemonに接続されていません。
+`child_recovery` はdaemonのGateway監視とWorker側の復旧経路に接続されています。再試行・予算・degraded状態の観測は、孤児の再採用やホスト障害からの安全な分散復旧を意味しません。
+
+実 Discord の Gateway 自動復旧は、単一ホスト・単一 botd 専用のローカル Identify 許可（Bot 単位。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回。超えると `IdentifyUnavailable` で `Degraded`）の下で有効です。初回起動と手動 start は常に許可して記録します。複数プロセス・複数ホスト間の調整は未実装、botd 再起動で履歴は消えます。セッションの Resume は未実装で、再起動のたびに Identify を 1 回消費します。ローカル未ビルドで GitHub Actions の検証待ちで、実 Discord・実機では未検証です。`botctl status` では上限超過が `restart_exhausted: true`・`recovery.state` の `Degraded: IdentifyUnavailable`（`desired_running` は false）として見え、復旧イベント（監査）にも同じ理由が出ます。間隔未満の間は `Deferred`（IdentifyBudget）で待ち、再起動回数を消費せず間隔が空くと再起動します。`metrics_feed` はライブラリとテストがありますがdaemonに接続されていません。
 
 `discord_smoke` は明示実行の読み取り専用REST確認補助CLI（`src/src/bin/discord_smoke.rs`、`src/tests/discord_smoke/cli.rs`）で、GatewayやCoreを起動しません。実Discordでの検証はユーザーが実施する範囲です。性能測定の条件とLinux共有runner（Actions `ubuntu-latest`、AMD EPYC 7763 4vCPU、IPC往復 p99 = 115.5/258.1/973.6 µs、failover検知 Suspected p50 1503.6 ms / FailoverPending p50 3003.1 ms、共有ランナーで本番保証ではない、往復値で片道p99の直接測定ではない）の記録は [benchmarks.md](benchmarks.md) を参照してください。手動ワークフローとして `.github/workflows/stress.yml` と `bench.yml` が用意されていますが、更新負荷中の無停止条件は未達で `src/tests/update_load.rs` は `#[ignore]` です。
