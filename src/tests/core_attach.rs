@@ -916,3 +916,31 @@ async fn a_standby_gateway_exits_when_its_control_pipe_closes_before_activation(
     assert!(status.success(), "{status:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Sol のレビュー指摘：Core が一度提供した最高の epoch は、その接続が切れた後も下限として
+/// 残る。低い epoch は、何も接続されていない間でも再び入れない。
+#[tokio::test]
+async fn the_highest_epoch_served_stays_a_floor_after_it_disconnects() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    let mut high = attach_with_epoch(&socket, SECRET, 5).await;
+    assert!(healthy(&mut high).await);
+    drop(high);
+    // Let the Core notice the disconnect, then try a lower and an equal epoch.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut lower = attach_with_epoch(&socket, SECRET, 1).await;
+    assert!(
+        !healthy(&mut lower).await,
+        "a lower epoch must stay refused"
+    );
+    let mut equal = attach_with_epoch(&socket, SECRET, 5).await;
+    assert!(healthy(&mut equal).await, "the same epoch may reconnect");
+    let mut higher = attach_with_epoch(&socket, SECRET, 6).await;
+    assert!(healthy(&mut higher).await, "a higher epoch is served");
+
+    let _ = core.child.kill().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

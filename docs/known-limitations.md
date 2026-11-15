@@ -26,6 +26,12 @@
 - `botd --core-mode separate`（opt-in。既定は `embedded`）は Linux 限定で、`--stop-children-on-exit` を必須とし、試験用の quorum・raft・Gateway 切替の指定とは併用できません。検証は WSL の実プロセス試験（`botd_separate_cores`、模擬 Discord）のみで、実 Discord、systemd 常駐、長時間稼働、複数 Shard での separate は未検証です。
 - separate では Core の無停止差し替え（ホットスワップ）は未対応です。Gateway の `--core-dir` では Worker 更新の監視を行いません。
 - separate の `botctl gateway-update` による Gateway の無停止差し替えは、WSL と実 Discord で 1 回の更新（成功、カウンタ継続、重複 5 件の破棄）を確認しました。複数 Shard の本番運用、長時間稼働（soak）、Interaction の重複は未検証です。activate 送信後に失敗した場合の Core と旧 Gateway の状態も未検証です。
+- `gateway-update` の既知の限界（2026-11-16 夜の Codex（`gpt-6.1-sol`）レビューによる。コードで確認した指摘で、実機での再現はしていない）：
+  - 有効化の確認：botd は `activate` を送れたら監督を新 Gateway に移し、旧 Gateway に停止を要求する。候補が Core への attach に失敗しても、その時点で旧 Gateway は Core から外れているため戻せない。候補が終了すれば botd が上がった epoch で Gateway を再起動する（自己回復だが、Identify を 1 回余分に使う）。候補が attach を確認してから旧を止める「確認付き有効化」は未実装。READY のマーカーは Discord 切断後も残る。
+  - 進行中の応答：Core が接続を切り替える（fence する）とき、旧 Gateway が HTTP 送信中の応答の `ApiResult` は Core に届かないことがある（結果不明の扱い）。更新前に新規受付を止めて決着させる処理は未実装。
+  - 旧 Gateway が Core の応答を読まなくなると、Core の応答書き込みに期限がなく、epoch の引き継ぎが書き込みの終わりまで遅れ得る。
+  - ログ：`gateway-candidate.log`（更新後も新 Gateway の出力先として残る）と `core-*.log`（重複破棄の 1 行ずつ）は、起動時にしか大きさを見ない。長期稼働や更新の繰り返しで増える。ローテーションは未実装。
+  - 状態ファイルの競合は一部対策済み：書き手の epoch を `core-state.json` に記録し、低い epoch は上書きしない／一時ファイル名を pid 付きにした。ただし確認と rename は別プロセス間で不可分ではない（ロックではない）。永続化を Core 側の単一の持ち主にする設計は未実装。
 - `gateway-update` は、他の変更系コマンドと同じ role／scope の認可（`admin` かつ Bot の全 Shard が scope 内）を通ります（単体試験あり）。実行の要求と結果は `runtime-root/gateway-update-audit.jsonl`（0600、追記のみ、1 行 1 JSON：時刻・event（requested／rejected／succeeded／failed）・操作 ID・Bot・subject・role・固定のエラー種別。secret・パス・引数は含まない）に残り、記録できない要求は開始前に拒否されます。ただし完了の記録は fsync 済みでも、`update-audit.jsonl` のような単一ライターの検証付き監査（改ざん検知・世代付きローテーション）ではなく、ローテーションもありません。単一の bootstrap secret の既定 role は `admin` なので、secret を持つ者は実行できます。
 - 重複排除は Core のメモリ上で直近 4096 件の Discord message id を見るだけです。Core の再起動をまたぐ重複は検出しません。スラッシュコマンドは Discord の単一 ACK 規則（処理より前に ACK を送る）で重複を防ぐ想定ですが、実 Discord での効果は未検証です。
 - separate で botd が死亡すると Core も失われます（Core は stdin の EOF で終了）。botd の SIGKILL 時の後始末は未検証で、試験は SIGTERM による停止のみです。

@@ -1797,7 +1797,13 @@ impl Manager {
                     workers: count,
                 };
                 let (persister, loaded) = crate::core_state::Persister::open(dir, binding).await;
-                (Some(persister), loaded)
+                #[cfg(unix)]
+                let epoch = attach
+                    .as_ref()
+                    .map_or(0, |attach| attach.identity.ownership_epoch.0);
+                #[cfg(not(unix))]
+                let epoch = 0;
+                (Some(persister.with_epoch(epoch)), loaded)
             }
             None => (None, vec![None; count]),
         };

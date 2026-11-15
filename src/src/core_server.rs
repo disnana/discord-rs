@@ -213,15 +213,24 @@ pub async fn serve(
     let (fence_tx, _) = tokio::sync::watch::channel(0u64);
     let mut pending: Option<(UnixStream, u64)> = None;
     let mut acceptor = Box::pin(accept_authenticated(&listener, &secret, &failed));
+    // The highest epoch this Core has ever served. It outlives the connection that set it:
+    // once a Gateway has taken over at epoch N, no Gateway below N may attach again, even
+    // when nothing is connected at that moment.
+    let mut floor = 0u64;
     loop {
         let (stream, epoch) = match pending.take() {
             Some(next) => next,
             None => {
                 let next = acceptor.as_mut().await?;
                 acceptor = Box::pin(accept_authenticated(&listener, &secret, &failed));
+                if next.1 < floor {
+                    drop(next.0);
+                    continue;
+                }
                 next
             }
         };
+        floor = floor.max(epoch);
         let fence = Fence {
             rx: fence_tx.subscribe(),
             epoch,
@@ -235,7 +244,7 @@ pub async fn serve(
                 next = acceptor.as_mut() => {
                     let (stream, attached) = next?;
                     acceptor = Box::pin(accept_authenticated(&listener, &secret, &failed));
-                    let highest = pending.as_ref().map_or(epoch, |(_, e)| (*e).max(epoch));
+                    let highest = pending.as_ref().map_or(epoch, |(_, e)| (*e).max(epoch)).max(floor);
                     if attached < highest {
                         drop(stream);
                     } else {

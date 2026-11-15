@@ -1103,6 +1103,20 @@ async fn live_gateway(
 
 type ShardEvent = Result<Event, twilight_gateway::error::ReceiveMessageError>;
 
+/// A concurrency slot for one event. Live events are shed when the dispatcher is full
+/// (as before). Events a standby held back are replayed one at a time and WAIT for a slot
+/// instead: shedding them would silently drop events the standby had promised to keep.
+async fn event_permit(
+    capacity: &Arc<Semaphore>,
+    replaying: bool,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if replaying {
+        capacity.clone().acquire_owned().await.ok()
+    } else {
+        capacity.clone().try_acquire_owned().ok()
+    }
+}
+
 async fn live_events(
     mut shard: Shard,
     http: Arc<Client>,
@@ -1116,7 +1130,9 @@ async fn live_events(
     println!("Botを起動しています...");
     loop {
         // Events a standby Gateway held back come first, in the order they arrived.
+        let mut replaying = false;
         let result = if let Some(held) = backlog.pop_front() {
+            replaying = true;
             held
         } else {
             tokio::select! {
@@ -1138,7 +1154,7 @@ async fn live_events(
         match result {
             Ok(Event::Ready(ready)) => {
                 println!("ログイン成功: {}", ready.user.id);
-                let Ok(permit) = capacity.clone().try_acquire_owned() else {
+                let Some(permit) = event_permit(&capacity, replaying).await else {
                     eprintln!("Ready イベントを処理できません: 混雑中");
                     continue;
                 };
@@ -1155,7 +1171,7 @@ async fn live_events(
                 });
             }
             Ok(Event::MessageCreate(message)) if !message.author.bot => {
-                let Ok(permit) = capacity.clone().try_acquire_owned() else {
+                let Some(permit) = event_permit(&capacity, replaying).await else {
                     eprintln!("Workerが混雑しているためメッセージを処理できませんでした");
                     continue;
                 };
@@ -1266,7 +1282,7 @@ async fn live_events(
                 let key = channel.id.get();
                 let manager = manager.clone();
                 let http = http.clone();
-                let Ok(permit) = capacity.clone().try_acquire_owned() else {
+                let Some(permit) = event_permit(&capacity, replaying).await else {
                     eprintln!("Interaction を受け付けられません: 混雑中");
                     // Inline and short-timeout on purpose: no extra task under overload.
                     reject_interaction(

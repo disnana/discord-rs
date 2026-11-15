@@ -1175,6 +1175,13 @@ pub mod control {
             for key in &op.targets {
                 self.daemon.hold_restart(key, false);
             }
+            if op.command == "gateway-update" && failed {
+                // A standby that was never activated must not outlive its operation.
+                #[cfg(unix)]
+                for key in &op.targets {
+                    self.daemon.cancel_gateway_update(key);
+                }
+            }
             if op.command == "gateway-update"
                 && let Some(actor) = self.gateway_update_actors.get(&op.id)
             {
@@ -3129,6 +3136,14 @@ impl<C: Clock> Daemon<C> {
             command.env(name, credential);
         }
         let child = command.spawn().map_err(|_| DaemonError::SpawnFailed)?;
+        // The standby logs in with a session of its own: count it like every other explicit
+        // start, so the automatic recovery spacing sees it.
+        if entry.mock_discord.is_none() {
+            self.local_identify.record(
+                entry.snapshot.key.bot_id.as_str(),
+                std::time::Instant::now(),
+            );
+        }
         self.sequence = sequence;
         entry.candidate = Some(Candidate {
             child,

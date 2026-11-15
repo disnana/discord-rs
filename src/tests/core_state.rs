@@ -143,6 +143,7 @@ fn atomic_write_replaces_without_leaving_temporaries() {
     core_state::store(&dir.0, &binding(), &[Some(count(1)), None]).unwrap();
     // A stale temporary from a crashed writer does not block the next write.
     std::fs::write(dir.0.join(".core-state.json.tmp"), b"stale").unwrap();
+    std::fs::write(dir.0.join(".core-state.json.tmp.4294967290"), b"stale").unwrap();
     core_state::store(&dir.0, &binding(), &[Some(count(2)), None]).unwrap();
     assert_eq!(
         core_state::load(&dir.0, &binding()),
@@ -331,4 +332,36 @@ async fn count_continues_after_the_manager_is_restarted_on_the_same_state_path()
     })
     .await
     .expect("persistence integration deadline");
+}
+
+/// 更新中に 2 つの Gateway が重なっても、古い epoch の Gateway が、新しい epoch の状態を
+/// 古い状態で上書きしない。同じ epoch・高い epoch は書ける。一時ファイル名は書き手ごとに
+/// 別で、残らない。
+#[test]
+fn a_lower_epoch_never_replaces_a_state_written_by_a_higher_epoch() {
+    let dir = Dir::new();
+    let newer = [Some(count(9)), None];
+    let stale = [Some(count(2)), None];
+    core_state::store_at(&dir.0, &binding(), &newer, 5).unwrap();
+    // The older Gateway flushing at its shutdown: accepted by the call, but not written.
+    core_state::store_at(&dir.0, &binding(), &stale, 3).unwrap();
+    assert_eq!(core_state::load(&dir.0, &binding()), newer);
+    // The same epoch and a higher one still write.
+    let same = [Some(count(10)), None];
+    core_state::store_at(&dir.0, &binding(), &same, 5).unwrap();
+    assert_eq!(core_state::load(&dir.0, &binding()), same);
+    let higher = [Some(count(11)), None];
+    core_state::store_at(&dir.0, &binding(), &higher, 7).unwrap();
+    assert_eq!(core_state::load(&dir.0, &binding()), higher);
+    // A file from before epochs existed (no field) counts as epoch 0.
+    let legacy = core_state::encode(&binding(), &[Some(count(1)), None]).unwrap();
+    std::fs::write(dir.file(), legacy).unwrap();
+    core_state::store_at(&dir.0, &binding(), &newer, 1).unwrap();
+    assert_eq!(core_state::load(&dir.0, &binding()), newer);
+    let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }

@@ -50,7 +50,17 @@ struct Document {
     shard_id: u32,
     total_shards: u32,
     workers: usize,
+    /// Ownership epoch of the Gateway that wrote this file (0 for a file from before
+    /// Gateway updates existed). A Gateway with a lower epoch never replaces it.
+    #[serde(default)]
+    epoch: u64,
     states: Vec<Option<Value>>,
+}
+
+#[derive(Deserialize)]
+struct StoredEpoch {
+    #[serde(default)]
+    epoch: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -65,6 +75,15 @@ fn valid_state(value: &Value) -> bool {
 
 /// Serialize `states` (one slot per worker). Pure; no I/O.
 pub fn encode(binding: &Binding, states: &[Option<Value>]) -> Result<Vec<u8>, EncodeError> {
+    encode_at(binding, states, 0)
+}
+
+/// Like [`encode`], stamping the writer ownership epoch into the document.
+pub fn encode_at(
+    binding: &Binding,
+    states: &[Option<Value>],
+    epoch: u64,
+) -> Result<Vec<u8>, EncodeError> {
     if states.len() != binding.workers {
         return Err(EncodeError::Invalid);
     }
@@ -74,6 +93,7 @@ pub fn encode(binding: &Binding, states: &[Option<Value>]) -> Result<Vec<u8>, En
         shard_id: binding.shard_id,
         total_shards: binding.total_shards,
         workers: binding.workers,
+        epoch,
         states: states.to_vec(),
     };
     let mut bytes = serde_json::to_vec(&document).map_err(|_| EncodeError::Invalid)?;
@@ -180,11 +200,67 @@ pub fn write_atomic(dir: &Path, name: &str, temp: &str, bytes: &[u8]) -> io::Res
 
 /// Encode and atomically store. Oversize documents are rejected before I/O.
 pub fn store(dir: &Path, binding: &Binding, states: &[Option<Value>]) -> io::Result<()> {
-    let bytes = encode(binding, states).map_err(|error| match error {
+    store_at(dir, binding, states, 0)
+}
+
+/// The epoch recorded in the stored document (0 when absent or unreadable).
+fn stored_epoch(dir: &Path) -> u64 {
+    read_limited(&dir.join(FILE_NAME))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StoredEpoch>(&bytes).ok())
+        .map_or(0, |stored| stored.epoch)
+}
+
+/// Store as the Gateway of ownership epoch `epoch`. While two Gateways overlap during an
+/// update, the older one may still flush at its shutdown; a file already written by a higher
+/// epoch is left alone so a stale snapshot never replaces a newer one. The check and the
+/// rename are not one atomic step across processes: this closes the common ordering, it is
+/// not a lock. The temporary name carries the process id, so two writers never share it.
+pub fn store_at(
+    dir: &Path,
+    binding: &Binding,
+    states: &[Option<Value>],
+    epoch: u64,
+) -> io::Result<()> {
+    let bytes = encode_at(binding, states, epoch).map_err(|error| match error {
         EncodeError::TooLarge => io::Error::new(io::ErrorKind::InvalidInput, "state too large"),
         EncodeError::Invalid => io::Error::new(io::ErrorKind::InvalidInput, "state invalid"),
     })?;
-    write_atomic(dir, FILE_NAME, TEMP_NAME, &bytes)
+    if stored_epoch(dir) > epoch {
+        return Ok(());
+    }
+    remove_dead_temporaries(dir);
+    let temp = format!("{TEMP_NAME}.{}", std::process::id());
+    write_atomic(dir, FILE_NAME, &temp, &bytes)
+}
+
+/// Temporaries of writers that no longer exist: the pre-epoch fixed name, and
+/// `<name>.<pid>` for a pid that is gone (a crashed writer). A live writer's temporary is
+/// never touched.
+fn remove_dead_temporaries(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let dead = if name == TEMP_NAME {
+            true
+        } else if let Some(pid) = name
+            .strip_prefix(TEMP_NAME)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        {
+            pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists()
+        } else {
+            false
+        };
+        if dead {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 struct Pending {
@@ -200,8 +276,9 @@ pub struct Persister {
     dir: PathBuf,
     binding: Binding,
     pending: StdMutex<Pending>,
-    // Serializes writers so the single temporary name is never shared.
+    // Serializes writers within this process.
     writing: Mutex<()>,
+    epoch: u64,
 }
 
 impl Persister {
@@ -224,8 +301,15 @@ impl Persister {
                 oversize_warned: false,
             }),
             writing: Mutex::new(()),
+            epoch: 0,
         };
         (persister, loaded)
+    }
+
+    /// The ownership epoch of the Gateway this persister belongs to.
+    pub fn with_epoch(mut self, epoch: u64) -> Self {
+        self.epoch = epoch;
+        self
     }
 
     /// Record a confirmed state. Only a real change marks the file dirty.
@@ -267,7 +351,8 @@ impl Persister {
         };
         let dir = self.dir.clone();
         let binding = self.binding;
-        let result = tokio::task::spawn_blocking(move || store(&dir, &binding, &states))
+        let epoch = self.epoch;
+        let result = tokio::task::spawn_blocking(move || store_at(&dir, &binding, &states, epoch))
             .await
             .unwrap_or_else(|_| Err(io::Error::other("persist task failed")));
         let mut pending = self.pending.lock().unwrap();
