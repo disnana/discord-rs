@@ -263,3 +263,7 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 実機で分かった WSL の注意：WSL2 はアイドルで VM ごと停止する（約 25 秒）。**開いた端末（セッション）がないと botd が道連れで止まる**。実験中は WSL の端末を開いたままにする（または `.wslconfig` の `vmIdleTimeout`）。バックグラウンドの `wsl.exe -- sleep` では維持できなかった。
 - 未検証：WSL の再起動後の botd の自動起動（`systemctl enable` していない）、長時間稼働、Resume、複数 Shard、レート制限の実機、Gateway の無停止更新（ローリング）、Gateway と Core の分離（通常経路は未実装。ロードマップ）。
 - 修正済みの課題：実 Discord の Gateway 自動復旧（ローカルの Identify 許可：30 秒間隔・1 時間 10 回）、再起動をまたぐ `!count` の維持（確認済みスナップショットの永続化。イベントのジャーナルとカーソルは保存せず、`kill -9` では最大約 2.5 秒分が失われる）。
+
+## 2026-11-15：Gateway と Core の分離（設計書の取り込みと方針決定）
+- 設計書 `docs/gateway-core-separation-design.md` を取り込み。要点：試験用モードでも Core は Gateway の子（匿名パイプ）で、分離には IPC の媒体の改修（Unix socket、Core 側の受け入れ、接続ごとの状態初期化）が要る。生きている Core に再接続する Gateway は `core-state.json` で状態を巻き戻してはならない（鮮度判定が必須）。分離は単独で障害耐性を大きく上げず、価値は Gateway の無停止更新（新旧 Gateway が同じ Core を共有）の前提になる点。
+- 方針（ユーザー決定）：Gateway の無停止更新を目標に分離を進める。第 1 段階は opt-in の `botd --core-mode separate`（Linux、Unix socket、既定は従来のまま、Core 先・Gateway 後）。判断点は設計書の推奨を採用（旧経路は検証完了まで維持、Core は N プロセス `ChildKey.slot`、ホットスワップは後回し、botd 死亡時は Core も失う、IPC 認証は既存方針、Core の成果物は `src --worker` と同一）。
