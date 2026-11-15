@@ -71,5 +71,6 @@ sudo install -m 0755 target/release/src /opt/discord-rs/bin/src.new && sudo mv /
 sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --secret-file /etc/discord-rs/botd.secret --port 47321 --json
 # 状態: botctl operation <操作ID>（state が succeeded）。記録: /var/lib/discord-rs/runtime/gateway-update-audit.jsonl
 ```
+一括確認：`sudo bash deploy/dev/update-check.sh test [--repeat N]` は、更新の前後の PID、Core の不変、旧 Gateway の消滅、IPC の残骸、マーカー、監査ログ、journald の警告を確認して PASS／FAIL の表を出す（終了コードは全 PASS のときだけ 0）。**サーバーでの実行は未検証**（`bash -n` のみ。WSL では同じ Bot の二重返信を避けるため実行していない）。最初の実行で表示が期待と違えば、スクリプト側の不具合を疑う。
 更新の前後で `sudo soak-report` を取り、Core の PID が変わらないこと、`!count`（または `/ping`）が続くことを確認する。`mv` で置き換えるのは、実行中のファイルに上書きしない（`Text file busy` を避ける）ため。
 
