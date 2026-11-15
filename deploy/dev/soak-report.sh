@@ -39,7 +39,7 @@ done
 echo "core duplicates dropped (last): $(grep -h '重複したメッセージ' "$ROOT"/*/*/ipc/core-*.log 2>/dev/null | tail -n 1)"
 
 echo "--- journal since boot: warnings/errors count ---"
-journalctl -u "$UNIT" -b -p warning --no-pager 2>/dev/null | wc -l
+journalctl -u "$UNIT" -b -p warning --no-pager 2>/dev/null | grep -vc "^-- "
 
 if [ -r "$SECRET" ] && command -v botctl >/dev/null 2>&1 || [ -x /opt/discord-rs/bin/botctl ]; then
   echo "--- botctl status (state, restarts, cores) ---"
