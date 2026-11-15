@@ -881,6 +881,16 @@ pub mod control {
         pub failed_shards: Vec<ShardKey>,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum UpdateStage {
+        /// The standby is not started yet.
+        Begin,
+        /// Started, logging in.
+        Warming,
+        /// Told to take the Cores; waiting for its confirmation.
+        Activating,
+    }
+
     #[derive(PartialEq, Eq)]
     enum Phase {
         Starting,
@@ -902,8 +912,8 @@ pub mod control {
         generations: BTreeMap<ShardKey, LaunchGeneration>,
         errors: BTreeMap<ShardKey, DaemonError>,
         finished: Option<OperationSnapshot>,
-        /// `gateway-update`: false until the standby Gateway of `targets[next]` is started.
-        update_begun: bool,
+        /// `gateway-update`: where the Shard `targets[next]` is in its update.
+        update_stage: UpdateStage,
     }
 
     /// One owner serializes admissions; independent Bot operations advance on
@@ -1361,7 +1371,7 @@ pub mod control {
                 generations: BTreeMap::new(),
                 errors: BTreeMap::new(),
                 finished: None,
-                update_begun: false,
+                update_stage: UpdateStage::Begin,
             };
             for key in &op.targets {
                 self.daemon.hold_restart(key, true);
@@ -1441,47 +1451,63 @@ pub mod control {
             op: &mut Operation,
             credentials: &impl CredentialSource,
         ) {
+            use crate::daemon::UpdateProgress;
             let Some(key) = op.targets.get(op.next).cloned() else {
                 self.finish(op);
                 return;
             };
-            if !op.update_begun {
-                match self.daemon.begin_gateway_update(&key, credentials) {
-                    Ok(()) => op.update_begun = true,
+            match op.update_stage {
+                UpdateStage::Begin => match self.daemon.begin_gateway_update(&key, credentials) {
+                    Ok(()) => op.update_stage = UpdateStage::Warming,
                     Err(error) => {
                         op.errors.insert(key, error);
                         self.finish(op);
                     }
-                }
-                return;
-            }
-            match self.daemon.gateway_update_progress(&key) {
-                crate::daemon::UpdateProgress::Warming => {
-                    if op.started.elapsed() >= UPDATE_TIMEOUT {
-                        self.daemon.cancel_gateway_update(&key);
-                        op.errors.insert(key, DaemonError::StopTimedOut);
+                },
+                UpdateStage::Warming => match self.daemon.gateway_update_progress(&key) {
+                    UpdateProgress::Warming => {
+                        if op.started.elapsed() >= UPDATE_TIMEOUT {
+                            self.daemon.cancel_gateway_update(&key);
+                            op.errors.insert(key, DaemonError::StopTimedOut);
+                            self.finish(op);
+                        }
+                    }
+                    UpdateProgress::Ready => {
+                        match self.daemon.send_gateway_activation(&key).await {
+                            Ok(()) => op.update_stage = UpdateStage::Activating,
+                            Err(error) => {
+                                op.errors.insert(key, error);
+                                self.finish(op);
+                            }
+                        }
+                    }
+                    UpdateProgress::Failed(error) => {
+                        op.errors.insert(key, error);
                         self.finish(op);
                     }
-                }
-                crate::daemon::UpdateProgress::Ready => {
-                    match self.daemon.activate_gateway_update(&key).await {
+                },
+                UpdateStage::Activating => match self.daemon.gateway_activation_progress(&key) {
+                    UpdateProgress::Warming => {}
+                    UpdateProgress::Ready => match self.daemon.commit_gateway_update(&key).await {
                         Ok(()) => {
                             op.next += 1;
-                            op.update_begun = false;
+                            op.update_stage = UpdateStage::Begin;
                             if op.next >= op.targets.len() {
                                 self.finish(op);
                             }
                         }
                         Err(error) => {
+                            self.daemon.fail_gateway_activation(&key);
                             op.errors.insert(key, error);
                             self.finish(op);
                         }
+                    },
+                    UpdateProgress::Failed(error) => {
+                        self.daemon.fail_gateway_activation(&key);
+                        op.errors.insert(key, error);
+                        self.finish(op);
                     }
-                }
-                crate::daemon::UpdateProgress::Failed(error) => {
-                    op.errors.insert(key, error);
-                    self.finish(op);
-                }
+                },
             }
         }
 
@@ -2611,7 +2637,16 @@ struct Candidate {
     child: Child,
     started: std::time::Instant,
     ready_marker: PathBuf,
+    /// Written by the standby once it has attached to every Core (it is then the Gateway
+    /// the Cores serve).
+    active_marker: PathBuf,
+    /// Set when the activation frame was delivered.
+    activated: Option<std::time::Instant>,
 }
+
+/// How long an activated standby may take to confirm that it holds the Cores.
+#[cfg(unix)]
+const ACTIVATION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(unix)]
 struct Retiring {
@@ -3094,7 +3129,9 @@ impl<C: Clock> Daemon<C> {
             None
         };
         let marker = spec.state_path.join("standby-ready");
+        let active_marker = spec.state_path.join("standby-active");
         let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&active_marker);
         let log = spec.management_path.parent().and_then(|dir| {
             let path = dir.join("gateway-candidate.log");
             let mut options = std::fs::OpenOptions::new();
@@ -3149,6 +3186,8 @@ impl<C: Clock> Daemon<C> {
             child,
             started: std::time::Instant::now(),
             ready_marker: marker,
+            active_marker,
+            activated: None,
         });
         Ok(())
     }
@@ -3191,29 +3230,20 @@ impl<C: Clock> Daemon<C> {
         {
             let _ = candidate.child.start_kill();
             let _ = std::fs::remove_file(&candidate.ready_marker);
+            let _ = std::fs::remove_file(&candidate.active_marker);
         }
     }
 
-    /// Makes the (ready) standby Gateway the active one: tells it to attach with the next
-    /// epoch, which stops the running Gateway's Core connections, hands the supervision of
-    /// the Shard to it and asks the old Gateway to exit. The old process stays owned by botd
-    /// until it has exited (killed after a grace period).
+    /// Step 1 of making the (ready) standby Gateway the active one: tell it to attach to the
+    /// Cores with the next epoch. That takes the Cores from the running Gateway, so from here
+    /// the old Gateway can no longer serve and the epoch is raised for good: any Gateway botd
+    /// starts later attaches above it. Nothing else changes until the standby confirms
+    /// (`gateway_activation_progress`) and `commit_gateway_update` hands the Shard over.
     #[cfg(unix)]
-    pub async fn activate_gateway_update(&mut self, key: &ShardKey) -> Result<(), DaemonError> {
-        let sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(DaemonError::GenerationExhausted)?;
+    pub async fn send_gateway_activation(&mut self, key: &ShardKey) -> Result<(), DaemonError> {
         let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
-        let Some(mut candidate) = entry.candidate.take() else {
+        let Some(candidate) = entry.candidate.as_mut() else {
             return Err(DaemonError::InvalidState);
-        };
-        let expected = match self.recovery.snapshot(entry.recovery_key) {
-            Ok(snapshot) => snapshot.generation,
-            Err(_) => {
-                let _ = candidate.child.start_kill();
-                return Err(DaemonError::InvalidState);
-            }
         };
         let epoch = entry.epoch + 1;
         let frame = serde_json::to_vec(&shard_runtime::GatewayControl::Activate { epoch })
@@ -3230,14 +3260,77 @@ impl<C: Clock> Daemon<C> {
             None => Ok(Err(std::io::Error::other("no stdin"))),
         };
         if !matches!(delivered, Ok(Ok(()))) {
-            let _ = candidate.child.start_kill();
-            let _ = std::fs::remove_file(&candidate.ready_marker);
+            self.cancel_gateway_update(key);
             return Err(DaemonError::StopFailed);
         }
-        // From here the candidate may already own the Cores. Any Gateway botd starts
-        // later must attach above this epoch, whatever happens next.
         entry.epoch = epoch;
         let _ = std::fs::remove_file(&candidate.ready_marker);
+        candidate.activated = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Whether the activated standby has confirmed that it holds the Cores. `Ready` means
+    /// confirmed; a standby that exited or stayed silent too long is `Failed`.
+    #[cfg(unix)]
+    pub fn gateway_activation_progress(&mut self, key: &ShardKey) -> UpdateProgress {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return UpdateProgress::Failed(DaemonError::UnknownShard);
+        };
+        let Some(candidate) = entry.candidate.as_mut() else {
+            return UpdateProgress::Failed(DaemonError::InvalidState);
+        };
+        let Some(activated) = candidate.activated else {
+            return UpdateProgress::Failed(DaemonError::InvalidState);
+        };
+        match candidate.child.try_wait() {
+            Ok(Some(_)) => return UpdateProgress::Failed(DaemonError::ChildExited),
+            Err(_) => return UpdateProgress::Failed(DaemonError::MonitorFailed),
+            Ok(None) => {}
+        }
+        if candidate.active_marker.exists() {
+            UpdateProgress::Ready
+        } else if activated.elapsed() >= ACTIVATION_CONFIRM_TIMEOUT {
+            UpdateProgress::Failed(DaemonError::StopTimedOut)
+        } else {
+            UpdateProgress::Warming
+        }
+    }
+
+    /// The activation did not succeed. The running Gateway has already lost its Cores, so it
+    /// is killed (not asked to stop: a clean exit would be read as "stopped on purpose") and
+    /// botd restarts it, now with the raised epoch. The standby, if any, is killed too.
+    #[cfg(unix)]
+    pub fn fail_gateway_activation(&mut self, key: &ShardKey) {
+        self.cancel_gateway_update(key);
+        if let Some(entry) = self.entries.get(key)
+            && let Ok(Some(old)) = self.recovery.child_mut(entry.recovery_key)
+        {
+            let _ = old.start_kill();
+        }
+    }
+
+    /// Step 2: the standby holds the Cores. Hand the supervision of the Shard to it and ask
+    /// the old Gateway to exit. The old process stays owned by botd until it has exited
+    /// (killed after a grace period).
+    #[cfg(unix)]
+    pub async fn commit_gateway_update(&mut self, key: &ShardKey) -> Result<(), DaemonError> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(DaemonError::GenerationExhausted)?;
+        let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
+        let Some(candidate) = entry.candidate.take() else {
+            return Err(DaemonError::InvalidState);
+        };
+        let expected = match self.recovery.snapshot(entry.recovery_key) {
+            Ok(snapshot) => snapshot.generation,
+            Err(_) => {
+                let mut child = candidate.child;
+                let _ = child.start_kill();
+                return Err(DaemonError::InvalidState);
+            }
+        };
+        let _ = std::fs::remove_file(&candidate.active_marker);
         let pid = candidate.child.id();
         match self.recovery.replace_ready(
             entry.recovery_key,
@@ -3246,7 +3339,6 @@ impl<C: Clock> Daemon<C> {
             candidate.child,
         ) {
             Ok(mut old) => {
-                // Graceful stop of the replaced Gateway; it only had its Core connections taken.
                 if let Some(pipe) = old.stdin.as_mut() {
                     let _ = tokio::time::timeout(Duration::from_millis(500), async {
                         pipe.write_all(shard_runtime::GATEWAY_SHUTDOWN_FRAME)

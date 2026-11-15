@@ -27,7 +27,7 @@
 - separate では Core の無停止差し替え（ホットスワップ）は未対応です。Gateway の `--core-dir` では Worker 更新の監視を行いません。
 - separate の `botctl gateway-update` による Gateway の無停止差し替えは、WSL と実 Discord で 1 回の更新（成功、カウンタ継続、重複 5 件の破棄）を確認しました。複数 Shard の本番運用、長時間稼働（soak）、Interaction の重複は未検証です。activate 送信後に失敗した場合の Core と旧 Gateway の状態も未検証です。
 - `gateway-update` の既知の限界（2026-11-16 夜の Codex（`gpt-6.1-sol`）レビューによる。コードで確認した指摘で、実機での再現はしていない）：
-  - 有効化の確認：botd は `activate` を送れたら監督を新 Gateway に移し、旧 Gateway に停止を要求する。候補が Core への attach に失敗しても、その時点で旧 Gateway は Core から外れているため戻せない。候補が終了すれば botd が上がった epoch で Gateway を再起動する（自己回復だが、Identify を 1 回余分に使う）。候補が attach を確認してから旧を止める「確認付き有効化」は未実装。READY のマーカーは Discord 切断後も残る。
+  - 有効化の確認（対応済み）：botd は `activate` を送ったあと、候補が全 Core に attach したことの確認（`standby-active`、最大 20 秒）を待ってから、監督を移して旧 Gateway に停止を要求する。確認できなければ操作は `failed`。このとき旧 Gateway は既に Core から外れているため戻せず、kill して botd が上がった epoch で再起動する（Identify を 1 回余分に使う自己回復）。READY のマーカー（`standby-ready`）は Discord 切断後も残る。確認の成否を注入する自動試験は未整備（正常系のみ）。
   - 進行中の応答：Core が接続を切り替える（fence する）とき、旧 Gateway が HTTP 送信中の応答の `ApiResult` は Core に届かないことがある（結果不明の扱い）。更新前に新規受付を止めて決着させる処理は未実装。
   - 旧 Gateway が Core の応答を読まなくなると、Core の応答書き込みに期限がなく、epoch の引き継ぎが書き込みの終わりまで遅れ得る。
   - ログ：`gateway-candidate.log`（更新後も新 Gateway の出力先として残る）と `core-*.log`（重複破棄の 1 行ずつ）は、起動時にしか大きさを見ない。長期稼働や更新の繰り返しで増える。ローテーションは未実装。

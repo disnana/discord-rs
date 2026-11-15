@@ -469,6 +469,10 @@ async fn run_standby(
         let attach = src::core_attach::load(&dir, deployment.bot_id, deployment.shard, epoch)?;
         let manager = worker::Manager::attach_gateway_pool(deployment, attach).await?;
         manager.start_jobs();
+        // botd waits for this before it lets the old Gateway go.
+        if let Some(state) = options.path("--state-path") {
+            let _ = std::fs::write(state.join("standby-active"), b"active\n");
+        }
         println!(
             "待機Gatewayを有効にしました（epoch {epoch}、保留 {} 件）",
             backlog.len()
@@ -1024,6 +1028,12 @@ async fn run() -> Result<(), AppError> {
         Some(_) => return Err(StartupFailure::InvalidArguments.into()),
         None => worker::Manager::start_gateway_pool(env::current_exe()?, 2, deployment).await?,
     };
+    if options.standby && mock.is_some() {
+        // Attached to every Core: tell botd it may hand the Shard over (mock collector).
+        if let Some(state) = options.path("--state-path") {
+            let _ = std::fs::write(state.join("standby-active"), b"active\n");
+        }
+    }
     let shutdown = match standby_shutdown {
         Some(receiver) => receiver,
         None => shutdown_input(!options.launch.is_empty() || options.mock_discord.is_some()),
