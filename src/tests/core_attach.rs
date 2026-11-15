@@ -433,7 +433,11 @@ async fn a_persistent_core_serves_a_second_connection_after_the_first_ends() {
         if round == 1 {
             // A wrong secret between two good sessions is refused without ending the Core.
             let mut bad = attach(&socket, OTHER_SECRET).await;
-            assert!(bounded(exchange(&mut bad, r#"{"type":"health"}"#)).await.is_none());
+            assert!(
+                bounded(exchange(&mut bad, r#"{"type":"health"}"#))
+                    .await
+                    .is_none()
+            );
         }
         let mut stream = attach(&socket, SECRET).await;
         let response = bounded(exchange(&mut stream, r#"{"type":"health"}"#))
@@ -448,7 +452,11 @@ async fn a_persistent_core_serves_a_second_connection_after_the_first_ends() {
     let listener = bind_socket(&socket).unwrap();
     let once = tokio::spawn(serve(listener, secret(), None, Lifetime::OneConnection));
     let mut stream = attach(&socket, SECRET).await;
-    assert!(bounded(exchange(&mut stream, r#"{"type":"health"}"#)).await.is_some());
+    assert!(
+        bounded(exchange(&mut stream, r#"{"type":"health"}"#))
+            .await
+            .is_some()
+    );
     drop(stream);
     bounded(once).await.unwrap().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
