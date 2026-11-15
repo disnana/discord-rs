@@ -761,3 +761,55 @@ async fn the_attach_line_epoch_is_optional_and_strict() {
     let _ = core.child.kill().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn attach_config_at_epoch(socket: &Path, epoch: u64) -> src::worker::CoreAttach {
+    let mut config = attach_config(socket);
+    config.identity.ownership_epoch = src::protocol::OwnershipEpoch(epoch);
+    config
+}
+
+/// R-2: Gateway は epoch を送り、Hello の identity も同じ epoch で提示する。高い epoch の
+/// Gateway が引き継ぐと、古い方の要求は通らず、再接続しても取り戻せない。状態は続く。
+#[tokio::test]
+async fn a_gateway_with_a_higher_epoch_takes_over_and_the_old_one_cannot_return() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    let old = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        attach_config_at_epoch(&socket, 3),
+    ))
+    .await
+    .expect("epoch 3 attaches (Hello carries the same epoch)");
+    let first = count(&old).await;
+
+    let new = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        attach_config_at_epoch(&socket, 5),
+    ))
+    .await
+    .expect("epoch 5 takes over");
+    let second = count(&new).await;
+    assert_ne!(first, second, "the counter continues across the takeover");
+
+    // 古い Gateway の要求は通らない。時間をおいても（再接続を試みても）取り戻せない。
+    for _ in 0..3 {
+        let stale =
+            tokio::time::timeout(Duration::from_secs(3), old.dispatch_key(7, "!count".into()))
+                .await;
+        assert!(
+            !matches!(stale, Ok(Ok(_))),
+            "a fenced Gateway must not change state"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let third = count(&new).await;
+    assert!(third != first && third != second, "only the new one counts");
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), old.shutdown()).await;
+    bounded(new.shutdown()).await.unwrap();
+    let _ = core.child.kill().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -233,6 +233,8 @@ struct GatewayOptions {
     /// Directory of the Cores botd runs for this Shard (separated layout). When set, the
     /// Gateway connects to them instead of starting its own Core processes.
     core_dir: Option<PathBuf>,
+    /// Ownership epoch this Gateway attaches to its Cores with (0 unless botd says so).
+    core_epoch: u64,
 }
 
 impl GatewayOptions {
@@ -249,6 +251,13 @@ impl GatewayOptions {
                         return Err(StartupFailure::InvalidArguments);
                     }
                     options.core_dir = Some(dir);
+                }
+                "--core-epoch" if options.core_epoch == 0 => {
+                    options.core_epoch = args
+                        .next()
+                        .and_then(|value| value.to_str().and_then(|v| v.parse::<u64>().ok()))
+                        .filter(|epoch| *epoch != 0)
+                        .ok_or(StartupFailure::InvalidArguments)?;
                 }
                 "--mock-discord" if options.mock_discord.is_none() => {
                     let addr = args.next().ok_or(StartupFailure::InvalidArguments)?;
@@ -273,6 +282,7 @@ impl GatewayOptions {
             || (options.local_control
                 && (!options.launch.is_empty() || options.mock_discord.is_some()))
             || (options.core_dir.is_some() && (options.local_control || !cfg!(unix)))
+            || (options.core_epoch != 0 && options.core_dir.is_none())
         {
             return Err(StartupFailure::InvalidArguments);
         }
@@ -862,7 +872,12 @@ async fn run() -> Result<(), AppError> {
     let manager = match &options.core_dir {
         #[cfg(unix)]
         Some(dir) => {
-            let attach = src::core_attach::load(dir, deployment.bot_id, deployment.shard)?;
+            let attach = src::core_attach::load(
+                dir,
+                deployment.bot_id,
+                deployment.shard,
+                options.core_epoch,
+            )?;
             worker::Manager::attach_gateway_pool(deployment, attach).await?
         }
         #[cfg(not(unix))]

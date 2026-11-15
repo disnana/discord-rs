@@ -77,14 +77,17 @@ pub fn renew_secret(dir: &Path) -> Result<(), AppError> {
 }
 
 /// Gateway side: everything `Manager::attach_gateway_pool` needs, from the directory.
-pub fn load(dir: &Path, bot_id: BotId, shard: Shard) -> Result<CoreAttach, AppError> {
+pub fn load(dir: &Path, bot_id: BotId, shard: Shard, epoch: u64) -> Result<CoreAttach, AppError> {
     validate_dir(dir)?;
     let secret =
         load_secret_file(&secret_path(dir)).map_err(|_| failure("core secret is unreadable"))?;
     Ok(CoreAttach {
         sockets: (0..SLOTS).map(|slot| socket_path(dir, slot)).collect(),
         secret,
-        identity: identity(bot_id, shard),
+        identity: Identity {
+            ownership_epoch: OwnershipEpoch(epoch),
+            ..identity(bot_id, shard)
+        },
     })
 }
 
@@ -120,7 +123,7 @@ mod tests {
         renew_secret(&dir).unwrap();
         assert_ne!(first, std::fs::read(secret_path(&dir)).unwrap());
         let shard = Shard::new(0, 1).unwrap();
-        let attach = load(&dir, BotId(7), shard).unwrap();
+        let attach = load(&dir, BotId(7), shard, 0).unwrap();
         assert_eq!(attach.sockets.len(), SLOTS);
         assert_eq!(attach.identity, identity(BotId(7), shard));
         cleanup(&dir);
@@ -143,7 +146,7 @@ mod tests {
         renew_secret(&dir).unwrap();
         std::fs::set_permissions(secret_path(&dir), std::fs::Permissions::from_mode(0o644))
             .unwrap();
-        assert!(load(&dir, BotId(7), Shard::new(0, 1).unwrap()).is_err());
+        assert!(load(&dir, BotId(7), Shard::new(0, 1).unwrap(), 0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

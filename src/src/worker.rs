@@ -734,13 +734,24 @@ impl Process {
         // The first line authenticates this client to the Core (64 hex digits and a
         // newline), built in a fixed buffer that is wiped as soon as it is written.
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut line = [0u8; crate::secret_file::SECRET_BYTES * 2 + 1];
+        // A non-zero ownership epoch follows the secret (` <epoch>`); the Core orders and
+        // fences connections by it. Epoch 0 keeps the original one-field line.
+        let hex_len = crate::secret_file::SECRET_BYTES * 2;
+        let mut line = [0u8; crate::secret_file::SECRET_BYTES * 2 + 1 + 20 + 1];
         for (index, byte) in secret.expose_secret().iter().enumerate() {
             line[index * 2] = HEX[usize::from(byte >> 4)];
             line[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
         }
-        line[crate::secret_file::SECRET_BYTES * 2] = b'\n';
-        let written = timeout(DEADLINE, stream.write_all(&line)).await;
+        let mut len = hex_len;
+        let epoch = identity.ownership_epoch.0;
+        if epoch != 0 {
+            let suffix = format!(" {epoch}");
+            line[len..len + suffix.len()].copy_from_slice(suffix.as_bytes());
+            len += suffix.len();
+        }
+        line[len] = b'\n';
+        len += 1;
+        let written = timeout(DEADLINE, stream.write_all(&line[..len])).await;
         crate::secret_file::wipe(&mut line);
         written
             .map_err(|_| failure("core attach timed out"))?
@@ -3702,7 +3713,14 @@ async fn connection_loop(
     } = io;
     let mut output = output;
     let backend = life.backend.clone();
-    let identity = life.identity.clone();
+    // A connection that attached with an ownership epoch is that Gateway's epoch: Hello
+    // must then present the same identity, epoch included.
+    let identity = life.identity.clone().map(|mut identity| {
+        if let Some(fence) = &fence {
+            identity.ownership_epoch = crate::protocol::OwnershipEpoch(fence.epoch);
+        }
+        identity
+    });
     let runtime = life.runtime.clone();
     let tasks = &mut life.tasks;
     let mut sequenced_events = false;
