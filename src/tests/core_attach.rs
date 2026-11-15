@@ -416,3 +416,40 @@ async fn attaching_to_a_core_with_a_different_identity_fails_before_any_command(
     let _ = bounded(core.child.wait()).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `UntilStopped`: a Core keeps serving after its connection ends, a failed attach in
+/// between does not stop it, and `OneConnection` still ends with the first session.
+/// (That application state survives is by construction - `CoreLife` is held across
+/// connections - and is not asserted here.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_persistent_core_serves_a_second_connection_after_the_first_ends() {
+    use src::core_server::{Lifetime, bind_socket, serve};
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let listener = bind_socket(&socket).unwrap();
+    let server = tokio::spawn(serve(listener, secret(), None, Lifetime::UntilStopped));
+
+    for round in 0..3 {
+        if round == 1 {
+            // A wrong secret between two good sessions is refused without ending the Core.
+            let mut bad = attach(&socket, OTHER_SECRET).await;
+            assert!(bounded(exchange(&mut bad, r#"{"type":"health"}"#)).await.is_none());
+        }
+        let mut stream = attach(&socket, SECRET).await;
+        let response = bounded(exchange(&mut stream, r#"{"type":"health"}"#))
+            .await
+            .expect("health response on a reused core");
+        assert_eq!(response["type"], "ready", "round {round}");
+        drop(stream);
+    }
+    assert!(!server.is_finished(), "a persistent core must keep running");
+    server.abort();
+
+    let listener = bind_socket(&socket).unwrap();
+    let once = tokio::spawn(serve(listener, secret(), None, Lifetime::OneConnection));
+    let mut stream = attach(&socket, SECRET).await;
+    assert!(bounded(exchange(&mut stream, r#"{"type":"health"}"#)).await.is_some());
+    drop(stream);
+    bounded(once).await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
