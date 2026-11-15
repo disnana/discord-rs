@@ -60,7 +60,7 @@ impl Core {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
