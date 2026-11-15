@@ -536,6 +536,8 @@ case " $* " in
     done
     mkdir -p "$state"
     echo ready > "$state/standby-ready"
+    IFS= read -r line
+    echo got > "$state/got-activate"
     exec cat > /dev/null
     ;;
   *) exec {real} "$@" ;;
@@ -554,6 +556,18 @@ esac
 /// brings a Gateway back, with the raised epoch, onto the very same Cores.
 #[tokio::test]
 async fn an_update_whose_standby_never_confirms_fails_and_the_gateway_recovers() {
+    unconfirmed_update(false).await;
+}
+
+/// Same, but the old Gateway exits CLEANLY (code 0, as after a fatal Discord close) while the
+/// update waits for the confirmation. Recovery reads a clean exit as "stopped on purpose"; the
+/// failed update must still bring the Shard back.
+#[tokio::test]
+async fn a_gateway_that_exits_cleanly_during_an_update_is_brought_back_when_it_fails() {
+    unconfirmed_update(true).await;
+}
+
+async fn unconfirmed_update(old_exits_cleanly: bool) {
     let fixture = Fixture::start_with(Some(&silent_standby_program)).await;
     let first = fixture.accept().await;
     let cores = worker_pids(&first.ready);
@@ -566,6 +580,21 @@ async fn an_update_whose_standby_never_confirms_fails_and_the_gateway_recovers()
     )
     .await;
     assert_eq!(admitted["ok"], true, "{admitted}");
+
+    if old_exits_cleanly {
+        // Wait until the standby has been told to activate, then let the old Gateway leave
+        // on its own with a clean exit (SIGINT is its cooperative shutdown).
+        bounded(async {
+            while !walk(&fixture.root)
+                .iter()
+                .any(|path| path.file_name().is_some_and(|n| n == "got-activate"))
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        signal(old_pid, "INT");
+    }
 
     // The standby stub never confirms: the operation fails after the confirmation window.
     let finished = tokio::time::timeout(Duration::from_secs(60), async {

@@ -327,3 +327,4 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 00:06 Sol 指摘(9)のログ上限を実装：稼働中も定期（約 60 秒）に大きさを見て、超えたら `.1` に写して空にする（`core_units::rotate_in_place`、試験あり）。
 - 00:08 確認が来ない場合の自動試験を追加（スクリプトの待機 Gateway がログインだけして確認しない）：操作は `failed`（確認の期限 20 秒）、旧 Gateway は終了、botd が上がった epoch で Gateway を戻し、同じ Core に接続、監査に `requested`／`failed`。WSL で合格。
 - 00:22 Sol 再レビュー（4 件）への対応：(P1) 有効化の確認待ちの間に旧 Gateway が code 0 で終了して復旧が「意図した停止」と読んで止まる場合に備え、失敗時に停止済みの枠を再び起動（予算は保持。自動試験なし、コード上の対応）。(P2) ログの回転は、コピー中に書かれた行を失わないよう、測った長さのままのときだけ空にする（そうでなければ次回へ）。(P3) 検査したファイルと同じ記述子（dev／ino 一致）で copy と truncate を行う。(P4) `standby-ready`／`standby-active` を消せなければ更新を開始せず、マーカーは通常ファイルだけを有効とする。operator-guide／ipc-protocol を最新の手順に更新（Haiku、事実を確認）。
+- 00:31 P1 の自動試験を追加（`a_gateway_that_exits_cleanly_during_an_update_is_brought_back_when_it_fails`）：確認待ちの間に旧 Gateway が SIGINT で code 0 の終了をしても、更新が失敗したあとに Gateway が戻る。修正を一時的に外すと試験は失敗する（60 秒で期限切れ）ことを確認し、元に戻した。
