@@ -3639,17 +3639,53 @@ pub(crate) async fn serve_core(
     io: CoreIo,
 ) -> Result<(), AppError> {
     let mut life = CoreLife::new(backend)?;
-    serve_connection(&mut life, io).await
+    serve_connection(&mut life, io, None).await
+}
+
+/// Ownership fencing for a connection (stage R-1 of docs/gateway-rolling-update-design.md).
+/// A connection carries the epoch it attached with. When a connection with a higher epoch
+/// has been admitted, `rx` shows it and this connection stops taking requests: a delayed
+/// request of an older Gateway can no longer change state the newer one now owns. It ends
+/// between requests, never in the middle of one, so state is not left half applied.
+pub(crate) struct Fence {
+    pub rx: tokio::sync::watch::Receiver<u64>,
+    pub epoch: u64,
+}
+
+async fn next_request(
+    input: &mut tokio::sync::mpsc::Receiver<Result<Request, AppError>>,
+    fence: Option<&mut Fence>,
+) -> Option<Result<Request, AppError>> {
+    let Some(fence) = fence else {
+        return input.recv().await;
+    };
+    loop {
+        if *fence.rx.borrow() > fence.epoch {
+            return None;
+        }
+        tokio::select! {
+            request = input.recv() => return request,
+            changed = fence.rx.changed() => {
+                if changed.is_err() {
+                    return input.recv().await;
+                }
+            }
+        }
+    }
 }
 
 /// One connection's worth of the request loop. Returns when the peer goes away or the
 /// session ends; `life` keeps the application state for the next connection.
-pub(crate) async fn serve_connection(life: &mut CoreLife, io: CoreIo) -> Result<(), AppError> {
+pub(crate) async fn serve_connection(
+    life: &mut CoreLife,
+    io: CoreIo,
+    fence: Option<Fence>,
+) -> Result<(), AppError> {
     // The loop below treats the state as an owned local (take / replace / clone). Lend it
     // out, and take it back whatever the outcome: every `?` inside returns through here, so
     // a failed connection cannot cost the Core its state.
     let mut state = std::mem::take(&mut life.state);
-    let result = connection_loop(life, &mut state, io).await;
+    let result = connection_loop(life, &mut state, io, fence).await;
     life.state = state;
     result
 }
@@ -3658,6 +3694,7 @@ async fn connection_loop(
     life: &mut CoreLife,
     state: &mut crate::cogs::State,
     io: CoreIo,
+    mut fence: Option<Fence>,
 ) -> Result<(), AppError> {
     let CoreIo {
         output,
@@ -3767,7 +3804,7 @@ async fn connection_loop(
     let mut pending_results = std::collections::HashSet::new();
     let mut event_stream_initialized = false;
     let mut receiver = crate::event_seq::Receiver::new(0);
-    while let Some(request) = input.recv().await {
+    while let Some(request) = next_request(&mut input, fence.as_mut()).await {
         let request = request?;
         let (request, operation) = match request {
             Request::ResponseDispatch {

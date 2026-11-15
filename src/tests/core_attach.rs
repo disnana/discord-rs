@@ -670,3 +670,94 @@ async fn a_restarted_core_is_given_the_last_confirmed_state() {
     bounded(manager.shutdown()).await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+async fn attach_with_epoch(socket: &Path, secret: &str, epoch: u64) -> UnixStream {
+    let mut stream = UnixStream::connect(socket).await.unwrap();
+    stream
+        .write_all(format!("{secret} {epoch}\n").as_bytes())
+        .await
+        .unwrap();
+    stream
+}
+
+async fn healthy(stream: &mut UnixStream) -> bool {
+    bounded(exchange(stream, r#"{"type":"health"}"#))
+        .await
+        .is_some_and(|response| response["type"] == "ready")
+}
+
+/// R-1: epoch による fencing。高い epoch の接続が低い epoch の接続を止め、低い epoch は
+/// 受け付けず、同じ epoch は順番を待つ。
+#[tokio::test]
+async fn connections_are_ordered_by_ownership_epoch() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    // epoch 1 の接続が提供中。
+    let mut first = attach_with_epoch(&socket, SECRET, 1).await;
+    assert!(healthy(&mut first).await);
+
+    // 低い epoch は受け付けない（すぐ閉じられる）。提供中の接続は影響を受けない。
+    let mut lower = attach_with_epoch(&socket, SECRET, 0).await;
+    assert!(!healthy(&mut lower).await, "a lower epoch must be refused");
+    assert!(
+        healthy(&mut first).await,
+        "the active connection is unaffected"
+    );
+
+    // 同じ epoch は待たされる（提供中の接続が続く間は応答が来ない）。
+    let mut equal = attach_with_epoch(&socket, SECRET, 1).await;
+    equal.write_all(b"{\"type\":\"health\"}\n").await.unwrap();
+    let waited = tokio::time::timeout(Duration::from_millis(500), async {
+        let mut byte = [0u8; 1];
+        equal.read(&mut byte).await
+    })
+    .await;
+    assert!(waited.is_err(), "an equal epoch must wait for its turn");
+
+    // 高い epoch は提供中の接続を止め、自分が提供される。待っていた同じ epoch の接続は
+    // さらに高い epoch の後ろに回る（高い方が先）。
+    let mut higher = attach_with_epoch(&socket, SECRET, 2).await;
+    assert!(healthy(&mut higher).await, "the higher epoch is served");
+    // 止められた接続は、閉じられている（応答が来ない）。
+    assert!(
+        !healthy(&mut first).await,
+        "the fenced connection must stop"
+    );
+    assert!(
+        core.child.try_wait().unwrap().is_none(),
+        "the Core stayed up"
+    );
+
+    let _ = core.child.kill().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 旧形式（epoch なしの 1 行）は epoch 0 として扱う。不正な epoch の書式は拒否する。
+#[tokio::test]
+async fn the_attach_line_epoch_is_optional_and_strict() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    for bad in [
+        format!("{SECRET} x"),
+        format!("{SECRET} "),
+        format!("{SECRET}  1"),
+    ] {
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        stream
+            .write_all(format!("{bad}\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(!healthy(&mut stream).await, "{bad:?} must be refused");
+    }
+    let mut plain = attach(&socket, SECRET).await;
+    assert!(healthy(&mut plain).await, "no epoch means epoch 0");
+
+    let _ = core.child.kill().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

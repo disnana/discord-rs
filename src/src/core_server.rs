@@ -17,7 +17,7 @@
 use crate::AppError;
 use crate::redact::Secret;
 use crate::secret_file::{SECRET_BYTES, effective_uid, parse_hex_secret};
-use crate::worker::{CoreIo, CoreLife, failure, serve_connection};
+use crate::worker::{CoreIo, CoreLife, Fence, failure, serve_connection};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -109,26 +109,65 @@ pub fn bind_socket(path: &Path) -> Result<UnixListener, CoreServerError> {
     Ok(listener)
 }
 
-/// Reads exactly the attach line and compares it in constant time. Reads no more than
-/// the frame, so nothing of the protocol that follows is consumed.
+/// Longest attach line: 64 hex digits, a space, a u64 in decimal (20 digits).
+const ATTACH_LINE_MAX: usize = SECRET_BYTES * 2 + 1 + 20;
+
+/// Reads the attach line `<64 hex>[ <epoch>]\n` and compares the secret in constant time.
+/// Reads byte by byte up to the newline, so nothing of the protocol that follows is
+/// consumed. Returns the ownership epoch the client attached with (0 when absent).
 async fn authenticate(
     stream: &mut UnixStream,
     expected: &Secret<[u8; SECRET_BYTES]>,
-) -> Result<(), CoreServerError> {
-    let mut frame = [0u8; ATTACH_FRAME_BYTES];
-    tokio::time::timeout(ATTACH_DEADLINE, stream.read_exact(&mut frame))
-        .await
-        .map_err(|_| CoreServerError::Secret)?
-        .map_err(|_| CoreServerError::Secret)?;
-    if frame[ATTACH_FRAME_BYTES - 1] != b'\n' {
+) -> Result<u64, CoreServerError> {
+    let mut line = [0u8; ATTACH_LINE_MAX];
+    let mut len = 0usize;
+    let read = tokio::time::timeout(ATTACH_DEADLINE, async {
+        loop {
+            let byte = stream
+                .read_u8()
+                .await
+                .map_err(|_| CoreServerError::Secret)?;
+            if byte == b'\n' {
+                return Ok(());
+            }
+            if len >= ATTACH_LINE_MAX {
+                return Err(CoreServerError::Secret);
+            }
+            line[len] = byte;
+            len += 1;
+        }
+    })
+    .await
+    .map_err(|_| CoreServerError::Secret)
+    .and_then(|result| result);
+    let result = read.and_then(|()| verify_attach_line(&line[..len], expected));
+    crate::secret_file::wipe(&mut line);
+    result
+}
+
+fn verify_attach_line(
+    line: &[u8],
+    expected: &Secret<[u8; SECRET_BYTES]>,
+) -> Result<u64, CoreServerError> {
+    let hex_len = SECRET_BYTES * 2;
+    if line.len() < hex_len {
         return Err(CoreServerError::Secret);
     }
-    let presented =
-        parse_hex_secret(&frame[..ATTACH_FRAME_BYTES - 1]).map_err(|_| CoreServerError::Secret)?;
-    if bool::from(presented.expose_secret().ct_eq(expected.expose_secret())) {
-        Ok(())
-    } else {
-        Err(CoreServerError::Secret)
+    let presented = parse_hex_secret(&line[..hex_len]).map_err(|_| CoreServerError::Secret)?;
+    // The epoch is parsed only after the secret matched, so an unauthenticated peer gets no
+    // information from how its suffix is judged.
+    if !bool::from(presented.expose_secret().ct_eq(expected.expose_secret())) {
+        return Err(CoreServerError::Secret);
+    }
+    match &line[hex_len..] {
+        [] => Ok(0),
+        [b' ', digits @ ..] if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
+            std::str::from_utf8(digits)
+                .ok()
+                .and_then(|text| text.parse::<u64>().ok())
+                .ok_or(CoreServerError::Secret)
+        }
+        _ => Err(CoreServerError::Secret),
     }
 }
 
@@ -158,24 +197,80 @@ pub async fn serve(
     lifetime: Lifetime,
 ) -> Result<(), AppError> {
     let mut life = CoreLife::new(backend)?;
-    let mut failed = 0u32;
+    let failed = std::sync::atomic::AtomicU32::new(0);
+    if lifetime == Lifetime::OneConnection {
+        let (stream, _) = accept_authenticated(&listener, &secret, &failed).await?;
+        return serve_connection(&mut life, CoreIo::socket(stream), None).await;
+    }
+    // UntilStopped. While one connection is served, further ones are still accepted and
+    // authenticated, and ordered by the epoch they attach with:
+    // - a higher epoch fences the one being served (it stops between requests) and is
+    //   served next, so a Gateway that took over is never raced by the one it replaced;
+    // - an equal epoch waits its turn (a restarted Gateway behind a dead connection);
+    // - a lower epoch is refused at once.
+    // The acceptor is one future kept across the whole loop: dropping it while a client is
+    // half-way through authenticating would silently lose that client.
+    let (fence_tx, _) = tokio::sync::watch::channel(0u64);
+    let mut pending: Option<(UnixStream, u64)> = None;
+    let mut acceptor = Box::pin(accept_authenticated(&listener, &secret, &failed));
+    loop {
+        let (stream, epoch) = match pending.take() {
+            Some(next) => next,
+            None => {
+                let next = acceptor.as_mut().await?;
+                acceptor = Box::pin(accept_authenticated(&listener, &secret, &failed));
+                next
+            }
+        };
+        let fence = Fence {
+            rx: fence_tx.subscribe(),
+            epoch,
+        };
+        let serving = serve_connection(&mut life, CoreIo::socket(stream), Some(fence));
+        tokio::pin!(serving);
+        loop {
+            tokio::select! {
+                // A broken connection must not take the Core and its state down with it.
+                _ = &mut serving => break,
+                next = acceptor.as_mut() => {
+                    let (stream, attached) = next?;
+                    acceptor = Box::pin(accept_authenticated(&listener, &secret, &failed));
+                    let highest = pending.as_ref().map_or(epoch, |(_, e)| (*e).max(epoch));
+                    if attached < highest {
+                        drop(stream);
+                    } else {
+                        if attached > epoch {
+                            fence_tx.send_replace(attached);
+                        }
+                        pending = Some((stream, attached));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Accepts until one connection passes the peer check and the secret. Gives up after too
+/// many failures in a row so a Core is not probed forever.
+async fn accept_authenticated(
+    listener: &UnixListener,
+    secret: &Secret<[u8; SECRET_BYTES]>,
+    failed: &std::sync::atomic::AtomicU32,
+) -> Result<(UnixStream, u64), AppError> {
     loop {
         let (mut stream, _) = listener
             .accept()
             .await
             .map_err(|_| failure("core socket accept failed"))?;
-        if !peer_is_current_user(&stream) || authenticate(&mut stream, &secret).await.is_err() {
-            failed += 1;
-            if failed >= MAX_FAILED_ATTACHES {
-                return Err(Box::new(CoreServerError::TooManyFailedAttaches));
-            }
-            continue;
+        if peer_is_current_user(&stream)
+            && let Ok(epoch) = authenticate(&mut stream, secret).await
+        {
+            failed.store(0, std::sync::atomic::Ordering::Relaxed);
+            return Ok((stream, epoch));
         }
-        let outcome = serve_connection(&mut life, CoreIo::socket(stream)).await;
-        match lifetime {
-            Lifetime::OneConnection => return outcome,
-            // A broken connection must not take the Core and its state down with it.
-            Lifetime::UntilStopped => failed = 0,
+        let count = failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if count >= MAX_FAILED_ATTACHES {
+            return Err(Box::new(CoreServerError::TooManyFailedAttaches));
         }
     }
 }
