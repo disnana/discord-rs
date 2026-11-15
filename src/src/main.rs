@@ -790,7 +790,23 @@ async fn run() -> Result<(), AppError> {
     if let [flag, socket] = args.as_slice()
         && flag == "--core-listen"
     {
-        return src::core_server::run(PathBuf::from(socket)).await;
+        return src::core_server::run(
+            PathBuf::from(socket),
+            src::core_server::Lifetime::OneConnection,
+        )
+        .await;
+    }
+    // Same, but the Core outlives its connections (a restarted Gateway reconnects to it).
+    #[cfg(unix)]
+    if let [flag, socket, persist] = args.as_slice()
+        && flag == "--core-listen"
+        && persist == "--core-persist"
+    {
+        return src::core_server::run(
+            PathBuf::from(socket),
+            src::core_server::Lifetime::UntilStopped,
+        )
+        .await;
     }
     let options = GatewayOptions::parse(args)?;
     let bootstrap = if options.local_control {

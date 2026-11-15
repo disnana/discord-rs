@@ -1455,6 +1455,39 @@ pub struct Manager {
     /// True when the Cores belong to botd. The Manager then never spawns or replaces one:
     /// reconnecting after a lost connection is a separate step, not a respawn.
     attached: bool,
+    /// How to reach the Cores again after a lost connection (attached Managers only).
+    #[cfg(unix)]
+    attach: Option<CoreAttach>,
+    /// Per-slot reconnect pacing, so a Core that is down is not hammered.
+    reconnect: Vec<StdMutex<ReconnectBackoff>>,
+}
+
+/// Bounded exponential backoff between reconnect attempts to one Core.
+#[derive(Default)]
+struct ReconnectBackoff {
+    failures: u32,
+    not_before: Option<tokio::time::Instant>,
+}
+
+impl ReconnectBackoff {
+    const BASE: Duration = Duration::from_millis(100);
+    const MAX: Duration = Duration::from_secs(5);
+
+    fn ready(&self, now: tokio::time::Instant) -> bool {
+        self.not_before.is_none_or(|at| now >= at)
+    }
+
+    fn failed(&mut self, now: tokio::time::Instant) {
+        self.failures = self.failures.saturating_add(1);
+        let delay = Self::BASE
+            .saturating_mul(1u32 << self.failures.min(10))
+            .min(Self::MAX);
+        self.not_before = Some(now + delay);
+    }
+
+    fn succeeded(&mut self) {
+        *self = Self::default();
+    }
 }
 
 struct GatewayAdmission {
@@ -1808,6 +1841,11 @@ impl Manager {
             core_recovery,
             persist,
             attached,
+            #[cfg(unix)]
+            attach,
+            reconnect: (0..count)
+                .map(|_| StdMutex::new(ReconnectBackoff::default()))
+                .collect(),
         });
         let owner = Arc::downgrade(&manager);
         tokio::spawn(async move {
@@ -1874,7 +1912,8 @@ impl Manager {
     async fn poll_core_recovery(&self) {
         if self.attached {
             // The Cores belong to botd. Replacing one here would start a second owner;
-            // reconnecting a dropped Core is handled separately.
+            // a dropped connection is only ever re-made, never answered with a spawn.
+            self.poll_core_reconnect().await;
             return;
         }
         let Ok(_update) = self.update.try_lock() else {
@@ -1986,6 +2025,70 @@ impl Manager {
         }
         self.reap_retired();
     }
+
+    /// Re-connects a slot whose connection to its (botd-owned) Core was lost. The Core keeps
+    /// its own state, so nothing is restored into it: the new generation starts from what the
+    /// Core reports. Attempts are paced by a bounded backoff.
+    #[cfg(unix)]
+    async fn poll_core_reconnect(&self) {
+        let Some(attach) = &self.attach else {
+            return;
+        };
+        let Ok(_update) = self.update.try_lock() else {
+            return;
+        };
+        self.reap_retired();
+        for (index, worker) in self.workers.iter().enumerate() {
+            let previous = worker.read().await.clone();
+            let broken = previous
+                .process
+                .try_lock()
+                .ok()
+                .is_some_and(|process| process.broken);
+            if !broken || !self.core_recovery_authorized() {
+                continue;
+            }
+            let now = tokio::time::Instant::now();
+            if !self.reconnect[index].lock().unwrap().ready(now) {
+                continue;
+            }
+            let connected = timeout(DEADLINE, async {
+                let mut process = Process::attach(
+                    &attach.sockets[index],
+                    &attach.secret,
+                    attach.identity.clone(),
+                )
+                .await?;
+                process
+                    .prepare(&self.deployment, self.launch_policy)
+                    .await?;
+                Ok::<_, AppError>(process)
+            })
+            .await;
+            let Ok(Ok(process)) = connected else {
+                self.reconnect[index]
+                    .lock()
+                    .unwrap()
+                    .failed(tokio::time::Instant::now());
+                continue;
+            };
+            let mut active = worker.write().await;
+            if !Arc::ptr_eq(&active, &previous) || self.stopping.load(Ordering::Acquire) {
+                continue;
+            }
+            self.install(
+                index,
+                &mut active,
+                Generation::new(previous.path.clone(), process),
+            );
+            self.reconnect[index].lock().unwrap().succeeded();
+            eprintln!("Coreへ再接続しました");
+        }
+        self.reap_retired();
+    }
+
+    #[cfg(not(unix))]
+    async fn poll_core_reconnect(&self) {}
 
     /// A short synchronous admission boundary, never held across IPC/await.
     /// Paused ACK is ordered after all previously admitted work, while their

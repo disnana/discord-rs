@@ -196,10 +196,10 @@ async fn read_secret_from_stdin() -> Result<Secret<[u8; SECRET_BYTES]>, CoreServ
 }
 
 /// Process entry for `src --core-listen <absolute socket path>`.
-pub async fn run(socket: PathBuf) -> Result<(), AppError> {
+pub async fn run(socket: PathBuf, lifetime: Lifetime) -> Result<(), AppError> {
     let secret = read_secret_from_stdin().await?;
     let listener = bind_socket(&socket)?;
-    serve(listener, secret, None, Lifetime::OneConnection).await
+    serve(listener, secret, None, lifetime).await
 }
 
 #[cfg(test)]

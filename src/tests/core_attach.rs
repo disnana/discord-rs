@@ -52,8 +52,25 @@ impl Core {
     }
 
     async fn start_with_identity(socket: &Path, secret: &str, identity: Option<&str>) -> Self {
+        Self::start_mode(socket, secret, identity, false).await
+    }
+
+    /// 接続をまたいで動き続ける Core（`--core-persist`）。
+    async fn start_persistent(socket: &Path, secret: &str, identity: &str) -> Self {
+        Self::start_mode(socket, secret, Some(identity), true).await
+    }
+
+    async fn start_mode(
+        socket: &Path,
+        secret: &str,
+        identity: Option<&str>,
+        persistent: bool,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_src"));
         command.arg("--core-listen").arg(socket).env_clear();
+        if persistent {
+            command.arg("--core-persist");
+        }
         if let Some(identity) = identity {
             command.env("BOT_WORKER_IPC_IDENTITY", identity);
         }
@@ -459,5 +476,91 @@ async fn a_persistent_core_serves_a_second_connection_after_the_first_ends() {
     );
     drop(stream);
     bounded(once).await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 持続 Core では、Gateway（Manager）を作り直しても Core の状態（!count）が続く。
+#[tokio::test]
+async fn a_persistent_core_keeps_its_state_for_the_next_manager() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    let first = {
+        let manager = bounded(src::worker::Manager::attach_gateway_pool(
+            deployment(),
+            attach_config(&socket),
+        ))
+        .await
+        .expect("first Manager attaches");
+        let a = bounded(manager.dispatch_key(7, "!count".into()))
+            .await
+            .unwrap();
+        let b = bounded(manager.dispatch_key(7, "!count".into()))
+            .await
+            .unwrap();
+        assert_ne!(a, b);
+        bounded(manager.shutdown()).await.unwrap();
+        b
+    };
+    let manager = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        attach_config(&socket),
+    ))
+    .await
+    .expect("a second Manager attaches to the same Core");
+    let next = bounded(manager.dispatch_key(7, "!count".into()))
+        .await
+        .unwrap();
+    assert_ne!(first, next, "the counter must continue, not restart");
+    assert!(
+        core.child.try_wait().unwrap().is_none(),
+        "the Core stayed up"
+    );
+    bounded(manager.shutdown()).await.unwrap();
+    let _ = core.child.kill().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core が落ちて同じソケットで起動し直されたら、Manager は再接続して続きを処理する。
+/// 再接続は子の起動ではなく接続のやり直し（新しい Core の状態は Core 側のもの）。
+#[tokio::test]
+async fn a_manager_reconnects_to_a_restarted_core() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+    let manager = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        attach_config(&socket),
+    ))
+    .await
+    .unwrap();
+    bounded(manager.dispatch_key(7, "!count".into()))
+        .await
+        .unwrap();
+
+    core.child.kill().await.unwrap();
+    let _replacement = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    // 失敗は許す（切断の検知と再接続の間）。上限付きで再試行して、成功に至ること。
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut served = false;
+    while std::time::Instant::now() < deadline {
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.dispatch_key(7, "!count".into()),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
+        {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(served, "the Manager must reconnect to the restarted Core");
+    bounded(manager.shutdown()).await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
