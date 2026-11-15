@@ -17,6 +17,12 @@ pub const GATEWAY_SHUTDOWN_FRAME: &[u8] = b"{\"command\":\"shutdown\"}\n";
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayControl {
     Shutdown {},
+    /// Tells a standby Gateway (`--standby`) to attach to its Cores with this ownership
+    /// epoch and start handling events. The epoch must be higher than the active
+    /// Gateway's, which is what stops the active one.
+    Activate {
+        epoch: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

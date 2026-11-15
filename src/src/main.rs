@@ -233,6 +233,9 @@ struct GatewayOptions {
     /// Directory of the Cores botd runs for this Shard (separated layout). When set, the
     /// Gateway connects to them instead of starting its own Core processes.
     core_dir: Option<PathBuf>,
+    /// Log in to Discord and buffer events, but attach to the Cores (and so take over from
+    /// the running Gateway) only when told to (`GatewayControl::Activate`).
+    standby: bool,
     /// Ownership epoch this Gateway attaches to its Cores with (0 unless botd says so).
     core_epoch: u64,
 }
@@ -252,6 +255,7 @@ impl GatewayOptions {
                     }
                     options.core_dir = Some(dir);
                 }
+                "--standby" if !options.standby => options.standby = true,
                 "--core-epoch" if options.core_epoch == 0 => {
                     options.core_epoch = args
                         .next()
@@ -283,6 +287,11 @@ impl GatewayOptions {
                 && (!options.launch.is_empty() || options.mock_discord.is_some()))
             || (options.core_dir.is_some() && (options.local_control || !cfg!(unix)))
             || (options.core_epoch != 0 && options.core_dir.is_none())
+            || (options.standby
+                && (options.core_dir.is_none()
+                    || options.core_epoch != 0
+                    || options.mock_discord.is_some()
+                    || options.local_control))
         {
             return Err(StartupFailure::InvalidArguments);
         }
@@ -362,6 +371,106 @@ impl GatewayOptions {
 // A detached OS reader avoids Tokio's uncancellable stdin blocking task keeping
 // the runtime alive after another shutdown source fires. The anonymous pipe is
 // owned by the launcher; EOF/malformed input is never an instruction to stop.
+/// Reads Gateway control frames from stdin for the life of the process: `Shutdown` ends
+/// the reader and signals shutdown; `Activate` reports the epoch and keeps reading. An
+/// invalid or oversized frame, or EOF, ends the reader without signalling anything.
+fn control_input() -> (oneshot::Receiver<()>, mpsc::UnboundedReceiver<u64>) {
+    let (shutdown, shutdown_receiver) = oneshot::channel();
+    let (activate, activate_receiver) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        use src::shard_runtime::{GATEWAY_CONTROL_FRAME_LIMIT, GatewayControl};
+        use std::io::{BufRead, Read};
+        let mut reader = std::io::BufReader::new(std::io::stdin());
+        loop {
+            let mut frame = Vec::new();
+            let read = (&mut reader)
+                .take(GATEWAY_CONTROL_FRAME_LIMIT as u64 + 1)
+                .read_until(b'\n', &mut frame);
+            if !matches!(read, Ok(n) if n > 0)
+                || frame.len() > GATEWAY_CONTROL_FRAME_LIMIT
+                || frame.last() != Some(&b'\n')
+            {
+                return;
+            }
+            match serde_json::from_slice(&frame) {
+                Ok(GatewayControl::Shutdown {}) => {
+                    let _ = shutdown.send(());
+                    return;
+                }
+                Ok(GatewayControl::Activate { epoch }) => {
+                    if epoch == 0 || activate.send(epoch).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    (shutdown_receiver, activate_receiver)
+}
+
+/// A standby Gateway: already logged in to Discord (its own session), receiving events but
+/// not handling them. They are held, up to a limit, until `Activate`; then it attaches to
+/// the Cores with the given epoch, which stops the Gateway that was active, and handles the
+/// held events first. A Core drops a message it has already handled (by its Discord id),
+/// so what both Gateways saw is not done twice. Exceeding the limit aborts: events are
+/// never silently discarded.
+async fn run_standby(
+    options: &GatewayOptions,
+    deployment: worker::DeploymentIdentity,
+    mut shard: Shard,
+    http: Arc<Client>,
+) -> Result<(), AppError> {
+    const BACKLOG_LIMIT: usize = 512;
+    #[cfg(not(unix))]
+    {
+        let _ = (options, deployment, &mut shard, http);
+        Err(StartupFailure::InvalidArguments.into())
+    }
+    #[cfg(unix)]
+    {
+        let dir = options
+            .core_dir
+            .clone()
+            .ok_or(StartupFailure::InvalidArguments)?;
+        let (shutdown, mut activation) = control_input();
+        let shutdown = shutdown_requested(shutdown);
+        tokio::pin!(shutdown);
+        println!("待機Gatewayを起動しています...");
+        let mut backlog = std::collections::VecDeque::new();
+        let epoch = loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => return Ok(()),
+                Some(epoch) = activation.recv() => break epoch,
+                event = shard.next_event(EventTypeFlags::all()) => match event {
+                    Some(event) => {
+                        if backlog.len() >= BACKLOG_LIMIT {
+                            eprintln!("待機Gatewayのイベントが上限を超えたため中止します");
+                            return Err(StartupFailure::InvalidArguments.into());
+                        }
+                        backlog.push_back(event);
+                    }
+                    None => {
+                        eprintln!("待機Gatewayが再接続できない切断で終了しました");
+                        return Err(StartupFailure::InvalidArguments.into());
+                    }
+                },
+            }
+        };
+        let attach = src::core_attach::load(&dir, deployment.bot_id, deployment.shard, epoch)?;
+        let manager = worker::Manager::attach_gateway_pool(deployment, attach).await?;
+        manager.start_jobs();
+        println!(
+            "待機Gatewayを有効にしました（epoch {epoch}、保留 {} 件）",
+            backlog.len()
+        );
+        let result = live_events(shard, http, manager.clone(), backlog, shutdown).await;
+        let _ = manager.shutdown().await;
+        result
+    }
+}
+
 fn shutdown_input(enabled: bool) -> oneshot::Receiver<()> {
     let (sender, receiver) = oneshot::channel();
     if enabled {
@@ -869,6 +978,10 @@ async fn run() -> Result<(), AppError> {
     } else {
         None
     };
+    if options.standby {
+        let (shard, http) = live.expect("a standby Gateway uses the live Discord path");
+        return run_standby(&options, deployment, shard, http).await;
+    }
     let manager = match &options.core_dir {
         #[cfg(unix)]
         Some(dir) => {
@@ -909,7 +1022,14 @@ async fn run() -> Result<(), AppError> {
         .await
     } else {
         let (shard, http) = live.expect("one explicit gateway mode");
-        live_events(shard, http, manager.clone(), shutdown).await
+        live_events(
+            shard,
+            http,
+            manager.clone(),
+            std::collections::VecDeque::new(),
+            shutdown_requested(shutdown),
+        )
+        .await
     };
     // A watcher is not allowed to install another generation during shutdown.
     background.abort_all();
@@ -951,19 +1071,25 @@ async fn live_gateway(
     Ok((Shard::with_config(shard_id, config), http))
 }
 
+type ShardEvent = Result<Event, twilight_gateway::error::ReceiveMessageError>;
+
 async fn live_events(
     mut shard: Shard,
     http: Arc<Client>,
     manager: Arc<worker::Manager>,
-    shutdown: oneshot::Receiver<()>,
+    mut backlog: std::collections::VecDeque<ShardEvent>,
+    shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), AppError> {
     let capacity = Arc::new(Semaphore::new(64));
     let mut requests = JoinSet::new();
-    let shutdown = shutdown_requested(shutdown);
     tokio::pin!(shutdown);
     println!("Botを起動しています...");
     loop {
-        let result = tokio::select! {
+        // Events a standby Gateway held back come first, in the order they arrived.
+        let result = if let Some(held) = backlog.pop_front() {
+            held
+        } else {
+            tokio::select! {
             biased;
             _ = &mut shutdown => break,
             _ = requests.join_next(), if !requests.is_empty() => continue,
@@ -977,6 +1103,7 @@ async fn live_events(
                     break;
                 }
             },
+            }
         };
         match result {
             Ok(Event::Ready(ready)) => {
