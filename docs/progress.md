@@ -256,3 +256,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 ### 訂正（終了直後）
 - Gateway と Core の分離の設計書は、サブエージェントが停止され、**未作成**（成果物なし）。次回、あらためて作成する（読み取り調査 → `docs/gateway-core-separation-design.md`）。上の『作業中』の記述は、この訂正を正とする。
+
+## 2026-11-15：実 Discord・実 systemd での常駐・自動復旧・Core の無停止更新の実機確認（成功）
+- 環境：WSL2 の Ubuntu 24.04（systemd）、ユーザーのテスト用 Bot、main 1ad8daa（Identify のローカル許可と Core 状態の永続化を含む）。unit は出荷版（`--stop-children-on-exit`）、token は `/etc/discord-rs/botd.env`（0640）。
+- 結果（すべて実 Discord）：(1) 常駐の起動：`ログイン成功`、`/ping`・`!ping`・`!count` が返る。(2) Gateway を `kill -9`：**2 秒で自動復旧**（`restarts: 1`、`--- gateway generation 2 ---` で再ログイン）。前日は `Failed`・`restart_exhausted: true` で復旧しなかった。(3) 復旧後の `!count`：3 → **4**（Core の確認済みスナップショットの永続化が Gateway の再起動をまたいで働いた）。(4) botd を `kill -9`：**6 秒で systemd が再起動**（`NRestarts=1`）、`daemon: removed stale launch reservation (no live Gateway)` で古い予約が整理され、Gateway が復帰。`!count` は **5**。(5) Core（Worker）の無停止更新：`worker-path.txt` に新しい実行ファイルのパスを書くと、**Gateway の PID は不変のまま** 2 秒で Worker が 2 つとも入れ替わり（`Worker 1/2 を切り替えました`、`Worker 2/2 を切り替えました`）、`!count` は **6**。(6) `systemctl stop`：0 秒で `Result=success`、子も含め残りプロセス 0、起動予約 0、`core-state.json` は残る。
+- 実機で分かった WSL の注意：WSL2 はアイドルで VM ごと停止する（約 25 秒）。**開いた端末（セッション）がないと botd が道連れで止まる**。実験中は WSL の端末を開いたままにする（または `.wslconfig` の `vmIdleTimeout`）。バックグラウンドの `wsl.exe -- sleep` では維持できなかった。
+- 未検証：WSL の再起動後の botd の自動起動（`systemctl enable` していない）、長時間稼働、Resume、複数 Shard、レート制限の実機、Gateway の無停止更新（ローリング）、Gateway と Core の分離（通常経路は未実装。ロードマップ）。
+- 修正済みの課題：実 Discord の Gateway 自動復旧（ローカルの Identify 許可：30 秒間隔・1 時間 10 回）、再起動をまたぐ `!count` の維持（確認済みスナップショットの永続化。イベントのジャーナルとカーソルは保存せず、`kill -9` では最大約 2.5 秒分が失われる）。

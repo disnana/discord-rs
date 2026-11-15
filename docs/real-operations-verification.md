@@ -4,6 +4,9 @@ systemd で常駐させた botd を、実 Discord で動かして、次の 3 つ
 
 前提：[real-discord-verification.md](real-discord-verification.md) の「最初の 30 分」が、すでに成功していること（認証、Slash 登録、Gateway 単体、botd 手動起動）。テスト用 Bot とテスト用ギルドだけを使う。
 
+> **実機での結果（2026-11-15、WSL2 の実 systemd、実 Discord）**: 試験 2〜6 のうち、Worker の自動復旧、Gateway の自動復旧、botd 異常終了からの復旧、停止、Core の無停止更新は成功し、`!count` は更新・再起動をまたいで続いた（結果は `docs/progress.md`）。試験 1 のうち「OS 再起動後の自動起動」は未実施（`systemctl enable` が必要）。
+> **WSL で行う場合の注意**: WSL2 は、開いた端末がないとアイドル（約 25 秒）で VM ごと停止し、botd も止まる。実験中は WSL の端末を開いたままにする。
+
 ## 確認できること／できないこと
 
 | 項目 | 実 Discord で試せるか | 備考 |
