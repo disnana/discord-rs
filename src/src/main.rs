@@ -230,6 +230,9 @@ struct GatewayOptions {
     launch: BTreeMap<String, OsString>,
     mock_discord: Option<SocketAddr>,
     local_control: bool,
+    /// Directory of the Cores botd runs for this Shard (separated layout). When set, the
+    /// Gateway connects to them instead of starting its own Core processes.
+    core_dir: Option<PathBuf>,
 }
 
 impl GatewayOptions {
@@ -240,6 +243,13 @@ impl GatewayOptions {
             let flag = flag.to_str().ok_or(StartupFailure::InvalidArguments)?;
             match flag {
                 "--local-control" if !options.local_control => options.local_control = true,
+                "--core-dir" if options.core_dir.is_none() => {
+                    let dir = PathBuf::from(args.next().ok_or(StartupFailure::InvalidArguments)?);
+                    if !dir.is_absolute() || dir.components().any(|p| p == Component::ParentDir) {
+                        return Err(StartupFailure::InvalidArguments);
+                    }
+                    options.core_dir = Some(dir);
+                }
                 "--mock-discord" if options.mock_discord.is_none() => {
                     let addr = args.next().ok_or(StartupFailure::InvalidArguments)?;
                     let addr = addr
@@ -262,6 +272,7 @@ impl GatewayOptions {
         if (!options.launch.is_empty() && options.launch.len() != 7)
             || (options.local_control
                 && (!options.launch.is_empty() || options.mock_discord.is_some()))
+            || (options.core_dir.is_some() && (options.local_control || !cfg!(unix)))
         {
             return Err(StartupFailure::InvalidArguments);
         }
@@ -848,7 +859,16 @@ async fn run() -> Result<(), AppError> {
     } else {
         None
     };
-    let manager = worker::Manager::start_gateway_pool(env::current_exe()?, 2, deployment).await?;
+    let manager = match &options.core_dir {
+        #[cfg(unix)]
+        Some(dir) => {
+            let attach = src::core_attach::load(dir, deployment.bot_id, deployment.shard)?;
+            worker::Manager::attach_gateway_pool(deployment, attach).await?
+        }
+        #[cfg(not(unix))]
+        Some(_) => return Err(StartupFailure::InvalidArguments.into()),
+        None => worker::Manager::start_gateway_pool(env::current_exe()?, 2, deployment).await?,
+    };
     let shutdown = shutdown_input(!options.launch.is_empty() || options.mock_discord.is_some());
     let mut background = JoinSet::new();
     if let Some(bootstrap) = bootstrap {
@@ -858,7 +878,10 @@ async fn run() -> Result<(), AppError> {
         });
     }
     manager.start_jobs();
-    background.spawn(manager.clone().watch(watch_file));
+    // Hot-swapping Cores is not supported for Cores botd owns (a later stage).
+    if options.core_dir.is_none() {
+        background.spawn(manager.clone().watch(watch_file));
+    }
     let result = if let Some(stream) = &mut mock {
         mock_events(
             stream,

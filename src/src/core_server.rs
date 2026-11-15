@@ -199,6 +199,17 @@ async fn read_secret_from_stdin() -> Result<Secret<[u8; SECRET_BYTES]>, CoreServ
 pub async fn run(socket: PathBuf, lifetime: Lifetime) -> Result<(), AppError> {
     let secret = read_secret_from_stdin().await?;
     let listener = bind_socket(&socket)?;
+    if lifetime == Lifetime::UntilStopped {
+        // A persistent Core is supervised by whoever holds the other end of its stdin
+        // (botd). When that end closes, whether botd stopped it or died, the Core exits:
+        // it must not linger as an unreachable orphan holding state.
+        tokio::spawn(async {
+            let mut stdin = tokio::io::stdin();
+            let mut sink = [0u8; 64];
+            while matches!(stdin.read(&mut sink).await, Ok(n) if n > 0) {}
+            std::process::exit(0);
+        });
+    }
     serve(listener, secret, None, lifetime).await
 }
 

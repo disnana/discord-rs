@@ -5,8 +5,12 @@ pub mod cluster;
 pub mod cluster_runtime;
 mod cogs;
 #[cfg(unix)]
+pub mod core_attach;
+#[cfg(unix)]
 pub mod core_server;
 pub mod core_state;
+#[cfg(unix)]
+pub mod core_units;
 pub mod daemon;
 pub mod daemon_metrics;
 pub mod drain;
