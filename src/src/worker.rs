@@ -3208,10 +3208,16 @@ pub async fn run_with_state_store(
 struct WorkerReader {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    // Connection-oriented Core: the reader is an async task (a socket read can be
+    // cancelled, unlike a blocking stdin read), aborted together with the loop.
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 impl Drop for WorkerReader {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
         if let Some(thread) = self.thread.take()
             && thread.is_finished()
         {
@@ -3237,10 +3243,57 @@ fn read_blocking_frame<R: std::io::BufRead>(reader: &mut R) -> Result<Option<Vec
     Ok(Some(frame))
 }
 
+/// Where one Core session reads requests from and writes responses to. The managed
+/// child Core uses its stdin/stdout; a connection-oriented Core (see
+/// docs/gateway-core-separation-design.md) is handed an accepted socket instead.
+/// The request loop itself is identical, so every capability keeps one implementation.
+pub(crate) struct CoreIo {
+    output: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    input: CoreInput,
+}
+
+enum CoreInput {
+    /// The process stdin, read by a dedicated OS thread (a blocking read cannot be
+    /// interrupted portably, so it must never run on the runtime).
+    Stdin,
+    /// Any cancellable async byte stream, read by a task.
+    Stream(Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+}
+
+impl CoreIo {
+    pub(crate) fn stdio() -> Self {
+        Self {
+            output: Box::new(tokio::io::stdout()),
+            input: CoreInput::Stdin,
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub(crate) fn socket(stream: tokio::net::UnixStream) -> Self {
+        let (read, write) = stream.into_split();
+        Self {
+            output: Box::new(write),
+            input: CoreInput::Stream(Box::new(read)),
+        }
+    }
+}
+
 async fn run_with_backend(
     backend: Option<Arc<dyn crate::state_store::StateStore>>,
 ) -> Result<(), AppError> {
-    let mut output = tokio::io::stdout();
+    serve_core(backend, CoreIo::stdio()).await
+}
+
+async fn serve_core(
+    backend: Option<Arc<dyn crate::state_store::StateStore>>,
+    io: CoreIo,
+) -> Result<(), AppError> {
+    let CoreIo {
+        output,
+        input: source,
+    } = io;
+    let mut output = output;
     let mut state = crate::cogs::State::default();
     let runtime = Arc::new(crate::cogs::FrameworkRuntime::default());
     bot_framework::commands()?;
@@ -3267,45 +3320,88 @@ async fn run_with_backend(
     let reader_drain = drain.clone();
     let reader_enabled = drain_enabled.clone();
     let reader_stop = Arc::new(AtomicBool::new(false));
-    let stopped = reader_stop.clone();
-    let reader = std::thread::Builder::new()
-        .name("worker-input".into())
-        .spawn(move || {
-            let stdin = std::io::stdin();
-            let mut reader = std::io::BufReader::new(stdin.lock());
-            loop {
-                if stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                let next = match read_blocking_frame(&mut reader) {
-                    Ok(Some(frame)) => serde_json::from_slice::<Request>(&frame)
-                        .map_err(|error| Box::new(error) as AppError),
-                    Ok(None) => break,
-                    Err(error) => Err(error),
-                };
-                match next {
-                    Ok(Request::BeginDrain) if reader_enabled.load(Ordering::Acquire) => {
-                        reader_drain.send_replace(true);
-                    }
-                    Ok(Request::BeginDrain) => {
-                        let _ = requests
-                            .blocking_send(Err(failure("worker drain signal was not negotiated")));
-                        break;
-                    }
-                    request => {
-                        let failed = request.is_err();
-                        if requests.blocking_send(request).is_err() || failed {
+    let _reader = match source {
+        CoreInput::Stdin => {
+            let stopped = reader_stop.clone();
+            let reader = std::thread::Builder::new()
+                .name("worker-input".into())
+                .spawn(move || {
+                    let stdin = std::io::stdin();
+                    let mut reader = std::io::BufReader::new(stdin.lock());
+                    loop {
+                        if stopped.load(Ordering::Acquire) {
                             break;
+                        }
+                        let next = match read_blocking_frame(&mut reader) {
+                            Ok(Some(frame)) => serde_json::from_slice::<Request>(&frame)
+                                .map_err(|error| Box::new(error) as AppError),
+                            Ok(None) => break,
+                            Err(error) => Err(error),
+                        };
+                        match next {
+                            Ok(Request::BeginDrain) if reader_enabled.load(Ordering::Acquire) => {
+                                reader_drain.send_replace(true);
+                            }
+                            Ok(Request::BeginDrain) => {
+                                let _ = requests.blocking_send(Err(failure(
+                                    "worker drain signal was not negotiated",
+                                )));
+                                break;
+                            }
+                            request => {
+                                let failed = request.is_err();
+                                if requests.blocking_send(request).is_err() || failed {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Parent loss cancels local waits even when no control message arrived.
+                    reader_drain.send_replace(true);
+                })?;
+            WorkerReader {
+                stop: reader_stop,
+                thread: Some(reader),
+                task: None,
+            }
+        }
+        CoreInput::Stream(stream) => {
+            let task = tokio::spawn(async move {
+                let mut reader = BufReader::new(stream);
+                loop {
+                    let next = match read_frame(&mut reader).await {
+                        Ok(Some(frame)) => serde_json::from_slice::<Request>(&frame)
+                            .map_err(|error| Box::new(error) as AppError),
+                        Ok(None) => break,
+                        Err(error) => Err(error),
+                    };
+                    match next {
+                        Ok(Request::BeginDrain) if reader_enabled.load(Ordering::Acquire) => {
+                            reader_drain.send_replace(true);
+                        }
+                        Ok(Request::BeginDrain) => {
+                            let _ = requests
+                                .send(Err(failure("worker drain signal was not negotiated")))
+                                .await;
+                            break;
+                        }
+                        request => {
+                            let failed = request.is_err();
+                            if requests.send(request).await.is_err() || failed {
+                                break;
+                            }
                         }
                     }
                 }
+                // Peer loss cancels local waits even when no control message arrived.
+                reader_drain.send_replace(true);
+            });
+            WorkerReader {
+                stop: reader_stop,
+                thread: None,
+                task: Some(task),
             }
-            // Parent loss cancels local waits even when no control message arrived.
-            reader_drain.send_replace(true);
-        })?;
-    let _reader = WorkerReader {
-        stop: reader_stop,
-        thread: Some(reader),
+        }
     };
     let mut pending_results = std::collections::HashSet::new();
     let mut event_stream_initialized = false;
