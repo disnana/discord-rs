@@ -10,7 +10,7 @@ CLUSTER="cluster_sim raft_cluster_runtime e2e_cluster_processes"
 DAEMON="botctl_daemon fixture_build raft_quorum"
 # Tests that spawn several real botd/Gateway/Worker processes each. They get their
 # own shard because they are the slowest and most CPU hungry.
-PROCESS="e2e_gateway_process_switch botd_child_recovery gateway_admission_process hot_swap_scenarios raft_botd_processes botd_metrics child_recovery_processes worker_child_recovery e2e_shard_worker e2e_shard_runtime"
+PROCESS="core_attach e2e_gateway_process_switch botd_child_recovery gateway_admission_process hot_swap_scenarios raft_botd_processes botd_metrics child_recovery_processes worker_child_recovery e2e_shard_worker e2e_shard_runtime"
 
 targets() {
   cargo metadata --locked --no-deps --format-version 1 \
