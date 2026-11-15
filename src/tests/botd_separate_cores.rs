@@ -113,6 +113,11 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// `stub`: a script used as the Gateway program instead of the real binary.
+    async fn start_with(stub: Option<&dyn Fn(&Path) -> PathBuf>) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // Short: Unix socket paths are limited to about 100 bytes.
         let root = std::env::temp_dir().join(format!(
@@ -124,6 +129,10 @@ impl Fixture {
         std::fs::create_dir_all(&root).unwrap();
         let config = root.join("placement.toml");
         std::fs::write(&config, CONFIG).unwrap();
+        let program = match stub {
+            Some(make) => make(&root),
+            None => PathBuf::from(env!("CARGO_BIN_EXE_src")),
+        };
         let collector = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_botd"));
         command
@@ -132,7 +141,7 @@ impl Fixture {
             .arg("--runtime-root")
             .arg(&root)
             .arg("--gateway-program")
-            .arg(env!("CARGO_BIN_EXE_src"))
+            .arg(&program)
             .args([
                 "--bootstrap-stdin",
                 "--stop-children-on-exit",
@@ -505,5 +514,102 @@ async fn a_core_crash_during_a_gateway_update_leaves_a_working_system() {
         .filter(|p| p.extension().is_some_and(|e| e == "sock" || e == "secret"))
         .collect();
     assert!(ipc.is_empty(), "sockets or secret left behind: {ipc:?}");
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+/// A Gateway program that behaves like the real one, except that a `--standby` launch logs
+/// in (writes `standby-ready`) and then never confirms that it holds the Cores.
+fn silent_standby_program(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = root.join("gw.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+case " $* " in
+  *" --standby "*)
+    state=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--state-path" ]; then state="$arg"; fi
+      prev="$arg"
+    done
+    mkdir -p "$state"
+    echo ready > "$state/standby-ready"
+    exec cat > /dev/null
+    ;;
+  *) exec {real} "$@" ;;
+esac
+"#,
+            real = env!("CARGO_BIN_EXE_src")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// If the activated standby never confirms that it holds the Cores, the update fails; the
+/// running Gateway (already cut off from the Cores by the higher epoch) is killed and botd
+/// brings a Gateway back, with the raised epoch, onto the very same Cores.
+#[tokio::test]
+async fn an_update_whose_standby_never_confirms_fails_and_the_gateway_recovers() {
+    let fixture = Fixture::start_with(Some(&silent_standby_program)).await;
+    let first = fixture.accept().await;
+    let cores = worker_pids(&first.ready);
+    let old_pid = first.pid();
+
+    let id = "fedcba9876543210fedcba9876543210";
+    let admitted = control(
+        fixture.port,
+        json!({"command":"gateway-update","bot":"101","operation_id":id}),
+    )
+    .await;
+    assert_eq!(admitted["ok"], true, "{admitted}");
+
+    // The standby stub never confirms: the operation fails after the confirmation window.
+    let finished = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let view = control(
+                fixture.port,
+                json!({"command":"operation","operation_id":id}),
+            )
+            .await;
+            if view["operation"]["state"] != "running" {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the update ends");
+    assert_eq!(finished["operation"]["state"], "failed", "{finished}");
+
+    // The old Gateway is gone, a new one serves the same Cores, and the failure is on record.
+    bounded(async {
+        while alive(old_pid) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let second = fixture.accept().await;
+    assert_ne!(second.pid(), old_pid);
+    assert_eq!(worker_pids(&second.ready), cores, "the Cores were kept");
+    let audit = std::fs::read_to_string(fixture.root.join("gateway-update-audit.jsonl")).unwrap();
+    let words: Vec<_> = audit
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap()["event"].clone())
+        .collect();
+    assert_eq!(words, [json!("requested"), json!("failed")], "{audit}");
+
+    signal(fixture.daemon.id().unwrap(), "TERM");
+    let mut daemon = fixture.daemon;
+    bounded(daemon.wait()).await.unwrap();
+    bounded(async {
+        while [second.pid(), cores[0], cores[1]].into_iter().any(alive) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
