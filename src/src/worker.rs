@@ -686,6 +686,63 @@ impl Process {
         Ok(process)
     }
 
+    /// Connects to a Core that is already running and owned by someone else (botd), as
+    /// opposed to `spawn`, which starts and owns a child. The Core's identity is chosen by
+    /// its owner and must be passed in: Hello requires both sides to present the same one.
+    /// There is no child handle, so a lost connection is reported as a failure and never as
+    /// permission to replace anything (see `exited`).
+    #[cfg(unix)]
+    pub(crate) async fn attach(
+        socket: &Path,
+        secret: &crate::redact::Secret<[u8; crate::secret_file::SECRET_BYTES]>,
+        identity: crate::protocol::Identity,
+    ) -> Result<Self, AppError> {
+        let mut stream = timeout(DEADLINE, tokio::net::UnixStream::connect(socket))
+            .await
+            .map_err(|_| failure("core connect timed out"))?
+            .map_err(|_| failure("core connect failed"))?;
+        // The first line authenticates this client to the Core (64 hex digits and a
+        // newline), built in a fixed buffer that is wiped as soon as it is written.
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut line = [0u8; crate::secret_file::SECRET_BYTES * 2 + 1];
+        for (index, byte) in secret.expose_secret().iter().enumerate() {
+            line[index * 2] = HEX[usize::from(byte >> 4)];
+            line[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+        }
+        line[crate::secret_file::SECRET_BYTES * 2] = b'\n';
+        let written = timeout(DEADLINE, stream.write_all(&line)).await;
+        crate::secret_file::wipe(&mut line);
+        written
+            .map_err(|_| failure("core attach timed out"))?
+            .map_err(|_| failure("core attach failed"))?;
+        let (read, write) = stream.into_split();
+        let input: ProcessWriter = Box::new(write);
+        let output = BufReader::new(Box::new(read) as ProcessReader);
+        Ok(Self {
+            ownership: Arc::new(ChildOwnership {
+                child: Mutex::new(None),
+                recovery_generation: AtomicU64::new(0),
+            }),
+            // Unknown to the Gateway: only the Core's own report of its pid is available.
+            child_pid: 0,
+            launch_identity: identity,
+            exit_status: Arc::new(StdMutex::new(None)),
+            input: Arc::new(Mutex::new(Some(input))),
+            output,
+            broken: false,
+            transfer: Arc::new(StdMutex::new(TransferState {
+                events: crate::event_seq::Sender::new(64, 0, MAX_FRAME_BYTES as usize, 0)
+                    .expect("fixed valid worker event buffer"),
+                checkpoint: None,
+            })),
+            build: String::new(),
+            pid: 0,
+            supported_capabilities: Vec::new(),
+            identity: None,
+            credential_free: false,
+        })
+    }
+
     fn spawn(
         path: &Path,
         deployment: &DeploymentIdentity,
@@ -819,7 +876,10 @@ impl Process {
                 {
                     return Err(failure("worker lacks required Gateway capabilities"));
                 }
-                if process.supports(API_RESULT_CAPABILITY) && process.child_pid != pid {
+                if process.supports(API_RESULT_CAPABILITY)
+                    && process.child_pid != 0
+                    && process.child_pid != pid
+                {
                     return Err(failure("worker API result process identity mismatch"));
                 }
                 if let Some(config) = &deployment.interaction_state {
@@ -3991,4 +4051,35 @@ mod frame_tests {
             MAX_FRAME_BYTES as usize
         );
     }
+}
+
+/// What an attach probe learned about the Core it connected to. Test support for the
+/// connection-oriented Core (docs/gateway-core-separation-design.md); not a production API.
+#[cfg(unix)]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AttachProbe {
+    pub core_pid: u32,
+    pub credential_free: bool,
+    pub capabilities: Vec<String>,
+}
+
+/// Connects to a running Core, authenticates, and runs the same Health/Hello preparation
+/// that a spawned Core goes through. The Core's identity (chosen by whoever started it)
+/// must be supplied; a mismatch fails the handshake exactly as it does today.
+#[cfg(unix)]
+#[doc(hidden)]
+pub async fn probe_attach(
+    socket: &Path,
+    secret: &crate::redact::Secret<[u8; crate::secret_file::SECRET_BYTES]>,
+    identity: crate::protocol::Identity,
+    deployment: &DeploymentIdentity,
+) -> Result<AttachProbe, AppError> {
+    let mut process = Process::attach(socket, secret, identity).await?;
+    process.prepare(deployment, LaunchPolicy::default()).await?;
+    Ok(AttachProbe {
+        core_pid: process.pid,
+        credential_free: process.credential_free,
+        capabilities: process.supported_capabilities.clone(),
+    })
 }

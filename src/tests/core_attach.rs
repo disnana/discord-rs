@@ -48,10 +48,16 @@ struct Core {
 impl Core {
     /// Core を起動して、秘密を stdin で渡し、ソケットができるまで待つ。
     async fn start(socket: &Path, secret: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_src"))
-            .arg("--core-listen")
-            .arg(socket)
-            .env_clear()
+        Self::start_with_identity(socket, secret, None).await
+    }
+
+    async fn start_with_identity(socket: &Path, secret: &str, identity: Option<&str>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_src"));
+        command.arg("--core-listen").arg(socket).env_clear();
+        if let Some(identity) = identity {
+            command.env("BOT_WORKER_IPC_IDENTITY", identity);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -257,5 +263,80 @@ async fn a_stale_socket_is_replaced_but_a_regular_file_is_never_overwritten() {
         .unwrap();
     assert!(!bounded(child.wait()).await.unwrap().success());
     assert_eq!(std::fs::read(&path).unwrap(), b"precious");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn identity() -> src::protocol::Identity {
+    src::protocol::Identity {
+        bot_id: src::protocol::BotId(101),
+        shard: src::protocol::Shard::new(0, 1).unwrap(),
+        generation_id: src::protocol::GenerationId(7),
+        ownership_epoch: src::protocol::OwnershipEpoch(0),
+    }
+}
+
+fn deployment() -> src::worker::DeploymentIdentity {
+    src::worker::DeploymentIdentity::parse(|name| {
+        Ok(match name {
+            "BOT_ID" => Some("101".to_owned()),
+            "SHARD_ID" => Some("0".to_owned()),
+            "TOTAL_SHARDS" => Some("1".to_owned()),
+            _ => None,
+        })
+    })
+    .unwrap()
+}
+
+fn secret() -> src::redact::Secret<[u8; 32]> {
+    src::secret_file::parse_hex_secret(SECRET.as_bytes()).unwrap()
+}
+
+#[tokio::test]
+async fn a_gateway_side_process_attaches_and_completes_the_hello_handshake() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_with_identity(&socket, SECRET, Some(&identity_json)).await;
+
+    // Gateway と同じ経路（Process::attach → prepare の Health/Hello）で接続する。
+    let probe = bounded(src::worker::probe_attach(
+        &socket,
+        &secret(),
+        identity(),
+        &deployment(),
+    ))
+    .await
+    .expect("attach and handshake");
+    assert!(probe.credential_free, "{probe:?}");
+    assert!(probe.core_pid > 0, "{probe:?}");
+    assert!(
+        probe.capabilities.iter().any(|cap| cap == "snapshot-v3") || !probe.capabilities.is_empty(),
+        "{probe:?}"
+    );
+    let _ = bounded(core.child.wait()).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_mismatched_identity_fails_the_handshake_as_it_does_for_a_child_core() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_with_identity(&socket, SECRET, Some(&identity_json)).await;
+
+    let mut other = identity();
+    other.generation_id = src::protocol::GenerationId(8);
+    let result = bounded(src::worker::probe_attach(
+        &socket,
+        &secret(),
+        other,
+        &deployment(),
+    ))
+    .await;
+    assert!(
+        result.is_err(),
+        "a different Core generation must not attach"
+    );
+    let _ = bounded(core.child.wait()).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
