@@ -340,3 +340,79 @@ async fn a_mismatched_identity_fails_the_handshake_as_it_does_for_a_child_core()
     let _ = bounded(core.child.wait()).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Manager が接続型で Core を使う（Gateway が botd 管理の Core に接続する形）。
+fn attach_config(socket: &Path) -> src::worker::CoreAttach {
+    src::worker::CoreAttach {
+        sockets: vec![socket.to_path_buf()],
+        secret: secret(),
+        identity: identity(),
+    }
+}
+
+#[tokio::test]
+async fn a_manager_attached_to_a_core_processes_commands_and_shutdown_leaves_the_core_alone() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_with_identity(&socket, SECRET, Some(&identity_json)).await;
+
+    let manager = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        attach_config(&socket),
+    ))
+    .await
+    .expect("attach a Manager to the running Core");
+
+    // 既存のコマンド経路がそのまま動く（!count は Core のカウンター）。
+    let first = bounded(manager.dispatch_key(7, "!count".into()))
+        .await
+        .expect("first !count");
+    let second = bounded(manager.dispatch_key(7, "!count".into()))
+        .await
+        .expect("second !count");
+    assert_ne!(
+        first, second,
+        "the Core's counter must advance: {first:?} {second:?}"
+    );
+
+    // Manager の終了は接続を閉じるだけ。Core の終了を待って固まらない。
+    let started = std::time::Instant::now();
+    bounded(manager.shutdown())
+        .await
+        .expect("shutdown of an attached Manager");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown must not wait for an exit status it can never observe"
+    );
+
+    // 1 接続の寿命の Core（1-B1）は、接続が閉じたので自分で終了する。Manager が殺したのではない。
+    let status = bounded(core.child.wait()).await.unwrap();
+    assert!(
+        status.code().is_some(),
+        "the Core exits by itself: {status:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn attaching_to_a_core_with_a_different_identity_fails_before_any_command() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_with_identity(&socket, SECRET, Some(&identity_json)).await;
+
+    let mut wrong = attach_config(&socket);
+    wrong.identity.generation_id = src::protocol::GenerationId(99);
+    let result = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        wrong,
+    ))
+    .await;
+    assert!(
+        result.is_err(),
+        "a Manager must not attach to a Core of another generation"
+    );
+    let _ = bounded(core.child.wait()).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

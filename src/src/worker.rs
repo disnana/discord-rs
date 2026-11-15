@@ -669,6 +669,19 @@ struct Process {
     credential_free: bool,
 }
 
+/// Where a Manager gets its Cores from. `Spawn` is the embedded layout: the Manager starts
+/// and owns the child processes. `Attach` is the separated layout: the Cores are started and
+/// supervised by botd, and the Gateway only connects to them (docs/gateway-core-separation-design.md).
+#[cfg(unix)]
+pub struct CoreAttach {
+    /// One socket per Core slot, in slot order.
+    pub sockets: Vec<PathBuf>,
+    /// The capability secret botd gave the Cores; shared with the Gateway over its stdin.
+    pub secret: crate::redact::Secret<[u8; crate::secret_file::SECRET_BYTES]>,
+    /// The identity each Core was started with (Hello requires an exact match).
+    pub identity: crate::protocol::Identity,
+}
+
 #[derive(Clone, Copy, Default)]
 struct LaunchPolicy {
     isolated: bool,
@@ -1439,6 +1452,9 @@ pub struct Manager {
     gateway_admission: Option<StdMutex<GatewayAdmission>>,
     core_recovery: Vec<StdMutex<CoreRecovery>>,
     persist: Option<crate::core_state::Persister>,
+    /// True when the Cores belong to botd. The Manager then never spawns or replaces one:
+    /// reconnecting after a lost connection is a separate step, not a respawn.
+    attached: bool,
 }
 
 struct GatewayAdmission {
@@ -1640,15 +1656,63 @@ impl Manager {
         deployment: DeploymentIdentity,
         launch_policy: LaunchPolicy,
     ) -> Result<Arc<Self>, AppError> {
+        #[cfg(unix)]
+        {
+            Self::start_pool_inner(path, count, deployment, launch_policy, None).await
+        }
+        #[cfg(not(unix))]
+        {
+            Self::start_pool_inner(path, count, deployment, launch_policy).await
+        }
+    }
+
+    /// Connects to Cores that botd already runs (stage 1-B2 of the Gateway/Core separation).
+    /// Nothing is spawned. A lost connection is not recovered yet: the Manager reports it and
+    /// the Gateway ends, which botd then restarts (reconnection is the next step).
+    #[cfg(unix)]
+    pub async fn attach_gateway_pool(
+        deployment: DeploymentIdentity,
+        attach: CoreAttach,
+    ) -> Result<Arc<Self>, AppError> {
+        let count = attach.sockets.len();
+        let path = attach
+            .sockets
+            .first()
+            .cloned()
+            .ok_or_else(|| failure("no Core socket given"))?;
+        Self::start_pool_inner(
+            path,
+            count,
+            deployment,
+            LaunchPolicy {
+                isolated: true,
+                require_gateway_capabilities: true,
+            },
+            Some(attach),
+        )
+        .await
+    }
+
+    async fn start_pool_inner(
+        path: PathBuf,
+        count: usize,
+        deployment: DeploymentIdentity,
+        launch_policy: LaunchPolicy,
+        #[cfg(unix)] attach: Option<CoreAttach>,
+    ) -> Result<Arc<Self>, AppError> {
         if count == 0 {
             return Err(failure("Worker数は1以上にしてください"));
         }
+        #[cfg(unix)]
+        let attached = attach.is_some();
+        #[cfg(not(unix))]
+        let attached = false;
         // Confirmed legacy count/job state persisted by an earlier Manager of
         // this exact Shard. Any defect yields empty state, never a failure.
         let (persist, restored) = match deployment
             .state_dir
             .clone()
-            .filter(|_| deployment.core_launch.is_none())
+            .filter(|_| deployment.core_launch.is_none() && !attached)
         {
             Some(dir) => {
                 let _ = tokio::fs::create_dir_all(&dir).await;
@@ -1668,15 +1732,32 @@ impl Manager {
         let mut core_recovery = Vec::with_capacity(count);
         for index in 0..count {
             let mut owner = CoreRecovery::new(&deployment)?;
-            let mut process = owner
-                .poll(&mut CoreRecoveryHost {
-                    path: &path,
-                    deployment: &deployment,
-                    policy: launch_policy,
-                    authorized: &|| true,
-                    candidate: None,
-                })
-                .ok_or_else(|| failure("Core initial spawn failed"))?;
+            #[cfg(unix)]
+            let attached_process = match &attach {
+                Some(attach) => Some(
+                    Process::attach(
+                        &attach.sockets[index],
+                        &attach.secret,
+                        attach.identity.clone(),
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
+            #[cfg(not(unix))]
+            let attached_process: Option<Process> = None;
+            let mut process = match attached_process {
+                Some(process) => process,
+                None => owner
+                    .poll(&mut CoreRecoveryHost {
+                        path: &path,
+                        deployment: &deployment,
+                        policy: launch_policy,
+                        authorized: &|| true,
+                        candidate: None,
+                    })
+                    .ok_or_else(|| failure("Core initial spawn failed"))?,
+            };
             process.prepare(&deployment, launch_policy).await?;
             if let Some(Some(state)) = restored.get(index) {
                 // Reuse the established restore path: it re-confirms the state
@@ -1689,7 +1770,9 @@ impl Manager {
                     eprintln!("警告: 永続化された状態を復元できないため空の状態で起動します");
                 }
             }
-            owner.confirm(&process)?;
+            if !attached {
+                owner.confirm(&process)?;
+            }
             let generation = Generation::new(path.clone(), process);
             generations.push(RegisteredGeneration {
                 index,
@@ -1724,6 +1807,7 @@ impl Manager {
             gateway_admission,
             core_recovery,
             persist,
+            attached,
         });
         let owner = Arc::downgrade(&manager);
         tokio::spawn(async move {
@@ -1788,6 +1872,11 @@ impl Manager {
     }
 
     async fn poll_core_recovery(&self) {
+        if self.attached {
+            // The Cores belong to botd. Replacing one here would start a second owner;
+            // reconnecting a dropped Core is handled separately.
+            return;
+        }
         let Ok(_update) = self.update.try_lock() else {
             return;
         };
@@ -2575,7 +2664,14 @@ impl Manager {
         }
         self.stopping.store(true, Ordering::Release);
         self.stopped.notify_waiters();
-        for (index, owner) in self.core_recovery.iter().enumerate() {
+        // Attached Cores were never started by this Manager, so there is nothing for the
+        // recovery engine to stop or reap.
+        for (index, owner) in self
+            .core_recovery
+            .iter()
+            .enumerate()
+            .filter(|_| !self.attached)
+        {
             let path = self.workers[index].read().await.path.clone();
             let mut owner = owner.lock().unwrap();
             let key = owner.key;
@@ -2621,6 +2717,14 @@ impl Manager {
             let mut failed = false;
             for generation in &generations {
                 let mut process = generation.process.lock().await;
+                if self.attached {
+                    // The Core is botd's: closing our side of the connection is all a
+                    // Gateway does. Waiting for an exit status that this Manager can
+                    // never observe would only run into the shutdown deadline.
+                    process.broken = true;
+                    pids.push(process.pid);
+                    continue;
+                }
                 let mut owned = generation.ownership.child.lock().await;
                 if let Some(child) = owned.as_mut() {
                     failed |= !child.wait().await?.success();
