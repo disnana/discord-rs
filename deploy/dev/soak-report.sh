@@ -31,10 +31,11 @@ echo "sockets/secret in ipc dirs: $(find "$ROOT" \( -name '*.sock' -o -name 'cor
 echo "reservations: $(find "$ROOT" -name '*.botd-reservation' 2>/dev/null | wc -l)"
 
 echo "--- gateway.log signals (counts) ---"
+# After a Gateway update the active Gateway keeps writing gateway-candidate.log (the standby
+# it was started as), so both files are counted together.
 for f in $(find "$ROOT" -name gateway.log 2>/dev/null); do
-  echo "$(basename "$(dirname "$f")"): generations=$(grep -c 'gateway generation' "$f")" \
-       "login=$(grep -c 'ログイン成功' "$f") closes=$(grep -c 'Gateway 切断' "$f")" \
-       "worker_unavailable=$(grep -c 'unavailable' "$f") rest_unknown=$(grep -c '結果不明' "$f")"
+  d=$(dirname "$f"); logs="$f"; [ -f "$d/gateway-candidate.log" ] && logs="$f $d/gateway-candidate.log"
+  echo "$(basename "$d"): generations=$(cat $logs | grep -c 'gateway generation')"        "login=$(cat $logs | grep -c 'ログイン成功') closes=$(cat $logs | grep -c 'Gateway 切断')"        "worker_unavailable=$(cat $logs | grep -c 'unavailable') rest_unknown=$(cat $logs | grep -c '結果不明')"
 done
 echo "core duplicates dropped (last): $(grep -h '重複したメッセージ' "$ROOT"/*/*/ipc/core-*.log 2>/dev/null | tail -n 1)"
 

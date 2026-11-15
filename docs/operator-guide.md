@@ -114,7 +114,7 @@ botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GAT
 - Core は stdin が閉じると終了します。botd が停止するとき、または botd が終了して stdin が閉じたときに止まります。停止順は Gateway → Core です。
 - Gateway を再起動しても Core は残り、再起動した Gateway が同じ Core に接続し直します。
 - Core を単独で終了させた場合（例：`kill`）、botd が 1 秒から 30 秒の指数バックオフで同じ slot の Core を起動し直します。Gateway は止まらず、新しい Core に接続し直します。
-- Core が連続して認証に失敗（その間に認証済みの接続がない）を 16 回重ねると、Core は終了し、botd が起動し直します。
+- Core が連続して認証に失敗（その間に認証済みの接続がない）を 16 回重ねると、Core は終了し、botd が起動し直します。（永続 Core は、認証失敗の上限で serve を終えたらプロセスも明示的に終了する。自動試験あり。2026-11-16 の Astra Max 監査で、標準入力の監視が残って生き続ける不具合を見つけて修正した）
 - botd が起動し直した空の Core へは、Gateway が保存している確認済みスナップショット（`core-state.json`）を復元します。生きている Core の状態は Core 側が保持します。
 
 制約と未検証の事項：
@@ -148,14 +148,14 @@ botd は Shard ごとに順番に次を行います。
 - 待機 Gateway の起動失敗、90 秒以内に ready にならない、activate の送信失敗では、その Shard の待機 Gateway を終了します。稼働中の Gateway は変更しません。
 - activate の後に `standby-active` が 20 秒以内に出ない、または待機 Gateway が終了した場合は操作が失敗します。このとき旧 Gateway はすでに Core から切り離されているため、botd は旧 Gateway を強制終了し、上げた epoch で起動し直します（Identify が 1 回余分に発生します）。待機 Gateway も終了します。
 - 先に完了した Shard の更新は残ります。全体の自動ロールバックはありません。
-- 操作全体は 180 秒で打ち切ります。
+- 操作全体は 180 秒で打ち切ります（確認待ちに入った段階は最大 20 秒でその段階を終えます。期限後に新しい段階には進みません）。
 - activate の送信後に失敗した場合の実 Discord 上の Core と Gateway の挙動は未検証です。
 - botd が後で Gateway を起動し直すときは、現在の epoch を `--core-epoch` で渡します。古い epoch の Gateway は Core に拒否されます。
 - botd を停止すると、進行中の更新は中断されます。未 activate の待機 Gateway と、置き換え中の旧 Gateway は強制終了します。稼働中の Gateway は通常の停止手順で止まります。
 
 権限は、管理 secret に結び付いた role が `admin` で、scope が Bot の全 Shard を含む場合に限られます（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否され、副作用はありません。単体試験あり）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の要求と結果は `runtime-root/gateway-update-audit.jsonl` に 1 行ずつ追記されます（権限 0600）。event は `requested`・`rejected`・`succeeded`・`failed` のいずれかで、記録は subject、role、bot、operation ID と固定の失敗種別だけです。secret、パス、引数、エラー本文は含みません。要求を記録できない場合は、何も始めずに拒否されます（詳細と限界は[制約一覧](known-limitations.md)）。
 
-ログは稼働中も大きさに上限があります。`gateway.log` と `gateway-candidate.log` は 8 MiB、`core-*.log` は 4 MiB を超えると、約 60 秒ごとに `.1` へ写してから空にします（既存の `.1` は置き換えます）。起動時は `gateway.log` が 1 MiB を超えていれば `.1` へ退避します。
+ログは稼働中も大きさに上限があります。`gateway.log` と `gateway-candidate.log` は 8 MiB、`core-*.log` は 4 MiB を超えると、約 60 秒ごとに `.1` へ写してから空にします（既存の `.1` は置き換えます）。起動時は `gateway.log` が 1 MiB を超えていれば `.1` へ退避します。 常に書き続ける書き手でも回転が止まらないよう、増えた分を数回コピーしてから空にします。その代わり、コピーと空にする間に書かれたごく少量は失われ得ます（上限を優先）。
 
 未検証：待機 Gateway の ready・activate・`standby-active` の往復、監査の記録、ログの回転は、自動プロセス試験のみで確認しています。実 Discord での確認はありません。
 

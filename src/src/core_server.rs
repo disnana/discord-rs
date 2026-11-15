@@ -314,7 +314,17 @@ pub async fn run(socket: PathBuf, lifetime: Lifetime) -> Result<(), AppError> {
             std::process::exit(0);
         });
     }
-    serve(listener, secret, None, lifetime).await
+    let result = serve(listener, secret, None, lifetime).await;
+    if lifetime == Lifetime::UntilStopped {
+        // The stdin watcher above is a blocking read that cannot be cancelled, so returning
+        // would leave the runtime waiting on it: a live process with no listener, which botd
+        // would never replace. Exit explicitly, so botd sees the exit and restarts the Core.
+        if let Err(error) = &result {
+            eprintln!("core: {}", crate::redact::error_diagnostic(error.as_ref()));
+        }
+        std::process::exit(i32::from(result.is_err()));
+    }
+    result
 }
 
 #[cfg(test)]

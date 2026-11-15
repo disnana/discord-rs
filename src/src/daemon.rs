@@ -1456,6 +1456,16 @@ pub mod control {
                 self.finish(op);
                 return;
             };
+            // The whole operation has one deadline. A confirmation already asked for
+            // (`Activating`) is allowed to conclude on its own shorter limit; nothing new
+            // starts after the deadline, for this Shard or the next ones.
+            if op.started.elapsed() >= UPDATE_TIMEOUT && op.update_stage != UpdateStage::Activating
+            {
+                self.daemon.cancel_gateway_update(&key);
+                op.errors.insert(key, DaemonError::StopTimedOut);
+                self.finish(op);
+                return;
+            }
             match op.update_stage {
                 UpdateStage::Begin => match self.daemon.begin_gateway_update(&key, credentials) {
                     Ok(()) => op.update_stage = UpdateStage::Warming,

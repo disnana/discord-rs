@@ -1028,3 +1028,56 @@ async fn a_peer_that_stops_reading_cannot_hold_up_a_takeover() {
     let _ = core.child.kill().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Astra のレビュー指摘：常に書き続ける書き手がいても、ログの回転は止められない（上限が効く）。
+#[test]
+fn rotation_is_not_starved_by_a_writer_that_never_pauses() {
+    use std::io::Write;
+    let dir = private_dir();
+    let log = dir.join("busy.log");
+    let mut writer = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .unwrap();
+    writer.write_all(&vec![b'x'; 4096]).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let busy = std::thread::spawn(move || {
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = writer.write_all(b"line\n");
+        }
+    });
+    let mut rotated = false;
+    for _ in 0..5 {
+        if src::core_units::rotate_in_place(&log, 1024).unwrap() {
+            rotated = true;
+            break;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    busy.join().unwrap();
+    assert!(rotated, "a continuous writer must not starve the rotation");
+    assert!(dir.join("busy.log.1").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Astra のレビュー指摘：永続 Core が認証失敗の上限で serve を終えたら、プロセスも終了する
+/// （標準入力の監視が残って「生きているが listener のない」Core にならない）。
+#[tokio::test]
+async fn a_persistent_core_exits_after_too_many_failed_attaches() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+    for _ in 0..20 {
+        if let Ok(mut stream) = UnixStream::connect(&socket).await {
+            let _ = stream
+                .write_all(format!("{OTHER_SECRET}\n").as_bytes())
+                .await;
+        }
+    }
+    let status = bounded(core.child.wait()).await.unwrap();
+    assert!(!status.success(), "the Core exits (non-zero): {status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

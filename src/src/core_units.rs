@@ -14,7 +14,7 @@ use crate::core_attach::{SLOTS, identity, prepare_dir, renew_secret, secret_path
 use crate::protocol::{BotId, Shard};
 use crate::redact::Secret;
 use crate::secret_file::{SECRET_BYTES, load_secret_file, wipe};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -69,15 +69,18 @@ pub fn rotate_in_place(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
         .mode(0o600)
         .open(&older)?;
     std::io::copy(&mut Read::by_ref(&mut live).take(measured), &mut copy)?;
-    // Lines the writers appended while the copy ran are not in `.1`; emptying the file now
-    // would lose them. Only empty it if nothing arrived; otherwise leave it for the next
-    // check (the copy is then merely a prefix, and nothing is lost).
-    if live.metadata()?.len() == measured {
-        live.set_len(0)?;
-        Ok(true)
-    } else {
-        Ok(false)
+    // Lines the writers appended while the copy ran: copy those too (a few rounds), then empty
+    // the file. A writer that never pauses must not be able to starve the rotation, or the file
+    // would grow without bound - so the last few bytes written between the final copy and the
+    // truncation can be lost (a window of microseconds). Bounded size wins over completeness.
+    for _ in 0..4 {
+        if live.metadata()?.len() <= live.stream_position()? {
+            break;
+        }
+        std::io::copy(&mut Read::by_ref(&mut live), &mut copy)?;
     }
+    live.set_len(0)?;
+    Ok(true)
 }
 
 struct Slot {
