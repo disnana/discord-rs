@@ -22,7 +22,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{Child, Command},
     sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock},
     time::timeout,
 };
@@ -645,6 +645,12 @@ impl ChildOwnership {
     }
 }
 
+/// How a Process talks to its Core. Today both are the child's stdin/stdout pipes; the
+/// aliases exist so a connection-oriented Core (a socket the Gateway attaches to, see
+/// docs/gateway-core-separation-design.md) can reuse every request/response path unchanged.
+type ProcessWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+type ProcessReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+
 struct Process {
     // Automatic recovery owns the handle; explicit update candidates and retired
     // generations retain theirs until the existing drain contract is complete.
@@ -652,8 +658,8 @@ struct Process {
     child_pid: u32,
     launch_identity: crate::protocol::Identity,
     exit_status: ObservedExit,
-    input: Arc<Mutex<Option<ChildStdin>>>,
-    output: BufReader<ChildStdout>,
+    input: Arc<Mutex<Option<ProcessWriter>>>,
+    output: BufReader<ProcessReader>,
     broken: bool,
     transfer: Arc<StdMutex<TransferState>>,
     build: String,
@@ -703,8 +709,10 @@ impl Process {
             .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
-        let input = child.stdin.take().expect("piped worker stdin");
-        let output = BufReader::new(child.stdout.take().expect("piped worker stdout"));
+        let input: ProcessWriter = Box::new(child.stdin.take().expect("piped worker stdin"));
+        let output = BufReader::new(
+            Box::new(child.stdout.take().expect("piped worker stdout")) as ProcessReader
+        );
         let child_pid = child.id().expect("new worker process identity");
         Ok(Self {
             ownership: Arc::new(ChildOwnership {
