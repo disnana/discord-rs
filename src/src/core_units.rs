@@ -151,10 +151,10 @@ impl CoreUnits {
     pub fn poll(&mut self, program: &Path, wanted: bool) {
         let now = Instant::now();
         for index in 0..self.slots.len() {
-            let exited = match self.slots[index].child.as_mut().map(Child::try_wait) {
-                Some(Ok(Some(_))) | Some(Err(_)) => true,
-                _ => false,
-            };
+            let exited = matches!(
+                self.slots[index].child.as_mut().map(Child::try_wait),
+                Some(Ok(Some(_)) | Err(_))
+            );
             if exited {
                 let slot = &mut self.slots[index];
                 slot.child = None;
