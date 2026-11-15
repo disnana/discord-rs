@@ -316,3 +316,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 環境：`oracle-cloud-core`（aarch64）。サーバーでビルド（`cargo build --release --locked -j 2`、約 2 分）し、`/opt/discord-rs/bin` に配置。`botd --core-mode separate --stop-children-on-exit`（drop-in `zz-separate.conf`）、Shard 1、テスト用 Bot（`bots.toml` の `cluster.id = "oracle-soak"`）。token は `read -rs` で `/etc/discord-rs/botd.env`（0640）に保存し、画面・履歴には出していない。開発機（WSL）の botd は、同じ Bot の二重返信を避けるため `disable --now` で停止。
 - 開始：2026-11-15 13:10:12 UTC（22:10 JST）。最初のスナップショット（`soak-report`）：botd 7.7MB・Core 各 6.1MB・Gateway 10.2MB（RSS）、fd 11〜16、再起動 0、Core 2 本 `running`・`failures 0`、ipc に sock 2 + secret 1、予約 1。ユーザー確認：`!ping` と動作を確認（`!count` は 1 から）。journald の警告 1 件は内容未確認。
 - 次：数時間後と翌日に `sudo soak-report | tee -a ~/soak.log` を取り、RSS・fd・ログの大きさ・再起動・切断が単調に増えていないかを比べる（`docs/soak-test.md`）。
+
+## 2026-11-16 夜間の自律作業（ユーザー就寝中、PC は 02:08 に自動シャットダウン）
+- 23:38 時点：main = eb6e806（CI 全ジョブ緑、systemd smoke も緑）。追加：更新中の Core 落下の自動試験、複数 Shard（2 Shard）の分離・更新の自動試験（Codex `gpt-6.1-terra` が執筆、WSL で実行して合格）、`gateway-update` の role／scope 認可の単体試験、docs（Haiku 執筆、事実を確認して訂正）、待機 Gateway は制御 pipe が閉じたら終了、botd 停止時は更新途中の待機 Gateway を kill。
+- Codex のモデル名：`Terra` は不可、正式名は `gpt-6.1-terra`／`gpt-6.1-sol`（`~/.codex/models_cache.json`）。疎通確認済み。
+- 進行中：Codex（`gpt-6.1-sol`）による今夜の差分の敵対的レビュー（読み取り専用）。
