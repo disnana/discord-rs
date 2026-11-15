@@ -736,6 +736,7 @@ async fn run() -> Result<(), &'static str> {
         options.runtime_root.join("update-audit.jsonl"),
     );
     let mut control = ControlPlane::new(daemon, config.clone(), startup_ok);
+    control.set_gateway_update_audit(options.runtime_root.join("gateway-update-audit.jsonl"));
     let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
     let mut server = tokio::spawn(status_server(
         listener,

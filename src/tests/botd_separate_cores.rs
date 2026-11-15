@@ -325,6 +325,22 @@ async fn gateway_update_replaces_the_gateway_and_keeps_the_cores() {
     .await;
     assert_eq!(finished["operation"]["state"], "succeeded", "{finished}");
 
+    // The request and its outcome are on record, with who asked and nothing sensitive.
+    let audit = std::fs::read_to_string(fixture.root.join("gateway-update-audit.jsonl"))
+        .expect("gateway-update audit");
+    let events: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let words: Vec<_> = events
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(words, ["requested", "succeeded"], "{audit}");
+    assert_eq!(events[0]["operation_id"], id);
+    assert_eq!(events[0]["subject"], "local-bootstrap");
+    assert!(!audit.contains("secret"));
+
     // The old Gateway is told to stop and goes away; the Cores do not.
     bounded(async {
         while alive(old_pid) {

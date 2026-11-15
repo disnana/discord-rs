@@ -26,7 +26,7 @@
 - `botd --core-mode separate`（opt-in。既定は `embedded`）は Linux 限定で、`--stop-children-on-exit` を必須とし、試験用の quorum・raft・Gateway 切替の指定とは併用できません。検証は WSL の実プロセス試験（`botd_separate_cores`、模擬 Discord）のみで、実 Discord、systemd 常駐、長時間稼働、複数 Shard での separate は未検証です。
 - separate では Core の無停止差し替え（ホットスワップ）は未対応です。Gateway の `--core-dir` では Worker 更新の監視を行いません。
 - separate の `botctl gateway-update` による Gateway の無停止差し替えは、WSL と実 Discord で 1 回の更新（成功、カウンタ継続、重複 5 件の破棄）を確認しました。複数 Shard の本番運用、長時間稼働（soak）、Interaction の重複は未検証です。activate 送信後に失敗した場合の Core と旧 Gateway の状態も未検証です。
-- `gateway-update` は、他の変更系コマンドと同じ role／scope の認可（`admin` かつ Bot の全 Shard が scope 内）を通ります（単体試験あり）。ただし、実行の開始・完了を残す永続監査は未実装です（`update-audit.jsonl` は `update`／`rollback` 用）。単一の bootstrap secret の既定 role は `admin` なので、secret を持つ者は実行できます。
+- `gateway-update` は、他の変更系コマンドと同じ role／scope の認可（`admin` かつ Bot の全 Shard が scope 内）を通ります（単体試験あり）。実行の要求と結果は `runtime-root/gateway-update-audit.jsonl`（0600、追記のみ、1 行 1 JSON：時刻・event（requested／rejected／succeeded／failed）・操作 ID・Bot・subject・role・固定のエラー種別。secret・パス・引数は含まない）に残り、記録できない要求は開始前に拒否されます。ただし完了の記録は fsync 済みでも、`update-audit.jsonl` のような単一ライターの検証付き監査（改ざん検知・世代付きローテーション）ではなく、ローテーションもありません。単一の bootstrap secret の既定 role は `admin` なので、secret を持つ者は実行できます。
 - 重複排除は Core のメモリ上で直近 4096 件の Discord message id を見るだけです。Core の再起動をまたぐ重複は検出しません。スラッシュコマンドは Discord の単一 ACK 規則（処理より前に ACK を送る）で重複を防ぐ想定ですが、実 Discord での効果は未検証です。
 - separate で botd が死亡すると Core も失われます（Core は stdin の EOF で終了）。botd の SIGKILL 時の後始末は未検証で、試験は SIGTERM による停止のみです。
 - separate の Core 切断は、要求の失敗で検知する記録です。待機中の切断の検知、再接続後のイベント連番・未確認イベントの扱いは未検証です。再接続は 100 ms から最大 5 秒の指数バックオフです。

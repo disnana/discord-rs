@@ -915,9 +915,56 @@ pub mod control {
         operations: BTreeMap<String, Operation>,
         monitor_ok: bool,
         last_advanced: String,
+        /// Where `gateway-update` requests and outcomes are recorded (one JSON object per
+        /// line, 0600). None leaves them unrecorded, as before.
+        gateway_update_audit: Option<PathBuf>,
+        /// Who asked, per operation, so the outcome can be recorded against them.
+        gateway_update_actors: BTreeMap<String, (String, String)>,
     }
 
     impl ControlPlane {
+        /// Records `gateway-update` requests and outcomes in an append-only file. A request
+        /// whose record cannot be written is refused before anything starts. The record holds
+        /// the subject and role (already validated names), the Bot, the operation ID and a
+        /// fixed outcome word - never a secret, path, argument or error text.
+        pub fn set_gateway_update_audit(&mut self, path: PathBuf) {
+            self.gateway_update_audit = Some(path);
+        }
+
+        fn audit_gateway_update(
+            &self,
+            event: &str,
+            operation_id: &str,
+            bot: &str,
+            actor: &(String, String),
+            error: Option<DaemonError>,
+        ) -> std::io::Result<()> {
+            let Some(path) = &self.gateway_update_audit else {
+                return Ok(());
+            };
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path)?;
+            let at_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            let mut line = serde_json::to_vec(&json!({
+                "at_ms": at_ms, "event": event, "operation_id": operation_id,
+                "bot": bot, "subject": actor.0, "role": actor.1,
+                "error": error.map(|e| format!("{e:?}")),
+            }))
+            .map_err(std::io::Error::other)?;
+            line.push(b'\n');
+            file.write_all(&line)?;
+            file.sync_data()
+        }
+
         pub fn recovery_events_dropped(&self) -> u64 {
             self.daemon.recovery_events_dropped
         }
@@ -981,6 +1028,24 @@ pub mod control {
             if !access.allows_command(read, target.as_deref(), &keys) {
                 return Self::error("control permission or scope denied");
             }
+            if request.command == "gateway-update" && request.valid() {
+                let id = request.operation_id.clone().unwrap_or_default();
+                let bot = request.bot.clone().unwrap_or_default();
+                let actor = (access.subject.clone(), access.role.clone());
+                if self
+                    .audit_gateway_update("requested", &id, &bot, &actor, None)
+                    .is_err()
+                {
+                    return Self::error("audit unavailable; gateway-update refused");
+                }
+                let response = self.request(request);
+                if response["ok"] == true {
+                    self.gateway_update_actors.insert(id, actor);
+                } else {
+                    let _ = self.audit_gateway_update("rejected", &id, &bot, &actor, None);
+                }
+                return response;
+            }
             self.request(request)
         }
 
@@ -991,6 +1056,8 @@ pub mod control {
                 operations: BTreeMap::new(),
                 monitor_ok,
                 last_advanced: String::new(),
+                gateway_update_audit: None,
+                gateway_update_actors: BTreeMap::new(),
             }
         }
 
@@ -1102,9 +1169,24 @@ pub mod control {
             } else {
                 OperationState::Failed
             };
+            let failed = snapshot.state == OperationState::Failed;
+            let first_error = op.errors.values().next().copied();
             op.finished = Some(snapshot);
             for key in &op.targets {
                 self.daemon.hold_restart(key, false);
+            }
+            if op.command == "gateway-update"
+                && let Some(actor) = self.gateway_update_actors.get(&op.id)
+            {
+                let event = if failed { "failed" } else { "succeeded" };
+                // The request was recorded before it started; a failure to record the
+                // outcome cannot undo it, so it is only reported.
+                if self
+                    .audit_gateway_update(event, &op.id, &op.bot_id, actor, first_error)
+                    .is_err()
+                {
+                    eprintln!("gateway-update の完了を監査に記録できません");
+                }
             }
         }
 
@@ -1925,6 +2007,49 @@ pub mod control {
         /// `gateway-update` replaces a running Gateway, so it is a mutation like stop: only an
         /// admin whose scope covers every shard of the Bot may ask for it. A refusal happens
         /// before any other check, so it cannot start a standby Gateway or read a credential.
+        #[test]
+        fn gateway_update_is_recorded_before_it_runs_and_refused_if_it_cannot_be() {
+            use super::super::update_control::ControlAccess;
+            let dir = log_dir("gwaudit");
+            let admin = ControlAccess::default();
+            let mut recorded = plane(1, 1);
+            recorded.set_gateway_update_audit(dir.join("gateway-update-audit.jsonl"));
+            // Not the separated layout here, so the daemon declines - but the request and its
+            // refusal are on record.
+            let response = recorded.request_as(&request("gateway-update", 0, 3), &admin);
+            assert_eq!(response["ok"], false);
+            let text = std::fs::read_to_string(dir.join("gateway-update-audit.jsonl")).unwrap();
+            let lines: Vec<Value> = text
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(lines.len(), 2, "{text}");
+            assert_eq!(lines[0]["event"], "requested");
+            assert_eq!(lines[1]["event"], "rejected");
+            assert_eq!(lines[0]["subject"], "local-bootstrap");
+            assert_eq!(lines[0]["role"], "admin");
+            assert!(!text.contains("secret") && !text.contains('/'));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(dir.join("gateway-update-audit.jsonl"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+            // A record that cannot be written stops the request before anything happens.
+            let mut unwritable = plane(1, 1);
+            unwritable.set_gateway_update_audit(dir.clone());
+            let refused = unwritable.request_as(&request("gateway-update", 0, 4), &admin);
+            assert_eq!(
+                refused["error"],
+                "audit unavailable; gateway-update refused"
+            );
+            assert!(unwritable.operations.is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         #[test]
         fn gateway_update_needs_an_admin_whose_scope_covers_the_bot() {
             use super::super::update_control::ControlAccess;

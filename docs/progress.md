@@ -321,3 +321,4 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 23:38 時点：main = eb6e806（CI 全ジョブ緑、systemd smoke も緑）。追加：更新中の Core 落下の自動試験、複数 Shard（2 Shard）の分離・更新の自動試験（Codex `gpt-6.1-terra` が執筆、WSL で実行して合格）、`gateway-update` の role／scope 認可の単体試験、docs（Haiku 執筆、事実を確認して訂正）、待機 Gateway は制御 pipe が閉じたら終了、botd 停止時は更新途中の待機 Gateway を kill。
 - Codex のモデル名：`Terra` は不可、正式名は `gpt-6.1-terra`／`gpt-6.1-sol`（`~/.codex/models_cache.json`）。疎通確認済み。
 - 進行中：Codex（`gpt-6.1-sol`）による今夜の差分の敵対的レビュー（読み取り専用）。
+- 23:43 `gateway-update` の監査：`runtime-root/gateway-update-audit.jsonl`（0600、追記、`requested`→`succeeded`／`failed`／`rejected`、subject・role・Bot・操作 ID・固定エラー種別のみ）。要求の記録に失敗したら開始前に拒否。単体試験（記録・拒否・権限・秘密を含まない）と、実プロセス試験（更新後に `requested`,`succeeded` が残る）。`update-audit.jsonl` のような検証付き監査・ローテーションは未実装。

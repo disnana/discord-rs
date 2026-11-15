@@ -151,7 +151,7 @@ botd は Shard ごとに順番に次を行います。
 - activate の送信後に失敗した場合の Core と旧 Gateway の状態は未検証です。
 - botd が後で Gateway を起動し直すときは、現在の epoch を `--core-epoch` で渡します。古い epoch の Gateway は Core に拒否されます。
 
-権限は、管理 secret に結び付いた role が `admin` で、scope が Bot の全 Shard を含む場合に限られます（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否され、副作用はありません。単体試験あり）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の開始・完了を残す永続監査（`update-audit.jsonl` 相当）は未実装です（[制約一覧](known-limitations.md) 参照）。
+権限は、管理 secret に結び付いた role が `admin` で、scope が Bot の全 Shard を含む場合に限られます（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否され、副作用はありません。単体試験あり）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の要求と結果は `runtime-root/gateway-update-audit.jsonl` に追記されます（記録できない要求は開始前に拒否。詳細と限界は[制約一覧](known-limitations.md)）。
 
 ### Discordに接続しない模擬実行
 
