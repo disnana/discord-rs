@@ -1483,6 +1483,10 @@ pub struct Manager {
     deployment: DeploymentIdentity,
     launch_policy: LaunchPolicy,
     stopping: AtomicBool,
+    /// Set when this Manager Gateway has been told to exit (a replaced Gateway draining its
+    /// last responses): it must not reconnect to a Core in the meantime, or it could restore
+    /// its older state into a Core that restarted.
+    reconnect_disabled: AtomicBool,
     stopped: Notify,
     workers: Vec<RwLock<Arc<Generation>>>,
     generations: StdMutex<Vec<RegisteredGeneration>>,
@@ -1878,6 +1882,7 @@ impl Manager {
             deployment,
             launch_policy,
             stopping: AtomicBool::new(false),
+            reconnect_disabled: AtomicBool::new(false),
             stopped: Notify::new(),
             workers,
             instance_id,
@@ -2082,6 +2087,9 @@ impl Manager {
         let Some(attach) = &self.attach else {
             return;
         };
+        if self.reconnect_disabled.load(Ordering::Acquire) {
+            return;
+        }
         let Ok(_update) = self.update.try_lock() else {
             return;
         };
@@ -2099,6 +2107,13 @@ impl Manager {
             let now = tokio::time::Instant::now();
             if !self.reconnect[index].lock().unwrap().ready(now) {
                 continue;
+            }
+            // The broken session may still hold its socket (a request timed out, the Core is
+            // merely slow). A Core serves a connection of an epoch until it closes, so close
+            // our write side first: the Core then sees the end of that connection and can serve
+            // the new one of the same epoch instead of queueing it behind a dead session.
+            if let Ok(process) = previous.process.try_lock() {
+                *process.input.lock().await = None;
             }
             let connected = timeout(DEADLINE, async {
                 let mut process = Process::attach(
@@ -2837,6 +2852,12 @@ impl Manager {
     /// Stop admission, wait for owned work/results, close Core stdin and reap it.
     /// EOF is the existing Worker drain contract. Unknown outcomes are never
     /// reported as a successful graceful shutdown; the caller chooses escalation.
+    /// From now on this Manager never re-attaches to a Core. Called as soon as a Gateway is
+    /// asked to exit, before it drains its remaining responses.
+    pub fn stop_reconnecting(&self) {
+        self.reconnect_disabled.store(true, Ordering::Release);
+    }
+
     pub async fn shutdown(&self) -> Result<Vec<u32>, AppError> {
         if let Some(gate) = &self.gateway_admission {
             let mut gate = gate.lock().unwrap();

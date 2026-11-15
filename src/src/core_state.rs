@@ -303,7 +303,23 @@ impl Persister {
                     .map_or(0, |since| {
                         u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
                     });
-                now.max(stored_epoch(&dir).saturating_add(1))
+                // Also above every stamp this process has already handed out, so two writers
+                // opened back to back (before either has saved) never share one.
+                static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let wanted = now.max(stored_epoch(&dir).saturating_add(1));
+                let mut last = LAST.load(std::sync::atomic::Ordering::Acquire);
+                loop {
+                    let next = wanted.max(last.saturating_add(1));
+                    match LAST.compare_exchange(
+                        last,
+                        next,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    ) {
+                        Ok(_) => break next,
+                        Err(seen) => last = seen,
+                    }
+                }
             })
             .await
             .unwrap_or(1)

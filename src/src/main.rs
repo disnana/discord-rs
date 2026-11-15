@@ -884,6 +884,7 @@ async fn mock_events(
             }
         }
     };
+    manager.stop_reconnecting();
     // Accepted work completes before Worker stdin closes. Socket write failures
     // cannot cancel a REST operation that may already have been applied.
     let drained = tokio::time::timeout(Duration::from_secs(30), async {
@@ -1423,6 +1424,9 @@ async fn live_events(
             _ => {}
         }
     }
+    // Asked to exit (or the stream ended): stop re-attaching to Cores before draining the last
+    // responses, so a Gateway being replaced cannot restore older state into a restarted Core.
+    manager.stop_reconnecting();
     drop(shard);
     tokio::time::timeout(Duration::from_secs(30), async {
         while requests.join_next().await.is_some() {}
