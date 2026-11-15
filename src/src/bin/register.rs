@@ -1,9 +1,15 @@
 //! Explicit, one-command registration. The default is a dry run.
+//!
+//! `--check` reads the commands Discord already has and reports whether the linked
+//! definition matches (`status=up-to-date|changed|missing`; exit code 2 when a
+//! registration is needed). `--apply` first does the same comparison and sends nothing
+//! when the command is already up to date, so re-running it on every deploy costs one
+//! read and never spends the (much tighter) command-creation limit needlessly.
 use bot_framework::arguments::{ArgumentKind, ArgumentSchema};
 use src::redact::{Secret, error_diagnostic, redact};
 use std::{env, num::NonZeroU64};
 use twilight_http::Client;
-use twilight_model::application::command::{CommandOption, CommandOptionType};
+use twilight_model::application::command::{Command, CommandOption, CommandOptionType};
 use twilight_model::id::{
     Id,
     marker::{ApplicationMarker, GuildMarker},
@@ -15,6 +21,51 @@ struct Plan {
     guild: Option<NonZeroU64>,
     name: String,
     apply: bool,
+    check: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Status {
+    UpToDate,
+    Changed,
+    Missing,
+}
+
+impl Status {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::UpToDate => "up-to-date",
+            Self::Changed => "changed",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// Whether `existing` (what Discord has, any scope-matching command list) already holds
+/// the linked definition. Only fields this tool sets are compared; fields Discord adds
+/// (ids, versions, defaults) are ignored.
+fn compare(
+    existing: &[Command],
+    name: &str,
+    description: &str,
+    options: &[CommandOption],
+) -> Status {
+    let Some(found) = existing.iter().find(|command| command.name == name) else {
+        return Status::Missing;
+    };
+    let current = found.options.as_slice();
+    let same_options = current.len() == options.len()
+        && current.iter().zip(options).all(|(have, want)| {
+            have.name == want.name
+                && have.kind == want.kind
+                && have.required.unwrap_or(false) == want.required.unwrap_or(false)
+                && have.description == want.description
+        });
+    if found.description == description && same_options {
+        Status::UpToDate
+    } else {
+        Status::Changed
+    }
 }
 
 fn parse_id(value: &str) -> Result<NonZeroU64, &'static str> {
@@ -23,8 +74,10 @@ fn parse_id(value: &str) -> Result<NonZeroU64, &'static str> {
         .map_err(|_| "ID must be a nonzero integer")
 }
 fn parse(args: &[String]) -> Result<Plan, &'static str> {
-    if !(args.len() == 3 || (args.len() == 4 && args[3] == "--apply")) {
-        return Err("usage: register <application-id> <global|guild-id> <command-name> [--apply]");
+    if !(args.len() == 3 || (args.len() == 4 && (args[3] == "--apply" || args[3] == "--check"))) {
+        return Err(
+            "usage: register <application-id> <global|guild-id> <command-name> [--check|--apply]",
+        );
     }
     Ok(Plan {
         app: parse_id(&args[0])?,
@@ -34,7 +87,8 @@ fn parse(args: &[String]) -> Result<Plan, &'static str> {
             Some(parse_id(&args[1])?)
         },
         name: args[2].clone(),
-        apply: args.len() == 4,
+        apply: args.len() == 4 && args[3] == "--apply",
+        check: args.len() == 4 && args[3] == "--check",
     })
 }
 
@@ -139,8 +193,10 @@ async fn run() -> Result<(), src::AppError> {
     println!(
         "Only this command name is upserted; an existing command with the same name and scope is overwritten."
     );
-    if !plan.apply {
-        println!("Dry run: no request sent. Pass --apply to register.");
+    if !plan.apply && !plan.check {
+        println!(
+            "Dry run: no request sent. Pass --check to compare with Discord, --apply to register."
+        );
         return Ok(());
     }
     let token = Secret::new(env::var("DISCORD_TOKEN").map_err(|error| {
@@ -153,6 +209,44 @@ async fn run() -> Result<(), src::AppError> {
     let client = Client::new(token.into_inner());
     let application = Id::<ApplicationMarker>::new(plan.app.get());
     let commands = client.interaction(application);
+    // One read: what Discord has now. Reads do not spend the command-creation limit.
+    let existing = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let response = match plan.guild {
+            Some(guild) => {
+                commands
+                    .guild_commands(Id::<GuildMarker>::new(guild.get()))
+                    .await
+            }
+            None => commands.global_commands().await,
+        }
+        .map_err(|_| ())?;
+        response.models().await.map_err(|_| ())
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    match existing
+        .as_deref()
+        .map(|list| compare(list, command.name, command.description, &options))
+    {
+        Some(status) => {
+            println!("status={}", status.label());
+            if plan.check {
+                if status != Status::UpToDate {
+                    std::process::exit(2);
+                }
+                return Ok(());
+            }
+            if status == Status::UpToDate {
+                println!("Command already up to date; nothing sent.");
+                return Ok(());
+            }
+        }
+        None if plan.check => {
+            return Err(failure("could not read the existing commands from Discord"));
+        }
+        None => println!("status=unknown (could not read existing commands); registering."),
+    }
     let request = async {
         match plan.guild {
             Some(guild) => commands
@@ -184,6 +278,7 @@ impl std::fmt::Debug for Plan {
             .field("guild", &self.guild)
             .field("name", &Secret::new(&self.name))
             .field("apply", &self.apply)
+            .field("check", &self.check)
             .finish()
     }
 }
@@ -249,6 +344,44 @@ mod tests {
         )
         .await;
         assert!(!result.unwrap_err().contains("secret"));
+    }
+
+    #[test]
+    fn comparison_ignores_what_discord_adds_and_notices_what_changed() {
+        let options = discord_options(&[ArgumentSchema {
+            name: "n",
+            kind: ArgumentKind::Integer,
+            required: true,
+        }]);
+        let make = |description: &str, options: Vec<CommandOption>| -> Command {
+            serde_json::from_value(serde_json::json!({
+                "id": "1", "application_id": "2", "version": "3", "type": 1,
+                "name": "ping", "description": description,
+                "options": serde_json::to_value(options).unwrap(),
+                "default_member_permissions": null, "nsfw": false
+            }))
+            .unwrap()
+        };
+        let have = vec![make("Check response", options.clone())];
+        assert_eq!(
+            compare(&have, "ping", "Check response", &options),
+            Status::UpToDate
+        );
+        assert_eq!(compare(&have, "other", "x", &[]), Status::Missing);
+        assert_eq!(
+            compare(&have, "ping", "Check responses", &options),
+            Status::Changed
+        );
+        assert_eq!(
+            compare(&have, "ping", "Check response", &[]),
+            Status::Changed
+        );
+        let mut other = options.clone();
+        other[0].required = Some(false);
+        assert_eq!(
+            compare(&have, "ping", "Check response", &other),
+            Status::Changed
+        );
     }
 
     #[test]
