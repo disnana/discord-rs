@@ -2129,6 +2129,11 @@ impl Manager {
                 // its state, which `prepare` adopted) or the Core itself, restarted by botd
                 // with nothing. Only the second case is given the last confirmed state.
                 let last = previous.transfer.lock().unwrap().checkpoint.clone();
+                // Asked to exit while this attempt was under way: do not put older state into
+                // a Core on the way out.
+                if self.reconnect_disabled.load(Ordering::Acquire) {
+                    return Err(failure("reconnect cancelled: this Gateway is exiting"));
+                }
                 if let Some(state) = last
                     && process.core_is_fresh()
                     && process.restore(STATE_VERSION, state).await.is_err()
@@ -2147,7 +2152,10 @@ impl Manager {
                 continue;
             };
             let mut active = worker.write().await;
-            if !Arc::ptr_eq(&active, &previous) || self.stopping.load(Ordering::Acquire) {
+            if !Arc::ptr_eq(&active, &previous)
+                || self.stopping.load(Ordering::Acquire)
+                || self.reconnect_disabled.load(Ordering::Acquire)
+            {
                 continue;
             }
             self.install(

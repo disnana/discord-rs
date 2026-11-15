@@ -306,7 +306,11 @@ impl Persister {
                 // Also above every stamp this process has already handed out, so two writers
                 // opened back to back (before either has saved) never share one.
                 static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let wanted = now.max(stored_epoch(&dir).saturating_add(1));
+                // Kept below u64::MAX so that "one above" always exists (a file stamped at the
+                // very top would otherwise make every later allocation return the same value).
+                let wanted = now
+                    .max(stored_epoch(&dir).saturating_add(1))
+                    .min(u64::MAX - 1);
                 let mut last = LAST.load(std::sync::atomic::Ordering::Acquire);
                 loop {
                     let next = wanted.max(last.saturating_add(1));
