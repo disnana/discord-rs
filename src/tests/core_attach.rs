@@ -875,3 +875,44 @@ async fn a_message_id_seen_before_is_not_handled_again_even_from_another_gateway
     let _ = core.child.kill().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 待機 Gateway は、起動した botd が消えて（制御用の stdin が閉じて）有効化の指示が来ないまま
+/// なら、終了する。管理されない 2 つ目の Discord セッションとして残らない。
+#[tokio::test]
+async fn a_standby_gateway_exits_when_its_control_pipe_closes_before_activation() {
+    let dir = private_dir();
+    let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_src"))
+        .args(["--bot-id", "101", "--shard-id", "0", "--total-shards", "1"])
+        .arg("--ipc-path")
+        .arg(dir.join("ipc"))
+        .arg("--state-path")
+        .arg(dir.join("state"))
+        .arg("--management-path")
+        .arg(dir.join("mgmt"))
+        .args(["--token-env", "TOKEN_UNUSED"])
+        .arg("--core-dir")
+        .arg(dir.join("cores"))
+        .arg("--standby")
+        .arg("--mock-discord")
+        .arg(collector.local_addr().unwrap().to_string())
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    // It connects to the collector, announces nothing, and waits for botd.
+    let (_stream, _) = bounded(collector.accept()).await.unwrap();
+    // (`Child::wait` closes stdin first, so it must not be used to ask "still running?".)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "a standby waits while its control pipe is open"
+    );
+    drop(child.stdin.take());
+    let status = bounded(child.wait()).await.unwrap();
+    assert!(status.success(), "{status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

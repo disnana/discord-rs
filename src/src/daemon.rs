@@ -1292,6 +1292,8 @@ pub mod control {
             deadline: Duration,
         ) -> Vec<ShardKey> {
             let keys: Vec<ShardKey> = self.daemon.snapshots().into_iter().map(|s| s.key).collect();
+            #[cfg(unix)]
+            self.daemon.abandon_gateway_updates();
             for key in &keys {
                 // A failed request leaves the child running; it is reported below.
                 let _ = self.daemon.graceful_stop(key).await;
@@ -3131,6 +3133,22 @@ impl<C: Clock> Daemon<C> {
             Err((_, mut child)) => {
                 let _ = child.start_kill();
                 Err(DaemonError::InvalidState)
+            }
+        }
+    }
+
+    /// For daemon shutdown: an update in flight is abandoned. A standby Gateway that has not
+    /// been activated is killed, and a replaced Gateway that is still exiting is not left
+    /// behind. The Gateway that is active is stopped by the normal graceful path.
+    #[cfg(unix)]
+    pub fn abandon_gateway_updates(&mut self) {
+        for entry in self.entries.values_mut() {
+            if let Some(mut candidate) = entry.candidate.take() {
+                let _ = candidate.child.start_kill();
+                let _ = std::fs::remove_file(&candidate.ready_marker);
+            }
+            if let Some(retiring) = entry.retiring.as_mut() {
+                let _ = retiring.child.start_kill();
             }
         }
     }

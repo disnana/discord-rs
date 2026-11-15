@@ -360,3 +360,134 @@ async fn gateway_update_replaces_the_gateway_and_keeps_the_cores() {
     .await;
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
+
+#[tokio::test]
+async fn a_core_crash_during_a_gateway_update_leaves_a_working_system() {
+    let fixture = Fixture::start().await;
+    let mut first = Some(fixture.accept().await);
+    let original_gateway = first.as_ref().unwrap().pid();
+    let original_cores = worker_pids(&first.as_ref().unwrap().ready);
+    let botd_pid = fixture.daemon.id().unwrap();
+    let id = "fedcba9876543210fedcba9876543210";
+    let admitted = control(
+        fixture.port,
+        json!({"command":"gateway-update","bot":"101","operation_id":id}),
+    )
+    .await;
+    signal(original_cores[0], "KILL");
+    assert_eq!(admitted["ok"], true, "{admitted}");
+
+    bounded(async {
+        loop {
+            let view = control(
+                fixture.port,
+                json!({"command":"operation","operation_id":id}),
+            )
+            .await;
+            if matches!(
+                view["operation"]["state"].as_str(),
+                Some("succeeded" | "failed")
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    // Identify all fixture processes, including any that have lost their parent. Both
+    // Gateway and Core command lines contain the fixture's private runtime path.
+    let (gateway_pid, cores) = bounded(async {
+        loop {
+            let mut gateways = Vec::new();
+            let mut cores = Vec::new();
+            let mut all_children = true;
+            for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if pid == botd_pid {
+                    continue;
+                }
+                let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                    continue;
+                };
+                let args: Vec<_> = cmdline.split(|b| *b == 0).collect();
+                let root = fixture.root.to_string_lossy();
+                if !args.iter().any(|arg| arg.starts_with(root.as_bytes())) || !alive(pid) {
+                    continue;
+                }
+                let status =
+                    std::fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+                let parent = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok());
+                all_children &= parent == Some(botd_pid);
+                if args.contains(&b"--core-listen".as_slice()) {
+                    cores.push(pid);
+                } else {
+                    gateways.push(pid);
+                }
+            }
+            if all_children
+                && gateways.len() == 1
+                && cores.len() == 2
+                && !cores.contains(&original_cores[0])
+                && cores.iter().all(|pid| alive(*pid))
+            {
+                break (gateways[0], cores);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    let mut gateway = if gateway_pid == original_gateway {
+        first.take().unwrap()
+    } else {
+        bounded(async {
+            loop {
+                let candidate = fixture.accept().await;
+                if candidate.pid() == gateway_pid {
+                    break candidate;
+                }
+            }
+        })
+        .await
+    };
+    bounded(async {
+        loop {
+            let status = gateway.status().await;
+            let workers = worker_pids(&status);
+            if status["pid"] == gateway_pid
+                && workers.len() == 2
+                && workers.iter().all(|pid| cores.contains(pid) && alive(*pid))
+                && workers[0] != workers[1]
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    signal(botd_pid, "TERM");
+    let mut daemon = fixture.daemon;
+    bounded(daemon.wait()).await.unwrap();
+    bounded(async {
+        while [gateway_pid, cores[0], cores[1]].into_iter().any(alive) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let ipc: Vec<_> = walk(&fixture.root)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "sock" || e == "secret"))
+        .collect();
+    assert!(ipc.is_empty(), "sockets or secret left behind: {ipc:?}");
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}

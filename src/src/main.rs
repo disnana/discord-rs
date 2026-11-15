@@ -439,7 +439,12 @@ async fn run_standby(
             tokio::select! {
                 biased;
                 _ = &mut shutdown => return Ok(()),
-                Some(epoch) = activation.recv() => break epoch,
+                // The control pipe closing before activation means botd is gone (or gave up):
+                // a standby must not linger as an unmanaged second Discord session.
+                activated = activation.recv() => match activated {
+                    Some(epoch) => break epoch,
+                    None => return Ok(()),
+                },
                 event = shard.next_event(EventTypeFlags::all()) => match event {
                     Some(event) => {
                         if matches!(event, Ok(Event::Ready(_))) {
@@ -990,18 +995,13 @@ async fn run() -> Result<(), AppError> {
         if let Some(state) = options.path("--state-path") {
             let _ = std::fs::write(state.join("standby-ready"), b"ready\n");
         }
-        let epoch = loop {
-            tokio::select! {
-                Some(epoch) = activation.recv() => break epoch,
-                signalled = &mut shutdown => {
-                    if signalled.is_ok() {
-                        return Ok(());
-                    }
-                    // Control input ended without a request: keep waiting for nothing
-                    // rather than activating; the collector closing ends this process.
-                    std::future::pending::<()>().await;
-                }
-            }
+        let epoch = tokio::select! {
+            activated = activation.recv() => match activated {
+                Some(epoch) => epoch,
+                // Control input ended before activation: botd is gone.
+                None => return Ok(()),
+            },
+            _ = &mut shutdown => return Ok(()),
         };
         options.core_epoch = epoch;
         standby_shutdown = Some(shutdown);
