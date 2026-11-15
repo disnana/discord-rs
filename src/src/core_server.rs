@@ -3,10 +3,10 @@
 //!
 //! This is stage 1-B1 of the Gateway/Core separation. It accepts connections, checks
 //! that the peer is the same user and knows the capability secret, and then runs the
-//! unchanged request loop (`worker::serve_core`) on the accepted socket. For now one
-//! authenticated connection is served and the Core then exits, which is exactly the
-//! lifetime a stdin/stdout Core has; keeping a Core alive across connections needs
-//! per-connection state (stage 1-B3) and is deliberately not done here.
+//! unchanged request loop (`worker::serve_connection`) on the accepted socket. With
+//! `Lifetime::OneConnection` (what `run` uses today) the Core exits after one session, like a
+//! stdin/stdout Core; with `UntilStopped` (stage 1-B3) the application state lives in a
+//! `CoreLife` that outlasts connections. botd does not request that mode yet.
 //!
 //! Security model (Linux/Unix only): the socket lives in a directory that only the
 //! current user can enter, is created 0600, and every connection must present a
@@ -17,7 +17,7 @@
 use crate::AppError;
 use crate::redact::Secret;
 use crate::secret_file::{SECRET_BYTES, effective_uid, parse_hex_secret};
-use crate::worker::{CoreIo, failure, serve_core};
+use crate::worker::{CoreIo, CoreLife, failure, serve_connection};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -140,13 +140,24 @@ fn peer_is_current_user(stream: &UnixStream) -> bool {
         .is_ok_and(|credentials| credentials.uid() == effective_uid())
 }
 
-/// Accepts connections until one authenticates, then serves it with the shared request
-/// loop. Returns when that session ends.
+/// How long a Core serves. `OneConnection` is the embedded Core's lifetime; `UntilStopped`
+/// keeps the application state across connections (a restarted Gateway reconnects), with
+/// everything negotiated per connection starting fresh each time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifetime {
+    OneConnection,
+    UntilStopped,
+}
+
+/// Accepts connections and serves each authenticated one with the shared request loop.
+/// `OneConnection` returns when that session ends; `UntilStopped` keeps serving.
 pub async fn serve(
     listener: UnixListener,
     secret: Secret<[u8; SECRET_BYTES]>,
     backend: Option<std::sync::Arc<dyn crate::state_store::StateStore>>,
+    lifetime: Lifetime,
 ) -> Result<(), AppError> {
+    let mut life = CoreLife::new(backend)?;
     let mut failed = 0u32;
     loop {
         let (mut stream, _) = listener
@@ -160,7 +171,12 @@ pub async fn serve(
             }
             continue;
         }
-        return serve_core(backend, CoreIo::socket(stream)).await;
+        let outcome = serve_connection(&mut life, CoreIo::socket(stream)).await;
+        match lifetime {
+            Lifetime::OneConnection => return outcome,
+            // A broken connection must not take the Core and its state down with it.
+            Lifetime::UntilStopped => failed = 0,
+        }
     }
 }
 
@@ -183,7 +199,7 @@ async fn read_secret_from_stdin() -> Result<Secret<[u8; SECRET_BYTES]>, CoreServ
 pub async fn run(socket: PathBuf) -> Result<(), AppError> {
     let secret = read_secret_from_stdin().await?;
     let listener = bind_socket(&socket)?;
-    serve(listener, secret, None).await
+    serve(listener, secret, None, Lifetime::OneConnection).await
 }
 
 #[cfg(test)]

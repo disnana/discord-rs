@@ -3449,8 +3449,68 @@ async fn run_with_backend(
     serve_core(backend, CoreIo::stdio()).await
 }
 
+/// What a Core keeps for as long as the process lives: the application state and the
+/// machinery that runs handlers. A stdin/stdout Core has one connection and so one life;
+/// a socket Core serves a series of connections (a restarted Gateway reconnects) and must
+/// not lose its state between them. Everything negotiated with a peer is per connection
+/// and is built again in `serve_connection`.
+pub(crate) struct CoreLife {
+    backend: Option<Arc<dyn crate::state_store::StateStore>>,
+    state: crate::cogs::State,
+    runtime: Arc<crate::cogs::FrameworkRuntime>,
+    identity: Option<crate::protocol::Identity>,
+    tasks: crate::supervisor::WorkerTasks,
+}
+
+impl CoreLife {
+    pub(crate) fn new(
+        backend: Option<Arc<dyn crate::state_store::StateStore>>,
+    ) -> Result<Self, AppError> {
+        bot_framework::commands()?;
+        let identity = std::env::var(IDENTITY_ENV)
+            .ok()
+            .map(|value| serde_json::from_str::<crate::protocol::Identity>(&value))
+            .transpose()?;
+        let tasks = crate::supervisor::WorkerTasks::new(
+            identity
+                .as_ref()
+                .map_or(crate::protocol::BotId(0), |id| id.bot_id),
+            identity.as_ref().map_or(0, |id| id.shard.id()),
+        )?;
+        Ok(Self {
+            backend,
+            state: crate::cogs::State::default(),
+            runtime: Arc::new(crate::cogs::FrameworkRuntime::default()),
+            identity,
+            tasks,
+        })
+    }
+}
+
+/// A Core with exactly one connection: its stdin/stdout, or one accepted socket.
 pub(crate) async fn serve_core(
     backend: Option<Arc<dyn crate::state_store::StateStore>>,
+    io: CoreIo,
+) -> Result<(), AppError> {
+    let mut life = CoreLife::new(backend)?;
+    serve_connection(&mut life, io).await
+}
+
+/// One connection's worth of the request loop. Returns when the peer goes away or the
+/// session ends; `life` keeps the application state for the next connection.
+pub(crate) async fn serve_connection(life: &mut CoreLife, io: CoreIo) -> Result<(), AppError> {
+    // The loop below treats the state as an owned local (take / replace / clone). Lend it
+    // out, and take it back whatever the outcome: every `?` inside returns through here, so
+    // a failed connection cannot cost the Core its state.
+    let mut state = std::mem::take(&mut life.state);
+    let result = connection_loop(life, &mut state, io).await;
+    life.state = state;
+    result
+}
+
+async fn connection_loop(
+    life: &mut CoreLife,
+    state: &mut crate::cogs::State,
     io: CoreIo,
 ) -> Result<(), AppError> {
     let CoreIo {
@@ -3458,19 +3518,10 @@ pub(crate) async fn serve_core(
         input: source,
     } = io;
     let mut output = output;
-    let mut state = crate::cogs::State::default();
-    let runtime = Arc::new(crate::cogs::FrameworkRuntime::default());
-    bot_framework::commands()?;
-    let identity = std::env::var(IDENTITY_ENV)
-        .ok()
-        .map(|value| serde_json::from_str::<crate::protocol::Identity>(&value))
-        .transpose()?;
-    let mut tasks = crate::supervisor::WorkerTasks::new(
-        identity
-            .as_ref()
-            .map_or(crate::protocol::BotId(0), |id| id.bot_id),
-        identity.as_ref().map_or(0, |id| id.shard.id()),
-    )?;
+    let backend = life.backend.clone();
+    let identity = life.identity.clone();
+    let runtime = life.runtime.clone();
+    let tasks = &mut life.tasks;
     let mut sequenced_events = false;
     let mut replay_events = false;
     let mut api_results = false;
@@ -3737,7 +3788,7 @@ pub(crate) async fn serve_core(
                         let adapter = adapter.clone();
                         let registry = registry.clone();
                         let signal = drain.subscribe();
-                        let snapshot = serde_json::to_value(&state)?;
+                        let snapshot = serde_json::to_value(&*state)?;
                         tasks
                             .request(async move {
                                 let replies = StdMutex::new(Vec::new());
@@ -3794,17 +3845,17 @@ pub(crate) async fn serve_core(
             | Request::Tick) => {
                 application_started = true;
                 let previous = state.clone();
-                let owned = std::mem::take(&mut state);
+                let owned = std::mem::take(state);
                 match tasks
                     .request(handle_command(command, owned, runtime.clone()))
                     .await
                 {
                     Ok((current, response)) => {
-                        state = current;
+                        *state = current;
                         response?
                     }
                     Err(_) => {
-                        state = previous;
+                        *state = previous;
                         Response::Rejected {
                             reason: "managed command failed".into(),
                         }
@@ -3817,7 +3868,7 @@ pub(crate) async fn serve_core(
                 // locally so a cancelled/failed candidate leaves v1 usable.
                 tasks.begin_drain();
                 tasks.wait_drained().await?;
-                let snapshot = serde_json::to_value(&state);
+                let snapshot = serde_json::to_value(&*state);
                 tasks.resume()?;
                 Response::Snapshot {
                     version: STATE_VERSION,
@@ -3836,8 +3887,8 @@ pub(crate) async fn serve_core(
                     match serde_json::from_value(incoming) {
                         Ok(restored) => {
                             let previous = state.clone();
-                            state = restored;
-                            match checked_result(&mut state, previous, None)? {
+                            *state = restored;
+                            match checked_result(state, previous, None)? {
                                 Response::Rejected { reason } => Response::Rejected { reason },
                                 _ => Response::Restored,
                             }
