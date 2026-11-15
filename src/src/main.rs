@@ -288,10 +288,7 @@ impl GatewayOptions {
             || (options.core_dir.is_some() && (options.local_control || !cfg!(unix)))
             || (options.core_epoch != 0 && options.core_dir.is_none())
             || (options.standby
-                && (options.core_dir.is_none()
-                    || options.core_epoch != 0
-                    || options.mock_discord.is_some()
-                    || options.local_control))
+                && (options.core_dir.is_none() || options.core_epoch != 0 || options.local_control))
         {
             return Err(StartupFailure::InvalidArguments);
         }
@@ -944,7 +941,7 @@ async fn run() -> Result<(), AppError> {
         )
         .await;
     }
-    let options = GatewayOptions::parse(args)?;
+    let mut options = GatewayOptions::parse(args)?;
     let bootstrap = if options.local_control {
         Some(
             src::local_control::read_bootstrap()
@@ -984,7 +981,31 @@ async fn run() -> Result<(), AppError> {
     } else {
         None
     };
-    if options.standby {
+    // A standby Gateway on the explicit mock collector (tests): it connects to the collector
+    // but says nothing and attaches to no Core until told to activate. Real Discord standby
+    // is `run_standby`.
+    let mut standby_shutdown = None;
+    if options.standby && mock.is_some() {
+        let (mut shutdown, mut activation) = control_input();
+        if let Some(state) = options.path("--state-path") {
+            let _ = std::fs::write(state.join("standby-ready"), b"ready\n");
+        }
+        let epoch = loop {
+            tokio::select! {
+                Some(epoch) = activation.recv() => break epoch,
+                signalled = &mut shutdown => {
+                    if signalled.is_ok() {
+                        return Ok(());
+                    }
+                    // Control input ended without a request: keep waiting for nothing
+                    // rather than activating; the collector closing ends this process.
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        options.core_epoch = epoch;
+        standby_shutdown = Some(shutdown);
+    } else if options.standby {
         let (shard, http) = live.expect("a standby Gateway uses the live Discord path");
         return run_standby(&options, deployment, shard, http).await;
     }
@@ -1003,7 +1024,10 @@ async fn run() -> Result<(), AppError> {
         Some(_) => return Err(StartupFailure::InvalidArguments.into()),
         None => worker::Manager::start_gateway_pool(env::current_exe()?, 2, deployment).await?,
     };
-    let shutdown = shutdown_input(!options.launch.is_empty() || options.mock_discord.is_some());
+    let shutdown = match standby_shutdown {
+        Some(receiver) => receiver,
+        None => shutdown_input(!options.launch.is_empty() || options.mock_discord.is_some()),
+    };
     let mut background = JoinSet::new();
     if let Some(bootstrap) = bootstrap {
         let control_manager = manager.clone();

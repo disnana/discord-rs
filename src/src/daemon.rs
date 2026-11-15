@@ -2901,12 +2901,7 @@ impl<C: Clock> Daemon<C> {
         let Some(cores) = entry.cores.as_ref() else {
             return Err(DaemonError::InvalidState);
         };
-        if !entry.started
-            || !running
-            || entry.candidate.is_some()
-            || entry.retiring.is_some()
-            || entry.mock_discord.is_some()
-        {
+        if !entry.started || !running || entry.candidate.is_some() || entry.retiring.is_some() {
             return Err(DaemonError::InvalidState);
         }
         let spec = &entry.spec.gateway;
@@ -2914,10 +2909,17 @@ impl<C: Clock> Daemon<C> {
             return Err(DaemonError::InvalidProgram);
         }
         let name = &spec.environment.credential_refs[0];
-        let credential = credentials
-            .read(name)
-            .filter(|value| !value.is_empty())
-            .ok_or(DaemonError::MissingCredential)?;
+        // The explicit loopback simulation takes no credential, exactly like a normal launch.
+        let credential = if entry.mock_discord.is_none() {
+            Some(
+                credentials
+                    .read(name)
+                    .filter(|value| !value.is_empty())
+                    .ok_or(DaemonError::MissingCredential)?,
+            )
+        } else {
+            None
+        };
         let marker = spec.state_path.join("standby-ready");
         let _ = std::fs::remove_file(&marker);
         let log = spec.management_path.parent().and_then(|dir| {
@@ -2946,12 +2948,20 @@ impl<C: Clock> Daemon<C> {
             .env("SHARD_ID", entry.spec.shard_id.to_string())
             .env("TOTAL_SHARDS", entry.spec.total_shards.to_string())
             .env("GENERATION_ID", sequence.to_string())
-            .env(name, credential)
             .stdin(Stdio::piped())
             .stdout(out)
             .stderr(err)
             .kill_on_drop(false)
             .process_group(0);
+        if let Some(address) = entry.mock_discord {
+            command
+                .arg("--mock-discord")
+                .arg(address.to_string())
+                .env_remove("DISCORD_TOKEN")
+                .env_remove(name);
+        } else if let Some(credential) = credential {
+            command.env(name, credential);
+        }
         let child = command.spawn().map_err(|_| DaemonError::SpawnFailed)?;
         self.sequence = sequence;
         entry.candidate = Some(Candidate {

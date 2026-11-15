@@ -108,6 +108,7 @@ struct Fixture {
     root: PathBuf,
     daemon: Child,
     collector: TcpListener,
+    port: u16,
 }
 
 impl Fixture {
@@ -165,10 +166,13 @@ impl Fixture {
                 String::from_utf8_lossy(&diagnostic)
             );
         }
+        let announced: Value = serde_json::from_slice(&line).expect("botd announcement");
+        let port = announced["port"].as_u64().unwrap().try_into().unwrap();
         Self {
             root,
             daemon,
             collector,
+            port,
         }
     }
 
@@ -266,4 +270,93 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+async fn control(port: u16, mut value: Value) -> Value {
+    value["secret"] = json!(SECRET);
+    let mut stream = bounded(tokio::net::TcpStream::connect(("127.0.0.1", port)))
+        .await
+        .unwrap();
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    bounded(stream.write_all(&bytes)).await.unwrap();
+    let mut reply = Vec::new();
+    bounded(BufReader::new(stream).read_until(b'\n', &mut reply))
+        .await
+        .unwrap();
+    serde_json::from_slice(&reply).expect("daemon response")
+}
+
+/// A Gateway update through botd: a standby Gateway starts, becomes active, and the old one
+/// exits, while the Core processes stay the very same ones. A Gateway botd restarts
+/// afterwards attaches with the new epoch (it could not otherwise reach the Cores).
+#[tokio::test]
+async fn gateway_update_replaces_the_gateway_and_keeps_the_cores() {
+    let fixture = Fixture::start().await;
+    let first = fixture.accept().await;
+    let cores = worker_pids(&first.ready);
+    let old_pid = first.pid();
+
+    let id = "0123456789abcdef0123456789abcdef";
+    let admitted = control(
+        fixture.port,
+        json!({"command":"gateway-update","bot":"101","operation_id":id}),
+    )
+    .await;
+    assert_eq!(admitted["ok"], true, "{admitted}");
+
+    // The standby connects to the collector and announces itself only once active.
+    let mut second = fixture.accept().await;
+    assert_ne!(second.pid(), old_pid, "a new Gateway process");
+    assert_eq!(worker_pids(&second.ready), cores, "the Cores were kept");
+    let finished = bounded(async {
+        loop {
+            let view = control(
+                fixture.port,
+                json!({"command":"operation","operation_id":id}),
+            )
+            .await;
+            if view["operation"]["state"] != "running" {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert_eq!(finished["operation"]["state"], "succeeded", "{finished}");
+
+    // The old Gateway is told to stop and goes away; the Cores do not.
+    bounded(async {
+        while alive(old_pid) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    for core in &cores {
+        assert!(alive(*core), "a Core died during the update");
+    }
+    assert_eq!(second.status().await["pid"], second.pid());
+
+    // botd now supervises the new Gateway: when it dies, its replacement attaches to the
+    // same Cores (with the raised epoch).
+    let new_pid = second.pid();
+    second
+        .input
+        .write_all(b"{\"type\":\"crash\",\"id\":9}\n")
+        .await
+        .unwrap();
+    let third = fixture.accept().await;
+    assert_ne!(third.pid(), new_pid);
+    assert_eq!(worker_pids(&third.ready), cores);
+
+    signal(fixture.daemon.id().unwrap(), "TERM");
+    let mut daemon = fixture.daemon;
+    bounded(daemon.wait()).await.unwrap();
+    bounded(async {
+        while [third.pid(), cores[0], cores[1]].into_iter().any(alive) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&fixture.root);
 }
