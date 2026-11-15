@@ -2683,6 +2683,7 @@ pub struct Daemon<C = MonotonicClock> {
     instance: [u8; 16],
     sequence: u64,
     metrics: crate::daemon_metrics::DaemonMetrics,
+    log_checked: Option<std::time::Instant>,
 }
 
 // Share the exact clock domain with the recovery engine without requiring C: Clone.
@@ -3015,6 +3016,7 @@ impl<C: Clock> Daemon<C> {
             instance,
             sequence: 0,
             metrics,
+            log_checked: None,
         })
     }
 
@@ -3386,6 +3388,23 @@ impl<C: Clock> Daemon<C> {
     }
 
     /// Reaps replaced Gateways; kills one that ignored the stop request.
+    fn rotate_gateway_logs(&mut self) {
+        let due = self
+            .log_checked
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(60));
+        if !due {
+            return;
+        }
+        self.log_checked = Some(std::time::Instant::now());
+        for entry in self.entries.values() {
+            if let Some(dir) = entry.spec.gateway.management_path.parent() {
+                for name in ["gateway.log", "gateway-candidate.log"] {
+                    let _ = crate::core_units::rotate_in_place(&dir.join(name), 8 * 1024 * 1024);
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn poll_retiring(&mut self) {
         for entry in self.entries.values_mut() {
@@ -3737,6 +3756,8 @@ impl<C: Clock> Daemon<C> {
         let mut first_error = self.now().err();
         #[cfg(unix)]
         self.poll_retiring();
+        #[cfg(unix)]
+        self.rotate_gateway_logs();
         #[cfg(unix)]
         for entry in self.entries.values_mut() {
             let program = PathBuf::from(&entry.spec.gateway.program);

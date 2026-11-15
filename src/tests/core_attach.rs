@@ -944,3 +944,40 @@ async fn the_highest_epoch_served_stays_a_floor_after_it_disconnects() {
     let _ = core.child.kill().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Sol のレビュー指摘：Core や Gateway のログは、動き続けている間も大きさに上限を持つ。
+/// 超えたら `.1` に写して空にし、追記し続ける書き手はそのまま書ける。
+#[test]
+fn an_oversized_log_is_rotated_in_place_and_writers_keep_appending() {
+    use std::io::Write;
+    let dir = private_dir();
+    let log = dir.join("core-0.log");
+    let mut writer = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .unwrap();
+    writer.write_all(&vec![b'x'; 2048]).unwrap();
+    // Under the limit: untouched.
+    assert!(!src::core_units::rotate_in_place(&log, 4096).unwrap());
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), 2048);
+    // Over it: the content moves to `.1`, the file is emptied, the writer carries on.
+    assert!(src::core_units::rotate_in_place(&log, 1024).unwrap());
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+    assert_eq!(std::fs::read(dir.join("core-0.log.1")).unwrap().len(), 2048);
+    writer.write_all(b"after\n").unwrap();
+    writer.flush().unwrap();
+    assert_eq!(std::fs::read(&log).unwrap(), b"after\n");
+    // A previous copy is replaced, and a missing log is not an error.
+    std::fs::write(&log, vec![b'y'; 2048]).unwrap();
+    assert!(src::core_units::rotate_in_place(&log, 1024).unwrap());
+    assert_eq!(std::fs::read(dir.join("core-0.log.1")).unwrap()[0], b'y');
+    assert!(!src::core_units::rotate_in_place(&dir.join("missing.log"), 1).unwrap());
+    // A symlink standing where the copy goes is never followed or replaced.
+    std::fs::write(&log, vec![b'z'; 2048]).unwrap();
+    std::fs::remove_file(dir.join("core-0.log.1")).unwrap();
+    std::os::unix::fs::symlink("/nonexistent-target", dir.join("core-0.log.1")).unwrap();
+    assert!(!src::core_units::rotate_in_place(&log, 1024).unwrap());
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), 2048);
+    let _ = std::fs::remove_dir_all(&dir);
+}

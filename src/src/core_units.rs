@@ -26,6 +26,44 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A Core that stays up this long starts over with the shortest backoff.
 const STABLE_AFTER: Duration = Duration::from_secs(60);
 const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// How often a running Core log is checked for size.
+const LOG_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// Keeps a log that processes append to from growing without bound: when it is over
+/// `max_bytes`, its content is copied to `<path>.1` (replacing an older copy) and the file is
+/// emptied in place. The writers keep their descriptors (they append), so nothing is lost
+/// except what was already older than one rotation. Returns whether it rotated. A symlink or
+/// non-file at either path is left alone.
+pub fn rotate_in_place(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !meta.file_type().is_file() || meta.len() <= max_bytes {
+        return Ok(false);
+    }
+    let mut older = path.as_os_str().to_owned();
+    older.push(".1");
+    let older = PathBuf::from(older);
+    match std::fs::symlink_metadata(&older) {
+        Ok(meta) if meta.file_type().is_file() => std::fs::remove_file(&older)?,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut copy = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&older)?;
+    std::io::copy(&mut std::fs::File::open(path)?, &mut copy)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_len(0)?;
+    Ok(true)
+}
 
 struct Slot {
     child: Option<Child>,
@@ -54,6 +92,7 @@ pub struct CoreUnits {
     shard: Shard,
     slots: Vec<Slot>,
     prepared: bool,
+    log_checked: Option<Instant>,
 }
 
 /// What an operator may be told about a Core, never a path, secret or argument.
@@ -71,6 +110,7 @@ impl CoreUnits {
             shard,
             slots: (0..SLOTS).map(|_| Slot::empty()).collect(),
             prepared: false,
+            log_checked: None,
         }
     }
 
@@ -150,6 +190,15 @@ impl CoreUnits {
     /// on purpose) reaps but never restarts.
     pub fn poll(&mut self, program: &Path, wanted: bool) {
         let now = Instant::now();
+        if self
+            .log_checked
+            .is_none_or(|at| now.duration_since(at) >= LOG_CHECK_EVERY)
+        {
+            self.log_checked = Some(now);
+            for index in 0..self.slots.len() {
+                let _ = rotate_in_place(&self.dir.join(format!("core-{index}.log")), LOG_MAX_BYTES);
+            }
+        }
         for index in 0..self.slots.len() {
             let exited = matches!(
                 self.slots[index].child.as_mut().map(Child::try_wait),
