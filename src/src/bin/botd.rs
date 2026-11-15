@@ -22,7 +22,7 @@ use tokio::{
 const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
@@ -30,6 +30,8 @@ struct Options {
     gateway_program: PathBuf,
     no_autostart: bool,
     stop_children_on_exit: bool,
+    /// Run each Shard Cores in botd (separated layout, Linux). Default: embedded.
+    separate_cores: bool,
     mock_discord: Option<SocketAddr>,
     allow_test_quorum: bool,
     raft: Option<RaftRuntimeOptions>,
@@ -48,6 +50,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut bootstrap = false;
     let mut no_autostart = false;
     let mut stop_children_on_exit = false;
+    let mut separate_cores = false;
     let mut mock_discord = None;
     let mut allow_test_quorum = false;
     let mut allow_raft_quorum = false;
@@ -140,6 +143,14 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
                 no_autostart = true;
                 continue;
             }
+            Some("--core-mode") => {
+                match args.next().ok_or(USAGE)?.to_str().ok_or(USAGE)? {
+                    "separate" if !separate_cores => separate_cores = true,
+                    "embedded" if !separate_cores => {}
+                    _ => return Err(USAGE),
+                }
+                continue;
+            }
             Some("--stop-children-on-exit") if !stop_children_on_exit => {
                 stop_children_on_exit = true;
                 continue;
@@ -222,6 +233,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         gateway_program: gateway_program.ok_or(USAGE)?,
         no_autostart,
         stop_children_on_exit,
+        separate_cores,
         mock_discord,
         allow_test_quorum,
         raft,
@@ -254,6 +266,15 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         options.raft.is_some() || options.allow_test_quorum || options.allow_test_gateway_switch;
     if options.stop_children_on_exit && test_or_raft {
         return Err("--stop-children-on-exit applies only to the standalone daemon");
+    }
+    if options.separate_cores {
+        // Cores die with botd (their stdin closes); Gateways must not be left running
+        // without them, so a separated deployment always stops its children on exit.
+        if !cfg!(unix) || test_or_raft || !options.stop_children_on_exit {
+            return Err(
+                "--core-mode separate requires Linux, --stop-children-on-exit and the standalone daemon",
+            );
+        }
     }
     if options.allow_test_gateway_switch {
         if options.mock_discord.is_none() {
@@ -683,6 +704,12 @@ async fn run() -> Result<(), &'static str> {
     daemon
         .set_gateway_program(&options.gateway_program)
         .map_err(|_| "invalid gateway program")?;
+    #[cfg(unix)]
+    if options.separate_cores {
+        daemon
+            .enable_separate_cores()
+            .map_err(|_| "cannot enable separate Cores")?;
+    }
     if let Some(address) = options.mock_discord {
         daemon
             .enable_mock_discord(address)

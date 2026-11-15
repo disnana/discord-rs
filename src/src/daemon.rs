@@ -1254,6 +1254,9 @@ pub mod control {
                     .cloned()
                     .collect();
                 if remaining.is_empty() || Instant::now() >= until {
+                    // Cores outlive Gateways on purpose, so they are stopped last.
+                    #[cfg(unix)]
+                    self.daemon.stop_cores(Duration::from_secs(5)).await;
                     return remaining;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2306,6 +2309,9 @@ struct Entry {
     feed: Option<crate::metrics_feed::FeedSender>,
     admission_since: Option<std::time::Instant>,
     stop_since: Option<std::time::Instant>,
+    /// The Shard Core processes when botd runs them (separated layout); None = embedded.
+    #[cfg(unix)]
+    cores: Option<crate::core_units::CoreUnits>,
 }
 
 pub struct Daemon<C = MonotonicClock> {
@@ -2615,6 +2621,8 @@ impl<C: Clock> Daemon<C> {
                         feed,
                         admission_since: None,
                         stop_since: None,
+                        #[cfg(unix)]
+                        cores: None,
                     },
                 )
             })
@@ -2683,6 +2691,68 @@ impl<C: Clock> Daemon<C> {
             entry.mock_discord = Some(address);
         }
         Ok(())
+    }
+
+    /// Separated layout (opt-in): botd runs each Shard Cores and the Gateway connects to
+    /// them. Before any launch. The Core directory is the Shard planned `ipc_path`.
+    #[cfg(unix)]
+    pub fn enable_separate_cores(&mut self) -> Result<(), DaemonError> {
+        if self.entries.values().any(|entry| entry.started) {
+            return Err(DaemonError::InvalidState);
+        }
+        for entry in self.entries.values_mut() {
+            let bot_id = entry
+                .spec
+                .bot_id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| id.to_string() == entry.spec.bot_id)
+                .ok_or(DaemonError::InvalidSpec)?;
+            let shard = crate::protocol::Shard::new(entry.spec.shard_id, entry.spec.total_shards)
+                .map_err(|_| DaemonError::InvalidSpec)?;
+            entry.cores = Some(crate::core_units::CoreUnits::new(
+                entry.spec.ipc_path.clone(),
+                crate::protocol::BotId(bot_id),
+                shard,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Core status per Shard for operators (no paths or secrets).
+    #[cfg(unix)]
+    pub fn core_status(&self, key: &ShardKey) -> Option<Vec<crate::core_units::CoreStatus>> {
+        self.entries.get(key)?.cores.as_ref().map(|c| c.status())
+    }
+
+    /// Stops every Shard Cores: close their stdin, wait until `deadline`, then kill the
+    /// ones still alive. Run after the Gateways have been stopped.
+    #[cfg(unix)]
+    pub async fn stop_cores(&mut self, deadline: Duration) {
+        for entry in self.entries.values_mut() {
+            if let Some(cores) = entry.cores.as_mut() {
+                cores.begin_stop();
+            }
+        }
+        let until = std::time::Instant::now() + deadline;
+        loop {
+            let mut alive = false;
+            for entry in self.entries.values_mut() {
+                if let Some(cores) = entry.cores.as_mut() {
+                    alive |= cores.any_alive();
+                }
+            }
+            if !alive || std::time::Instant::now() >= until {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        for entry in self.entries.values_mut() {
+            if let Some(cores) = entry.cores.as_mut() {
+                cores.kill();
+                cores.cleanup();
+            }
+        }
     }
 
     pub fn snapshots(&self) -> Vec<ProcessSnapshot> {
@@ -2874,7 +2944,18 @@ impl<C: Clock> Daemon<C> {
             }
             entry.reservation = Some(path);
         }
+        #[cfg(unix)]
+        if let Some(cores) = entry.cores.as_mut() {
+            // Cores first: the Gateway connects to them before it logs in to Discord.
+            cores
+                .ensure(Path::new(&spec.program))
+                .map_err(|_| DaemonError::SpawnFailed)?;
+        }
         let mut command = Command::new(&spec.program);
+        #[cfg(unix)]
+        if let Some(cores) = entry.cores.as_ref() {
+            command.arg("--core-dir").arg(cores.dir());
+        }
         command
             .args(&spec.args)
             .env_clear()
@@ -2968,6 +3049,14 @@ impl<C: Clock> Daemon<C> {
         manual: Option<&ShardKey>,
     ) -> Result<(), DaemonError> {
         let mut first_error = self.now().err();
+        #[cfg(unix)]
+        for entry in self.entries.values_mut() {
+            let program = PathBuf::from(&entry.spec.gateway.program);
+            let wanted = entry.snapshot.desired_running;
+            if let Some(cores) = entry.cores.as_mut() {
+                cores.poll(&program, wanted);
+            }
+        }
         let mut host = ProcessRecoveryHost {
             entries: &mut self.entries,
             credentials,

@@ -249,6 +249,8 @@ fn local_hello(identity: crate::protocol::Identity) -> crate::protocol::Hello {
 const STATE_VERSION: u32 = 3;
 const MAX_FRAME_BYTES: u64 = 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
+/// How long an attach waits for a Core that is still starting.
+const ATTACH_WAIT: Duration = Duration::from_secs(3);
 const APPLICATION_DEADLINE: Duration = Duration::from_secs(30);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -710,10 +712,25 @@ impl Process {
         secret: &crate::redact::Secret<[u8; crate::secret_file::SECRET_BYTES]>,
         identity: crate::protocol::Identity,
     ) -> Result<Self, AppError> {
-        let mut stream = timeout(DEADLINE, tokio::net::UnixStream::connect(socket))
-            .await
-            .map_err(|_| failure("core connect timed out"))?
-            .map_err(|_| failure("core connect failed"))?;
+        // botd starts the Cores and then the Gateway; the sockets may not exist yet. Wait a
+        // short, bounded time for a Core that is still starting, but fail at once on
+        // anything else (a refusal by permissions is not a Core that is "about to listen").
+        let started = tokio::time::Instant::now();
+        let mut stream = loop {
+            match timeout(DEADLINE, tokio::net::UnixStream::connect(socket)).await {
+                Err(_) => return Err(failure("core connect timed out")),
+                Ok(Ok(stream)) => break stream,
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) && started.elapsed() < ATTACH_WAIT =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(Err(_)) => return Err(failure("core connect failed")),
+            }
+        };
         // The first line authenticates this client to the Core (64 hex digits and a
         // newline), built in a fixed buffer that is wiped as soon as it is written.
         const HEX: &[u8; 16] = b"0123456789abcdef";
