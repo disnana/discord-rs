@@ -289,7 +289,7 @@ fn request_cause<'a>(
         .map_or(error, |error| error.0.as_ref())
 }
 
-fn failure(message: &'static str) -> AppError {
+pub(crate) fn failure(message: &'static str) -> AppError {
     Box::new(WorkerFailure {
         message,
         exit_code: None,
@@ -3285,7 +3285,7 @@ async fn run_with_backend(
     serve_core(backend, CoreIo::stdio()).await
 }
 
-async fn serve_core(
+pub(crate) async fn serve_core(
     backend: Option<Arc<dyn crate::state_store::StateStore>>,
     io: CoreIo,
 ) -> Result<(), AppError> {

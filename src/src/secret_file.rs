@@ -185,7 +185,7 @@ pub fn load_secret_file(path: &Path) -> Result<Secret<[u8; SECRET_BYTES]>, Secre
 }
 
 #[cfg(unix)]
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     unsafe extern "C" {
         fn geteuid() -> u32;
     }

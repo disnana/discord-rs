@@ -4,6 +4,8 @@ pub mod child_recovery;
 pub mod cluster;
 pub mod cluster_runtime;
 mod cogs;
+#[cfg(unix)]
+pub mod core_server;
 pub mod core_state;
 pub mod daemon;
 pub mod daemon_metrics;

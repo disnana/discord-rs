@@ -784,6 +784,14 @@ async fn run() -> Result<(), AppError> {
     if args == [OsString::from("--worker")] {
         return worker::run().await;
     }
+    // Connection-oriented Core (stage 1-B1 of the Gateway/Core separation): listens on a
+    // Unix socket instead of using stdin/stdout. Never combined with other arguments.
+    #[cfg(unix)]
+    if let [flag, socket] = args.as_slice()
+        && flag == "--core-listen"
+    {
+        return src::core_server::run(PathBuf::from(socket)).await;
+    }
     let options = GatewayOptions::parse(args)?;
     let bootstrap = if options.local_control {
         Some(
