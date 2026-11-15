@@ -95,6 +95,35 @@ botctl status --secret-file ABS_SECRET --port PORT --json
 
 Gatewayが起動するWorkerはさらに `env_clear` するため、任意名のBot tokenもCoreへ渡しません。状態・Worker更新監視ファイル・計画上のIPC/管理パスはBot/Shard別です。業務状態の大半はメモリ内であり、状態パスの割当そのものが永続化を意味するわけではありません。例外として、Gatewayは `--state-path`（`gateway-state`）配下の `core-state.json` に、確認済みスナップショット（snapshot-v3 の `!count` カウンターと `!job` 計算状態のみ）を保存し、Gateway／botd の再起動後の最初のWorkerへ復元します（詳細は後述の「確認済みスナップショットの永続化」）。
 
+### Core の配置：`--core-mode embedded|separate`
+
+既定の `--core-mode embedded`（従来どおり）では、Core は Gateway が起動して所有する Worker プールです。`--core-mode separate` は opt-in の経路で、Linux 限定、`--stop-children-on-exit` の併用が必須です。標準の単独 daemon だけで使え、試験用の quorum・raft・Gateway 切替の指定とは併用できません。
+
+```text
+botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GATEWAY --bootstrap-stdin --stop-children-on-exit --core-mode separate
+```
+
+次は、WSL の実プロセス試験（`botd_separate_cores`、模擬 Discord）で確認した動作です。
+
+- 起動順は Core → Gateway です。botd は Shard ごとに Core を 2 個（slot 0・1）起動してから Gateway に `--core-dir` を渡します。Gateway は Core のソケットが現れるまで最大 3 秒待って接続します。
+- Core は botd の子で、Gateway の子ではありません。Gateway が終了しても Core は残ります。Core は独立したプロセスグループで起動するため、端末の Ctrl+C は直接届きません。botd が停止させます。
+- Shard の `ipc` ディレクトリ（`ABS_RUNTIME/bot-<Bot IDの16進>/shard-<番号>/ipc`）に次のファイルを置きます。ディレクトリは 0700、ファイルは 0600 です。
+  - `core-<slot>.sock`：Core の Unix socket（slot は 0 と 1）。
+  - `core.secret`：能力 secret（64 桁の 16 進 1 行）。botd が作成し、Core の stdin と Gateway（接続時の読み込み）に渡します。値を端末・ログ・argv・環境変数へ出さないでください。Core が全て止まると削除されます。
+  - `core-<slot>.log`：各 Core の標準出力・標準エラー（追記、0600）。起動時に 4 MiB を超えていれば作り直します。
+- Core は stdin が閉じると終了します。botd が停止するとき、または botd が終了して stdin が閉じたときに止まります。停止順は Gateway → Core です。
+- Gateway を再起動しても Core は残り、再起動した Gateway が同じ Core に接続し直します。
+- Core を単独で終了させた場合（例：`kill`）、botd が 1 秒から 30 秒の指数バックオフで同じ slot の Core を起動し直します。Gateway は止まらず、新しい Core に接続し直します。
+- Core が連続して認証に失敗（その間に認証済みの接続がない）を 16 回重ねると、Core は終了し、botd が起動し直します。
+- botd が起動し直した空の Core へは、Gateway が保存している確認済みスナップショット（`core-state.json`）を復元します。生きている Core の状態は Core 側が保持します。
+
+制約と未検証の事項：
+
+- ホットスワップ（Core の無停止差し替え）は separate では未対応です。
+- botd が死亡すると Core も失われます。Gateway が残らないよう `--stop-children-on-exit` が必須です。botd が SIGKILL で止まった場合の後始末は未検証です。
+- 実 Discord、systemd 常駐、WSL の再起動後の自動起動、長時間稼働、複数 Shard での separate は未検証です。
+- 結果不明の外部操作と、Core の再起動をまたぐ未確認イベントの扱いは、既定経路と同じく保証しません。
+
 ### Discordに接続しない模擬実行
 
 実GatewayとWorkerの経路をtokenなしで検証するには、試験ランナーがloopbackでcollectorを待ち受け、botdに次の追加オプションを渡します。

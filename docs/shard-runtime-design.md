@@ -18,7 +18,7 @@
 
 `shard_runtime::plan(&[LocalShardIntent], &Path)` は純粋な計画生成で、環境変数の参照、ファイル操作、プロセス起動、listener作成を行わない。出力順はBot ID、Shard IDの順。各 `ShardRuntimeSpec` はGateway/Coreのプログラム名、個別の `OsString` 引数、状態・管理パス、当該ShardのIPCパスを持つ。
 
-Gatewayの引数は `--bot-id`、`--shard-id`、`--total-shards`、`--ipc-path`、`--state-path`、`--management-path`、`--token-env`。`botd --gateway-program` が計画上の `gateway-host` を実成果物へ置き換える。Core欄の `bot-core` は予約された起動仕様であり、daemonがそれを別途起動するわけではない。実CoreはGateway所有のWorkerプールである。
+Gatewayの引数は `--bot-id`、`--shard-id`、`--total-shards`、`--ipc-path`、`--state-path`、`--management-path`、`--token-env`。`botd --gateway-program` が計画上の `gateway-host` を実成果物へ置き換える。Core欄の `bot-core` は計画上の予約された起動仕様のままで、既定の `--core-mode embedded` では daemon がそれを別途起動しない。既定の実 Core は Gateway 所有の Worker プールである。opt-in の `botd --core-mode separate`（Linux、`--stop-children-on-exit` 必須）では、botd が Core を自分の子として Shard の `ipc` ディレクトリ配下の `core-<slot>.sock` に起動し、Gateway は `--core-dir` で接続する。この経路の Core は Gateway の子ではない（詳細は [operator-guide.md](operator-guide.md)、[ipc-protocol.md](ipc-protocol.md)。実 Discord と実 systemd 上の検証は未実施）。
 
 daemonは毎回 `env_clear` し、通常モードでは当該Botの `credential_refs` で指定したtokenだけを読み取り・注入する。さらに `BOT_ID` / `SHARD_ID` / `TOTAL_SHARDS` / `GENERATION_ID` を計画と起動世代から設定する。WindowsではloopbackのIPリテラルへの接続にも必要だったOS変数 `SystemRoot` だけを追加継承し、未設定・空なら固定診断で起動を拒否する。`PATH` や他の環境は継承しない。引数と環境のidentityが矛盾する実Gateway起動は拒否する。Workerは隔離起動で再び `env_clear` し、必要なIPC identityだけを渡す。`DISCORD_TOKEN` に加え任意の `token_env` 名の値もCoreへ継承しない。秘密値は起動仕様・予約記録・試験の結果へ書き出さない。
 
@@ -41,7 +41,7 @@ root/bot-<Bot IDのUTF-8小文字16進表現>/shard-<番号>/
 
 Bot IDは1〜64 UTF-8 byte、前後空白・制御文字は禁止。CON/NUL等の予約名、区切り、ドライブ表現、末尾ピリオドを生のパス成分にせず、大小文字の異なるIDも異なる16進表現にする。rootの親参照、Shard範囲外・重複、同一Bot内の総数/変数名の不一致、パスの大小文字非区別での衝突を拒否し、入力をエラー本文へ転記しない。
 
-実GatewayのWorker更新監視ファイルはShard別の `gateway-state/worker-path.txt` へ置く。`ipc` / `core-state` / 管理パスの計画上の割当は、Unix socket・Named Pipe・永続StateStoreの実装を意味しない。Gateway–Worker間の実IPCは世代ごとの匿名stdin/stdoutパイプである。カウンター・ジョブ・Framework StateMap等の業務状態はメモリ内で、Gateway再起動による復元は保証しない。
+実GatewayのWorker更新監視ファイルはShard別の `gateway-state/worker-path.txt` へ置く。`ipc` / `core-state` / 管理パスの計画上の割当は、既定経路では Unix socket・Named Pipe・永続StateStoreの実装を意味しない。既定経路の Gateway–Worker 間の実IPCは世代ごとの匿名stdin/stdoutパイプである。opt-in の separate 経路では、`ipc` 配下の `core-<slot>.sock` が Core の Unix socket として使われる。カウンター・ジョブ・Framework StateMap等の業務状態はメモリ内で、Gateway再起動による復元は保証しない。
 
 rootと実行成果物は信頼する配備入力である。ACL、symlink/junction等の別名、OS/transportの長さ制限、署名検証、停電時の永続性は本経路で保証しない。
 

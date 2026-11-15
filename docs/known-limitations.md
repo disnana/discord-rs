@@ -23,6 +23,11 @@
 - ownership、lease、watchdog、failover/failback には状態機械や模擬時計・模擬ネットワークの試験があります。本番のプロセス起動・Discord送信・quorumとの統合は未完成です。botd 既定経路は systemd `Type=notify` 向けに `READY=1`（制御経路 listen 開始後）・`WATCHDOG=1`（`WATCHDOG_USEC` の半分間隔、監視ループの tick 完了後のみ）・`STOPPING=1` を送りますが（`src/sd_notify.rs`）、テスト用クラスタ/Raft/Gateway 切替モードは未対応で、実 systemd での検証は未実施です。3秒検知・30秒安定確認は設定上の目標で、実復旧時間の保証ではありません。実験的 Raft ストアには epoch 永続化がありますが、本番統合や OS suspend 時の時計安全性は未検証です。
 - `cluster.rs` の過半数ACKは試験用シミュレーションであり本番合意ではありません。メインworkspaceの `raft_quorum` は OpenRaft 0.9.26 を用いる実験的な固定メンバー構成で、永続予約・epoch CAS とローカル admission gate を備えます。試験用cluster runtimeとmTLS Raft RPCに接続されますが、本番起動は拒否されます。本番fencingは未検証です。保持予約は明示的な解放が必要で、クラッシュ後の自動引継ぎや強制解除はありません。独立スパイクの評価は [quorum-evaluation.md](quorum-evaluation.md) 参照。実分断・quorum喪失下での二重Active防止を本番環境で保証できません。
 - Gateway並行切替には状態機械に加え、明示的な試験フラグと模擬Discordを使う botd → Gateway → Core のローカルプロセス切替経路があります。実Discord上の新旧WebSocket接続・Shadow・Active移譲・旧REST結果保持、本番 lease との統合は未検証です。この試験経路は production_ready ではありません。
+- `botd --core-mode separate`（opt-in。既定は `embedded`）は Linux 限定で、`--stop-children-on-exit` を必須とし、試験用の quorum・raft・Gateway 切替の指定とは併用できません。検証は WSL の実プロセス試験（`botd_separate_cores`、模擬 Discord）のみで、実 Discord、systemd 常駐、長時間稼働、複数 Shard での separate は未検証です。
+- separate では Core の無停止差し替え（ホットスワップ）は未対応です。Gateway の `--core-dir` では Worker 更新の監視を行いません。
+- separate で botd が死亡すると Core も失われます（Core は stdin の EOF で終了）。botd の SIGKILL 時の後始末は未検証で、試験は SIGTERM による停止のみです。
+- separate の Core 切断は、要求の失敗で検知する記録です。待機中の切断の検知、再接続後のイベント連番・未確認イベントの扱いは未検証です。再接続は 100 ms から最大 5 秒の指数バックオフです。
+- botd が起動し直した空の Core へは、Gateway の確認済みスナップショット（`core-state.json`）を復元します（模擬の試験のみ）。確認済み以降の変化は失われ得ます。実 Discord での `!count` 継続は未確認です。
 
 ## Worker更新・配送・外部副作用
 
@@ -38,7 +43,7 @@
 - StateStoreはTTL・容量・CAS・スキーマ等を持つ非同期APIとメモリ・ファイル永続化実装があります。StateMap、View/Modal状態、チェックポイント等がプロセスやホスト障害を越えて保持される保証はありません。
 - Gateway が `--state-path` 配下の `core-state.json` に確認済みスナップショット（snapshot-v3 の `!count`／`!job` のみ。framework の StateStore とは別）を保存し、Gateway／botd の再起動後に復元します。保存は変化時のみ・最短2秒間隔・原子的書き込み・0600・1 MiB 上限で、停止時は最終状態を書きます。`kill -9` 等では直近およそ2.5秒分の変化が失われ、イベントジャーナルとアプリのStateMap/Cog状態は保存されません。保存失敗や破損・不一致ファイルは警告または無視（空の状態で起動）で、`--state-path` なしでは何もしません。ローカル未ビルドでCI検証待ち、実Discordでの確認も未実施です。詳細は [operator-guide.md](operator-guide.md)。
 - TaskManager/Supervisorは子タスク追跡、取消、再起動予算、drain等の基盤があり、Workerの一部に接続されています。Cog、IPC、全資源を含む完全なdrainや障害復旧は未検証です。
-- 実Worker IPCはstdin/stdoutの改行JSON、フレーム上限1 MiBです。MessagePack、Unix socket/Named Pipe、制御・データ経路分離、snapshot分割は採用していません。Helloのidentityとcapability交渉はありますが、型の存在だけで全経路の認証・fencingを保証しません。[ipc-protocol.md](ipc-protocol.md) 参照。
+- 実Worker IPCはstdin/stdoutの改行JSON、フレーム上限1 MiBです。既定経路の実Worker IPCは上記のstdin/stdoutです。opt-in の `--core-mode separate` だけが Unix socket 接続型（能力 secret と SO_PEERCRED 付き）を使います。MessagePack、Named Pipe、制御・データ経路分離、snapshot分割は採用していません。Helloのidentityとcapability交渉はありますが、型の存在だけで全経路の認証・fencingを保証しません。[ipc-protocol.md](ipc-protocol.md) 参照。
 
 ## 管理・セキュリティ・観測性
 

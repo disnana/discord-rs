@@ -991,6 +991,40 @@ pub mod control {
             json!({"ok": false, "offline": false, "error": error, "note": NOTE})
         }
 
+        /// Process rows for status output. In the separated layout each Shard row also
+        /// carries `cores` (running and failures only); embedded layout keeps the rows unchanged.
+        fn process_views(&self, processes: &[ProcessSnapshot]) -> Vec<Value> {
+            processes
+                .iter()
+                .map(|process| {
+                    let mut view = json!(process);
+                    if let (Some(cores), Value::Object(map)) =
+                        (self.cores_view(&process.key), &mut view)
+                    {
+                        map.insert("cores".into(), cores);
+                    }
+                    view
+                })
+                .collect()
+        }
+
+        #[cfg(unix)]
+        fn cores_view(&self, key: &ShardKey) -> Option<Value> {
+            self.daemon.core_status(key).map(|cores| {
+                Value::Array(
+                    cores
+                        .iter()
+                        .map(|core| json!({"running": core.running, "failures": core.failures}))
+                        .collect(),
+                )
+            })
+        }
+
+        #[cfg(not(unix))]
+        fn cores_view(&self, _key: &ShardKey) -> Option<Value> {
+            None
+        }
+
         fn bot_view(&self, bot: &BotPlacement) -> Value {
             let processes: Vec<_> = self
                 .daemon
@@ -1021,7 +1055,7 @@ pub mod control {
                 "mixed"
             };
             json!({"name": bot.name, "bot_id": bot.bot_id, "total_shards": bot.total_shards,
-                "status": state, "processes": processes})
+                "status": state, "processes": self.process_views(&processes)})
         }
 
         fn snapshot(&self, op: &Operation) -> OperationSnapshot {
@@ -1108,7 +1142,7 @@ pub mod control {
                         .filter(|s| selected.as_ref().is_none_or(|b| b.bot_id == s.key.bot_id))
                         .collect();
                     let mut value = json!({"ok": true, "offline": false, "note": NOTE,
-                        "status": {"processes": processes, "monitor_ok": self.monitor_ok}});
+                        "status": {"processes": self.process_views(&processes), "monitor_ok": self.monitor_ok}});
                     // Advisory observations only; no labels beyond Bot/shard/generation.
                     value["status"]["metrics"] = self
                         .daemon

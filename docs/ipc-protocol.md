@@ -88,6 +88,20 @@ Health の広告だけでは有効にしない。未交渉の旧 Worker へは `
 
 検証は `event_seq_ipc.rs` / `worker_replay.rs` の実プロセスと故障注入 fixture、`worker_tasks.rs` の制御可能な Future を使用する。ACK / result 順序、欠落・重複拒否、ACK 喪失後の切替、候補 replay 失敗時の保持、両側 capability 不足拒否、連続更新のカーソル、結果喪失後の非再配送、通信待機取消からの切替、親子追跡・drain・取消・パニック・容量回収を確認する。Linux、実 Discord、プロセス suspend、親/ホスト強制停止、外部副作用の統合検証は未実施。
 
+## Unix socket 接続型（`--core-mode separate` の Core）
+
+既定経路（上記の stdin/stdout）とは別の、opt-in の接続型です。Linux のみです。botd が起動した Core（`src --core-listen <絶対パス> --core-persist`）に、Gateway（`--core-dir`）が接続します。
+
+- **ソケットと置き場所**：Core はソケットを 0600 で作り、親ディレクトリは実効ユーザーが所有し group/other に権限がないものを要求します。既存パスが通常ファイルなら置換せず拒否します。古いソケットだけを削除します。
+- **能力 secret（最初の行）**：接続の最初の行は 64 桁の 16 進と LF の 65 バイトです。Core は定数時間比較で照合します。不一致・形式不正、または 5 秒以内に届かない接続は閉じ、次の接続を待ちます。secret は botd が Core の stdin の最初の行（10 秒以内）で渡し、Gateway は `core.secret` を読みます。argv や環境変数には載せません。
+- **SO_PEERCRED**：接続元の uid が Core の実効 uid と一致しない接続を拒否します。同じユーザーの別プロセスは区別しません。実際の関門は secret です。
+- **Hello**：認証の後に通常の Hello 交渉を行います。Bot ID、Shard（id と total）、generation_id、ownership_epoch が両側で完全一致しなければ拒否されます。separate では botd が Bot と Shard から決めた identity（generation 1、ownership_epoch 0）を使い、Core には `BOT_WORKER_IPC_IDENTITY` で、Gateway には同じ規約から渡します。protocol 範囲と必須 capability の検査は従来どおりです。
+- **接続ごとの交渉状態**：capabilities、保留中の API 結果、イベントカーソル、drain は接続ごとに初期化されます。Core のアプリ状態（`!count` 等）は接続をまたいで Core が保持します。
+- **要求ループ**：認証後は stdin/stdout 版と同じ `serve_connection` を使います。要求と応答の種類、フレーム上限 1 MiB は同じです。
+- **接続の寿命**：`--core-persist` の Core は接続が切れても終了せず、次の接続を受けます。stdin が閉じたとき、または認証失敗が 16 回重なったときに終了します。
+- **切断と再接続（Gateway 側）**：切断は要求の失敗で検知します。再接続は 100 ms から最大 5 秒の指数バックオフです。接続だけが切れた場合は Core が保持する状態を採用します。空の Core（botd が起動し直したもの）にだけ確認済みスナップショットを復元します。
+- **未検証**：この接続型の実 Discord での挙動、待機中の切断の検知、再接続をまたぐ未確認イベントの連番と再送、botd の SIGKILL 時の後始末。
+
 ## 診断と切替後の障害記録
 
 Worker の診断はコードで定義した固定原因、IO の種別・OSコード、JSON の分類・行列だけを公開し、任意の Error 本文や source をそのまま整形しない。Worker の Rejected は既知の固定理由だけを採用し、未知の理由本文は `[REDACTED]` に置き換える。秘密らしい文字列を検索して消す処理だけに依存せず、通常の `worker exited` やプロトコル・capability 不一致を識別できるようにする。

@@ -8,6 +8,8 @@
 #   3. Core ワーカーを kill -9 → Gateway が補充する
 #   4. botd を kill -9 → systemd が再起動し、古い起動予約が整理されて子が起動し直す
 #   5. systemctl stop → 子も含めて残らず止まる
+#   6. --core-mode separate（drop-in で有効化）: Core は botd の子（Gateway の子ではない）、
+#      Gateway を kill しても Core の PID は不変、stop 後に Gateway/Core が残らず ipc に *.sock と core.secret が残らない
 #
 # 使い方（root で実行。専用ユーザー・/opt・/etc・unit を作り、終了時にすべて削除する）:
 #   sudo ./wsl-systemd-smoke.sh /path/to/discord-rs        # リポジトリのルート。target/release に botd botctl src が必要
@@ -136,6 +138,51 @@ result=$(systemctl show botd -p Result --value)
 left=$(ps -u "$USER_NAME" -o pid= | wc -l)
 echo "Result=$result leftover processes=$left"
 [ "$result" = success ] && [ "$left" = 0 ] && echo "OK: clean stop" || { echo "FAIL: unclean stop"; ps -u "$USER_NAME" -o pid,ppid,cmd | head; fail=1; }
+
+echo "--- 6. --core-mode separate (Core is botd's child, not the Gateway's) ---"
+# 手順 1-5 の後に行う。zz-separate.conf は smoke.conf より後に読まれ（systemd は drop-in を名前順に読む）、
+# ExecStart= で置き換える。--no-autostart は付けない（Gateway と Core を起動させるため）。模擬 Discord のみ。
+cat > /etc/systemd/system/botd.service.d/zz-separate.conf <<CONF
+[Service]
+ExecStart=
+ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --control-port $PORT --stop-children-on-exit --core-mode separate --mock-discord 127.0.0.1:$COLLECTOR_PORT
+CONF
+systemctl daemon-reload
+rm -rf /var/lib/discord-rs/runtime
+# Core のソケットと secret の場所（src/src/core_attach.rs）: <ipc>/core-<slot>.sock, <ipc>/core.secret。
+# ipc は <runtime-root>/bot-<bot_id の 16 進バイト列>/shard-<n>/ipc。bot_id 101 は 313031。
+ipc_dir=/var/lib/discord-rs/runtime/bot-313031/shard-0/ipc
+core_pids() { pgrep -u "$USER_NAME" -f 'src --core-listen' | sort -n; }
+ppid_of() { ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '; }
+if systemctl start botd; then echo "OK: started (separate)"; else echo "FAIL: botd did not start in separate mode"; journalctl -u botd --no-pager | tail -20; fail=1; exit 1; fi
+if wait_running 60; then echo "OK: Gateway and Core are Running"; else echo "FAIL: not Running in separate mode"; status_json | head -c 1500; fail=1; fi
+main=$(systemctl show botd -p MainPID --value)
+gw=$(gateway_pid)
+cores=$(core_pids)
+ncore=$(printf '%s\n' "$cores" | grep -c .)
+echo "botd=$main gateway=$gw cores=[$(printf '%s ' $cores)] count=$ncore"
+ok=1
+[ "$ncore" = 2 ] || ok=0
+for c in $cores; do [ "$(ppid_of "$c")" = "$main" ] || ok=0; done
+[ -n "$gw" ] && [ "$(ppid_of "$gw")" = "$main" ] || ok=0
+if [ "$ok" = 1 ]; then echo "OK: 2 Core processes, parent is botd (not the Gateway)"; else echo "FAIL: Core count or parent check"; ps -u "$USER_NAME" -o pid,ppid,cmd | head; fail=1; fi
+echo "--- 6b. kill -9 the Gateway: Core pids must not change ---"
+cores_before=$(core_pids | tr '\n' ' ')
+old=$(gateway_pid); kill -9 "$old"
+ok=0; for _ in $(seq 1 90); do new=$(gateway_pid); if [ -n "$new" ] && [ "$new" != "$old" ] && all_running; then ok=1; break; fi; sleep 1; done
+cores_after=$(core_pids | tr '\n' ' ')
+echo "core pids before: [$cores_before] after: [$cores_after]"
+if [ "$ok" = 1 ] && [ -n "$cores_before" ] && [ "$cores_before" = "$cores_after" ]; then echo "OK: Gateway restarted, Core pids unchanged"; else echo "FAIL: Gateway restart or Core pid change"; status_json | head -c 2500; fail=1; fi
+echo "--- 6c. stop: no Gateway/Core left, no sock/secret left in ipc ---"
+systemctl stop botd
+result=$(systemctl show botd -p Result --value)
+left=$(ps -u "$USER_NAME" -o pid= | wc -l)
+socks=$(ls "$ipc_dir"/*.sock 2>/dev/null | wc -l)
+secret=$(test -e "$ipc_dir/core.secret" && echo 1 || echo 0)
+echo "Result=$result leftover processes=$left sock files=$socks core.secret=$secret"
+if [ "$result" = success ] && [ "$left" = 0 ] && [ "$socks" = 0 ] && [ "$secret" = 0 ]; then echo "OK: separate mode stopped cleanly"; else echo "FAIL: unclean separate stop"; ps -u "$USER_NAME" -o pid,ppid,cmd | head; ls -la "$ipc_dir" 2>/dev/null; fail=1; fi
+rm -f /etc/systemd/system/botd.service.d/zz-separate.conf
+systemctl daemon-reload
 
 echo "=== result: $([ "$fail" = 0 ] && echo PASS || echo FAIL) ==="
 exit "$fail"

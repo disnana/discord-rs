@@ -14,6 +14,10 @@ on:
       - 'src/src/secret_file.rs'
       - 'src/src/bin/botd.rs'
       - 'src/src/bin/botctl.rs'
+      - 'src/src/core_units.rs'
+      - 'src/src/core_attach.rs'
+      - 'src/src/core_server.rs'
+      - 'src/src/daemon.rs'
 
 permissions:
   contents: read
@@ -268,6 +272,79 @@ jobs:
           sudo systemctl stop botd
           test "$(systemctl show botd -p Result --value)" = "success" || { echo "FAIL: unclean stop"; fail=1; }
           ps -u discord-rs -o pid,cmd --no-headers | grep -q . && { echo "FAIL: processes left after stop"; ps -u discord-rs -o pid,ppid,cmd | head; fail=1; }
+          test "$fail" = 0
+      - name: Separate Core mode under systemd (mock Discord; Core parent, Gateway kill, clean stop)
+        run: |
+          set +e
+          set -uo pipefail
+          # Same checks as deploy/dev/wsl-systemd-smoke.sh section 6. Only the drop-in
+          # zz-separate.conf is added: it is read after smoke.conf and replaces ExecStart=.
+          # Mock Discord only; no token. Cores are botd's children (not the Gateway's).
+          python3 /tmp/collector.py >/dev/null 2>&1 &
+          sleep 1
+          status_json() {
+            sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json 2>/dev/null
+          }
+          all_running() {
+            status_json | python3 -c 'import json,sys; d=json.load(sys.stdin); ps=[p for b in d.get("bots",[]) for p in b.get("processes",[])]; sys.exit(0 if ps and all(p.get("state",{}).get("state") == "Running" for p in ps) else 1)'
+          }
+          wait_running() {
+            for i in $(seq 1 "$1"); do all_running && return 0; sleep 1; done
+            return 1
+          }
+          gateway_pid() { pgrep -u discord-rs -f 'src.* --bot-id 101' | head -1; }
+          core_pids() { pgrep -u discord-rs -f 'src --core-listen' | sort -n; }
+          ppid_of() { ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '; }
+          ipc_dir=/var/lib/discord-rs/runtime/bot-313031/shard-0/ipc
+          fail=0
+          cat > /tmp/separate.conf <<'CONF'
+          [Service]
+          ExecStart=
+          ExecStart=/opt/discord-rs/bin/botd \
+              --file /etc/discord-rs/bots.toml \
+              --runtime-root /var/lib/discord-rs/runtime \
+              --gateway-program /opt/discord-rs/bin/src \
+              --secret-file /etc/discord-rs/botd.secret \
+              --control-port 47321 \
+              --stop-children-on-exit \
+              --core-mode separate \
+              --mock-discord 127.0.0.1:47400
+          CONF
+          sudo install -m 0644 /tmp/separate.conf /etc/systemd/system/botd.service.d/zz-separate.conf
+          sudo systemctl daemon-reload
+          sudo rm -rf /var/lib/discord-rs/runtime
+          sudo systemctl start botd || { echo "botd failed to start in separate mode"; sudo journalctl -u botd --no-pager | tail -30; exit 1; }
+          wait_running 60 || { echo "FAIL: not Running in separate mode"; status_json | head -c 1500; fail=1; }
+          main=$(systemctl show botd -p MainPID --value)
+          gw=$(gateway_pid)
+          cores=$(core_pids)
+          ncore=$(printf '%s\n' "$cores" | grep -c .)
+          echo "botd=$main gateway=$gw cores=[$(printf '%s ' $cores)] count=$ncore"
+          ok=1
+          [ "$ncore" = 2 ] || ok=0
+          for c in $cores; do [ "$(ppid_of "$c")" = "$main" ] || ok=0; done
+          [ -n "$gw" ] && [ "$(ppid_of "$gw")" = "$main" ] || ok=0
+          if [ "$ok" = 1 ]; then echo "OK: 2 Core processes, parent is botd (not the Gateway)"; else echo "FAIL: Core count or parent check"; ps -u discord-rs -o pid,ppid,cmd | head; fail=1; fi
+          echo "--- kill -9 the Gateway: Core pids must not change ---"
+          cores_before=$(core_pids | tr '\n' ' ')
+          old=$(gateway_pid); sudo kill -9 "$old"
+          ok=0
+          for i in $(seq 1 90); do
+            new=$(gateway_pid)
+            if [ -n "$new" ] && [ "$new" != "$old" ] && all_running; then ok=1; break; fi
+            sleep 1
+          done
+          cores_after=$(core_pids | tr '\n' ' ')
+          echo "core pids before: [$cores_before] after: [$cores_after]"
+          if [ "$ok" = 1 ] && [ -n "$cores_before" ] && [ "$cores_before" = "$cores_after" ]; then echo "OK: Gateway restarted, Core pids unchanged"; else echo "FAIL: Gateway restart or Core pid change"; status_json | head -c 2500; fail=1; fi
+          echo "--- stop: no Gateway/Core left, no sock/secret left in ipc ---"
+          sudo systemctl stop botd
+          result=$(systemctl show botd -p Result --value)
+          left=$(ps -u discord-rs -o pid= | wc -l)
+          socks=$(sudo ls "$ipc_dir"/*.sock 2>/dev/null | wc -l)
+          secret=$(sudo test -e "$ipc_dir/core.secret" && echo 1 || echo 0)
+          echo "Result=$result leftover processes=$left sock files=$socks core.secret=$secret"
+          if [ "$result" = success ] && [ "$left" = 0 ] && [ "$socks" = 0 ] && [ "$secret" = 0 ]; then echo "OK: separate mode stopped cleanly"; else echo "FAIL: unclean separate stop"; ps -u discord-rs -o pid,ppid,cmd | head; sudo ls -la "$ipc_dir" 2>/dev/null; fail=1; fi
           test "$fail" = 0
       - name: Journal
         if: always()
