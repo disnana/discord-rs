@@ -274,3 +274,5 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 検証：WSL で `core_attach` 9 件成功（持続 Core が 3 接続を処理し不正秘密の接続で止まらない／`OneConnection` は 1 接続で終了）。CI は 70ab7ec で `a_stale_socket_is_replaced…` が 1 回 Connection refused で失敗したが、同じテストを WSL で 40 回回しても再現せず、テストのみ変更（Core の stderr を CI ログに出す）の再実行は成功した。**原因未特定の不安定要因として残す**（再発時は Core の stderr で確認）。最後の試験追加コミット（722eda0）の CI は未確認。
 - 状態の保持そのもの（再接続後に `!count` が残る等）は構造上のもので、試験では未確認。
 - 次：1-B2b-ii（切断検知と上限付き再接続）、1-B2c（`core-state.json` の鮮度判定）、1-C（botd の `--core-mode separate`）。
+- 1-B2b-ii：attach した Manager は、接続が壊れたスロット（`process.broken`）を上限付き指数バックオフ（100 ms〜5 s）で再接続する（`poll_core_reconnect`）。子の起動はしない。再接続した Core へは `core-state.json` を Restore しない（Core 自身の状態を正とする）。`--core-listen <path> --core-persist` で接続をまたいで動く Core を起動できる（試験・1-C 用）。試験：Manager を作り直しても `!count` が続く、落ちて起動し直された Core へ再接続して処理が続く。CI 緑（fmt 修正後、3m48s）。
+- 制約：切断の検知は次の要求の失敗時（待機中の切断は能動的には検知しない）。再接続後のイベントカーソル／未確認イベントの再送、`core-state.json` の鮮度判定（1-B2c）は未実装。前回 CI の `a_stale_socket…` 失敗は再発していない。
