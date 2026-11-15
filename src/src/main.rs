@@ -445,6 +445,12 @@ async fn run_standby(
                 Some(epoch) = activation.recv() => break epoch,
                 event = shard.next_event(EventTypeFlags::all()) => match event {
                     Some(event) => {
+                        if matches!(event, Ok(Event::Ready(_))) {
+                            // botd waits for this file before it activates the standby.
+                            if let Some(state) = options.path("--state-path") {
+                                let _ = std::fs::write(state.join("standby-ready"), b"ready\n");
+                            }
+                        }
                         if backlog.len() >= BACKLOG_LIMIT {
                             eprintln!("待機Gatewayのイベントが上限を超えたため中止します");
                             return Err(StartupFailure::InvalidArguments.into());

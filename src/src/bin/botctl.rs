@@ -171,6 +171,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         ["start", bot] => ("start", Some((*bot).to_owned())),
         ["stop" | "shutdown", bot] => ("stop", Some((*bot).to_owned())),
         ["restart" | "reboot", bot] => ("restart", Some((*bot).to_owned())),
+        ["gateway-update", bot] => ("gateway-update", Some((*bot).to_owned())),
         ["update", bot] => ("update", Some((*bot).to_owned())),
         ["rollback", bot] => ("rollback", Some((*bot).to_owned())),
         ["operation" | "op", id] if operation_id.is_none() => {
@@ -241,7 +242,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     if operation_id.is_some()
         && !matches!(
             command,
-            "start" | "stop" | "restart" | "operation" | "update" | "rollback"
+            "start" | "stop" | "restart" | "operation" | "update" | "rollback" | "gateway-update"
         )
     {
         return Err("--operation-id requires a mutation or operation query");
@@ -498,7 +499,7 @@ fn operation_state<'a>(value: &'a Value, id: &str, command: &str) -> Result<&'a 
         || !operation["failed_shards"].is_array()
         || !matches!(
             operation["command"].as_str(),
-            Some("start" | "stop" | "restart" | "update" | "rollback")
+            Some("start" | "stop" | "restart" | "update" | "rollback" | "gateway-update")
         )
     {
         return Err("daemon operation has no valid result metadata");
@@ -614,7 +615,7 @@ async fn run_live(
 ) -> Value {
     let mutation = matches!(
         options.command,
-        "start" | "stop" | "restart" | "update" | "rollback"
+        "start" | "stop" | "restart" | "update" | "rollback" | "gateway-update"
     );
     if mutation && options.operation_id.is_none() {
         options.operation_id = match new_operation_id() {
