@@ -2,6 +2,12 @@
 
 作成: 2026-11-12（2026-11-13 更新）。この文書は、これまでの PM 主導・並列開発の方針、進め方、現状、残課題、運用上の注意をまとめたもの。仕様の基準は [architecture.md](architecture.md)、進捗の詳細は [progress.md](progress.md)、適合状況は [conformance.md](conformance.md)、保証できない点は [known-limitations.md](known-limitations.md)。
 
+## 0. 最新の状態（2026-11-16 夜の更新。詳細は progress.md の末尾）
+- **Gateway と Core の分離**（`botd --core-mode separate`、Linux、opt-in）と **Gateway の無停止更新**（`botctl gateway-update <bot>`）が入った。Core は botd の子で Gateway と独立に動き、Gateway の更新・クラッシュで Core の PID と `!count` の状態は変わらない。実機（WSL2、実 Discord）で、起動・各種クラッシュ復旧・更新 2 回・更新中の連投・重複排除・OS 再起動後の自動起動・待機 Gateway の失敗を確認済み。
+- **Oracle サーバー（aarch64）で放置試験中**（2026-11-15 22:10 JST 開始、separate、テスト用 Bot）。`~/soak.log` に記録（`soak-report`）、`deploy/dev/soak-diff.sh` で最初と最後を比較。次は `docs/soak-test.md` の §5（新ビルドへの入れ替え）。
+- **未検証・未実装**：長時間稼働の結果、複数 Shard の実機、Interaction（スラッシュ）の重複排除（ACK の規則による想定）、Core のホットスワップ（separate では未対応）、孤児 Core の再採用、`gateway-update` の検証付き監査（現状は追記ファイル）。Sol レビューの限界は `known-limitations.md`。
+- **ツール**：Codex は ChatGPT アカウントで `gpt-6.1-terra`／`gpt-6.1-sol`（`Terra` 等の別名は不可）。Haiku は docs・補助スクリプト、Codex は試験の執筆とレビュー、Claude が設計・統合・検証。CI の確認は ci-verify ブランチに push して Actions で行う。
+
 ## 1. 現状の要約
 - **対応OSと成否の基準（2026-11-13決定）**：対応OSは **Linux（Ubuntu）のみ**、**Windows はサポート外**（開発機での動作は保証しない。Windows固有コードは残るが保証・CI対象外）。**試験の成否の基準は Ubuntu の GitHub Actions**（`ci.yml`、`stress.yml`、`bench.yml`）とする。
 - **CI / ベンチマーク状況**：GitHub Actions（Ubuntu のみ）の並列ジョブ（fmt、clippy、test の 5 シャード＝reload/cluster/daemon/process/rest、examples+doctor、集約の ci-ok）は、2026-11-13 に全ジョブ成功を確認（最長経路は reload シャードの約 280 秒）。stable 互換は週次/手動の別ワークフロー（stable.yml）。Linux 上での IPC / failover ベンチマークも測定済み（AMD EPYC 7763 4vCPU、IPC 往復 p99 は並列度 1/4/16 で 115.5/258.1/973.6 µs、failover 検知 Suspected p50 1503.6ms / FailoverPending p50 3003.1ms。本番性能の保証ではない）。

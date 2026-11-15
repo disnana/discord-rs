@@ -55,3 +55,21 @@ cron で自動化する場合（1 時間おき）：`0 * * * * /usr/local/bin/so
 ## 4. 終わり方
 
 `sudo systemctl stop botd`（`Result=success`、残りプロセス 0、ipc に sock・secret なし）。結果は `docs/progress.md` に、日付・環境（サーバーの機種）・上の表の数値で書く。**確認できないこと**（今回の範囲外）：複数 Shard、複数ホスト、Resume、レート制限の高負荷。
+
+## 5. 放置のあとに：新しいビルドへの入れ替え（Gateway の無停止更新の実機試験を兼ねる）
+
+放置の記録を取り終えたら、新しいソースを入れ替える。**Core と botd は新しいバイナリで入れ替える必要があり（botd の再起動を含む）、その後の入れ替えからは Gateway だけを `gateway-update` で無停止に更新できる。**
+
+```bash
+# 1. 新しい src.zip を展開してビルド（前回と同じ。.gitignore された target は残してよい）
+cd /home/ubuntu/discord-rs/src && cargo build --release --locked -j 2 --bin botd --bin botctl --bin src
+# 2. 最初の入れ替え（この回は botd と Core も新しくなるので、Bot は数秒止まる）
+sudo install -m 0755 target/release/botd target/release/botctl target/release/src /opt/discord-rs/bin/
+sudo systemctl restart botd
+# 3. 次回以降（Gateway だけの変更）：バイナリを置いて、更新を指示する。Core は止まらない
+sudo install -m 0755 target/release/src /opt/discord-rs/bin/src.new && sudo mv /opt/discord-rs/bin/src.new /opt/discord-rs/bin/src
+sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --secret-file /etc/discord-rs/botd.secret --port 47321 --json
+# 状態: botctl operation <操作ID>（state が succeeded）。記録: /var/lib/discord-rs/runtime/gateway-update-audit.jsonl
+```
+更新の前後で `sudo soak-report` を取り、Core の PID が変わらないこと、`!count`（または `/ping`）が続くことを確認する。`mv` で置き換えるのは、実行中のファイルに上書きしない（`Text file busy` を避ける）ため。
+
