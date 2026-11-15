@@ -267,3 +267,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 ## 2026-11-15：Gateway と Core の分離（設計書の取り込みと方針決定）
 - 設計書 `docs/gateway-core-separation-design.md` を取り込み。要点：試験用モードでも Core は Gateway の子（匿名パイプ）で、分離には IPC の媒体の改修（Unix socket、Core 側の受け入れ、接続ごとの状態初期化）が要る。生きている Core に再接続する Gateway は `core-state.json` で状態を巻き戻してはならない（鮮度判定が必須）。分離は単独で障害耐性を大きく上げず、価値は Gateway の無停止更新（新旧 Gateway が同じ Core を共有）の前提になる点。
 - 方針（ユーザー決定）：Gateway の無停止更新を目標に分離を進める。第 1 段階は opt-in の `botd --core-mode separate`（Linux、Unix socket、既定は従来のまま、Core 先・Gateway 後）。判断点は設計書の推奨を採用（旧経路は検証完了まで維持、Core は N プロセス `ChildKey.slot`、ホットスワップは後回し、botd 死亡時は Core も失う、IPC 認証は既存方針、Core の成果物は `src --worker` と同一）。
+
+## 2026-11-15：分離の 1-B（Core のソケット受け入れと接続型 attach）
+- 1-B1：`--core-listen`（Unix ソケット、0700 ディレクトリ・0600 ソケット・SO_PEERCRED・stdin の 64 桁 16 進秘密を定数時間比較）。1-B2a：`Process::attach`。1-B2b-i：`Manager::attach_gateway_pool`（子を起動せず、Core の復旧・永続状態の Restore もしない。shutdown は Core を止めない）。いずれも CI 緑（process シャードの `core_attach`）。
+- 1-B3：Core のアプリケーション状態を `CoreLife` に分け、`serve_connection` が接続ごとの交渉状態（capabilities・保留中の API 結果・イベントカーソル・drain）を作り直す。接続が失敗しても状態は Core に戻る。`core_server::serve` に `Lifetime::{OneConnection, UntilStopped}`。`run`（`--core-listen`）は従来どおり `OneConnection`。`UntilStopped` を botd が使う配線は未実装。
+- 検証：WSL で `core_attach` 9 件成功（持続 Core が 3 接続を処理し不正秘密の接続で止まらない／`OneConnection` は 1 接続で終了）。CI は 70ab7ec で `a_stale_socket_is_replaced…` が 1 回 Connection refused で失敗したが、同じテストを WSL で 40 回回しても再現せず、テストのみ変更（Core の stderr を CI ログに出す）の再実行は成功した。**原因未特定の不安定要因として残す**（再発時は Core の stderr で確認）。最後の試験追加コミット（722eda0）の CI は未確認。
+- 状態の保持そのもの（再接続後に `!count` が残る等）は構造上のもので、試験では未確認。
+- 次：1-B2b-ii（切断検知と上限付き再接続）、1-B2c（`core-state.json` の鮮度判定）、1-C（botd の `--core-mode separate`）。
