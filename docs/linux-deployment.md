@@ -301,6 +301,7 @@ journalctl --disk-usage                             # 容量確認
 - systemd `Type=notify` / `WatchdogSec` の実機での動作確認（botd は `sd_notify` 対応済み。実 systemd では未検証のため unit では無効）。
 - Gateway 子プロセスのログ収集（journald に出ない）。
 - 本番での Raft quorum 有効化（拒否のまま）、分散 Identify・failover の本番統合。
+- 実 Discord の Gateway 自動復旧は、単一ホスト・単一 botd 専用のローカル Identify 許可（Bot 単位。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回。超えると `IdentifyUnavailable` で `Degraded`）の下で有効です。初回起動と手動 start は常に許可して記録します。複数プロセス・複数ホスト間の調整は未実装、botd 再起動で履歴は消えます。セッションの Resume は未実装で、再起動のたびに Identify を 1 回消費します。ローカル未ビルドで GitHub Actions の検証待ちで、実 Discord・実機では未検証です。
 - 複数ホストでの実障害（ホスト停止・網分断・failover）。
 - 無停止更新、`botctl update`/`rollback` の本番実行、原子的 rollback。
 - 孤児プロセスの再採用（未実装）、停電時の永続性、`--stop-children-on-exit` ＋ `SIGTERM` → `KillMode=mixed` 停止と

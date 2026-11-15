@@ -3,6 +3,7 @@
 use src::{
     child_recovery::{ChildRole, DegradedReason, RecoveryEventKind},
     daemon::{Daemon, DaemonError, ProcessSnapshot, ProcessState, ShardKey, StopMode},
+    local_identify::LocalIdentifyPolicy,
     placement::LocalShardIntent,
     shard_runtime::{self, ShardRuntimeSpec},
     supervisor::{Clock, RestartPolicy, Sleep},
@@ -358,6 +359,13 @@ async fn guarded_legacy_gateway_requires_shared_admission_after_its_first_proces
     let clock = ManualClock::default();
     let mut daemon = Managed::new(&root, &["A"], &clock);
     daemon.0.require_shared_recovery_admission();
+    // The first start is recorded; a one-per-window cap makes the very next
+    // automatic Identify exhausted (production defaults: 30 s apart, 10/hour).
+    daemon.0.set_local_identify_policy(LocalIdentifyPolicy {
+        min_interval: Duration::ZERO,
+        window: Duration::from_secs(3600),
+        max_per_window: 1,
+    });
     daemon.0.start(&key("A"), &credentials).unwrap();
     let identity = snapshot(&daemon.0, "A").identity.unwrap();
     ready(&root, "A", identity.pid).await;
@@ -418,6 +426,45 @@ async fn guarded_legacy_gateway_requires_shared_admission_after_its_first_proces
     assert_eq!(
         daemon.0.start(&key("A"), &credentials),
         Err(DaemonError::InvalidState)
+    );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn guarded_legacy_gateway_waits_for_the_local_identify_interval_before_recovering() {
+    let root = Root::new();
+    let clock = ManualClock::default();
+    let mut daemon = Managed::new(&root, &["A"], &clock);
+    daemon.0.require_shared_recovery_admission();
+    daemon.0.start(&key("A"), &credentials).unwrap();
+    let identity = snapshot(&daemon.0, "A").identity.unwrap();
+    ready(&root, "A", identity.pid).await;
+    std::fs::write(root.exit("A"), b"17").unwrap();
+    eventually(|| {
+        daemon.0.poll(&credentials).unwrap();
+        !daemon.0.has_child(&key("A"))
+    })
+    .await;
+
+    // The initial start was recorded moments ago (real time), so the default
+    // 30 s interval keeps the automatic Identify Pending: not degraded, no
+    // new child, recovery still wanted.
+    clock.set(1);
+    daemon.0.poll(&credentials).unwrap();
+    let waiting = snapshot(&daemon.0, "A");
+    assert_ne!(
+        waiting.recovery.unwrap()["state"],
+        serde_json::json!({"Degraded":"IdentifyUnavailable"})
+    );
+    assert!(waiting.desired_running);
+    assert!(!waiting.restart_exhausted);
+    assert!(!daemon.0.has_child(&key("A")));
+    assert!(
+        !daemon
+            .0
+            .take_recovery_events()
+            .iter()
+            .any(|event| matches!(event.kind, RecoveryEventKind::Degraded { .. }))
     );
     daemon.shutdown().await;
 }
