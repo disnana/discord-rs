@@ -140,18 +140,24 @@ botd は Shard ごとに順番に次を行います。
 1. 待機 Gateway を起動します。待機 Gateway は Discord にログインし、Core には接続せずイベントを保留します（保留は 512 件まで。超えると待機 Gateway は終了します）。
 2. 待機 Gateway が `standby-ready` を作るまで最大 90 秒待ちます。
 3. 待機 Gateway の stdin へ `{"command":"activate","epoch":N}` を送ります（N は現在の epoch + 1）。
-4. 待機 Gateway は epoch N で Core に接続します。Core は高い epoch を優先し、旧 Gateway の接続を要求の区切りで閉じます。
-5. botd は監視を待機 Gateway へ移し、旧 Gateway に終了を要求します。旧 Gateway が 30 秒以内に終了しなければ強制終了します。
+4. 待機 Gateway は epoch N で全 Core に接続します。Core は高い epoch を優先し、旧 Gateway の接続を要求の区切りで閉じます。接続が済むと待機 Gateway は `standby-active` を作ります。
+5. botd は `standby-active` を最大 20 秒待ちます。確認できたら監視を待機 Gateway へ移し、旧 Gateway に終了を要求します。旧 Gateway が 30 秒以内に終了しなければ強制終了します。
 
 失敗時の扱いは次のとおりです。
 
 - 待機 Gateway の起動失敗、90 秒以内に ready にならない、activate の送信失敗では、その Shard の待機 Gateway を終了します。稼働中の Gateway は変更しません。
+- activate の後に `standby-active` が 20 秒以内に出ない、または待機 Gateway が終了した場合は操作が失敗します。このとき旧 Gateway はすでに Core から切り離されているため、botd は旧 Gateway を強制終了し、上げた epoch で起動し直します（Identify が 1 回余分に発生します）。待機 Gateway も終了します。
 - 先に完了した Shard の更新は残ります。全体の自動ロールバックはありません。
 - 操作全体は 180 秒で打ち切ります。
-- activate の送信後に失敗した場合の Core と旧 Gateway の状態は未検証です。
+- activate の送信後に失敗した場合の実 Discord 上の Core と Gateway の挙動は未検証です。
 - botd が後で Gateway を起動し直すときは、現在の epoch を `--core-epoch` で渡します。古い epoch の Gateway は Core に拒否されます。
+- botd を停止すると、進行中の更新は中断されます。未 activate の待機 Gateway と、置き換え中の旧 Gateway は強制終了します。稼働中の Gateway は通常の停止手順で止まります。
 
-権限は、管理 secret に結び付いた role が `admin` で、scope が Bot の全 Shard を含む場合に限られます（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否され、副作用はありません。単体試験あり）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の要求と結果は `runtime-root/gateway-update-audit.jsonl` に追記されます（記録できない要求は開始前に拒否。詳細と限界は[制約一覧](known-limitations.md)）。
+権限は、管理 secret に結び付いた role が `admin` で、scope が Bot の全 Shard を含む場合に限られます（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否され、副作用はありません。単体試験あり）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の要求と結果は `runtime-root/gateway-update-audit.jsonl` に 1 行ずつ追記されます（権限 0600）。event は `requested`・`rejected`・`succeeded`・`failed` のいずれかで、記録は subject、role、bot、operation ID と固定の失敗種別だけです。secret、パス、引数、エラー本文は含みません。要求を記録できない場合は、何も始めずに拒否されます（詳細と限界は[制約一覧](known-limitations.md)）。
+
+ログは稼働中も大きさに上限があります。`gateway.log` と `gateway-candidate.log` は 8 MiB、`core-*.log` は 4 MiB を超えると、約 60 秒ごとに `.1` へ写してから空にします（既存の `.1` は置き換えます）。起動時は `gateway.log` が 1 MiB を超えていれば `.1` へ退避します。
+
+未検証：待機 Gateway の ready・activate・`standby-active` の往復、監査の記録、ログの回転は、自動プロセス試験のみで確認しています。実 Discord での確認はありません。
 
 ### Discordに接続しない模擬実行
 

@@ -108,11 +108,15 @@ Health の広告だけでは有効にしない。未交渉の旧 Worker へは `
   - 高い epoch は、処理中の接続を要求の区切りで閉じさせ、次に処理されます。
   - 同じ epoch は順番待ちになります（再起動した Gateway が、応答のない古い接続の後ろで待つ場合）。
   - 低い epoch は直ちに拒否されます。
-- **待機 Gateway の制御フレーム**：botd は待機 Gateway の stdin へ改行区切りの `{"command":"activate","epoch":N}` を送ります。N は 0 であってはなりません。`{"command":"shutdown"}` は待機 Gateway を終了させます。
+  - Core は、プロセスが生きている間に処理した最大の epoch を覚えます。接続が切れても、それより低い epoch は再接続できません。
+- **待機 Gateway の制御フレーム**：botd は待機 Gateway の stdin へ改行区切りの `{"command":"activate","epoch":N}` を送ります。N は 0 であってはなりません（0 は受け付けず、制御の読み取りを終了します）。`{"command":"shutdown"}` は待機 Gateway を終了させます。
+  - activate を受けた待機 Gateway は全 Core へ epoch N で接続し、完了すると `standby-active` を作ります。botd はこのファイルを最大 20 秒待ちます。確認はファイルで行い、IPC 上の応答はありません。
+  - activate の前に制御の stdin が閉じた（EOF）場合、待機 Gateway は終了します。
+- **core-state.json の書き手の epoch**：Gateway が書く `core-state.json` には書き手の epoch が記録されます。記録より低い epoch の Gateway は、そのファイルを上書きしません。
 - **botd の再起動時**：botd が Gateway を起動し直すときは `--core-epoch <現在の epoch>` を付けます（epoch 0 では付けません）。
 - **Dispatch の重複排除**：Dispatch の `source_id`（Discord message id）は Core ごとに直近 4096 件を記憶し、重複は処理せず破棄します。記憶は永続化されず、Core の再起動で空になります。破棄は `core-<slot>.log` に「重複したメッセージを処理せず破棄しました（累計 N 件）」と出ます。ID も本文も記録しません。
 - **Interaction**：`source_id` による重複排除の対象外です。Interaction は ACK を処理より前に送る設計（`interaction_flow`）で重複を防ぎますが、実 Discord での効果は未検証です。
-- **未検証**：複数 Shard での epoch の順序、実 Discord での重複破棄の全件、Interaction の重複、Core 再起動をまたぐ重複。
+- **未検証**：複数 Shard での epoch の順序、実 Discord での重複破棄の全件、Interaction の重複、Core 再起動をまたぐ重複。attach の handshake、`standby-active` の確認、`core-state.json` の epoch 保護は自動プロセス試験のみで、実 Discord では未検証です。
 
 ## 診断と切替後の障害記録
 

@@ -2644,6 +2644,12 @@ struct Candidate {
     activated: Option<std::time::Instant>,
 }
 
+/// A marker counts only as a regular file (not a directory or a link put in its place).
+#[cfg(unix)]
+fn marker_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
 /// How long an activated standby may take to confirm that it holds the Cores.
 #[cfg(unix)]
 const ACTIVATION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
@@ -3132,8 +3138,15 @@ impl<C: Clock> Daemon<C> {
         };
         let marker = spec.state_path.join("standby-ready");
         let active_marker = spec.state_path.join("standby-active");
-        let _ = std::fs::remove_file(&marker);
-        let _ = std::fs::remove_file(&active_marker);
+        // A leftover marker would let this update pass a step it has not reached, so a marker
+        // that cannot be removed stops the update before anything starts.
+        for stale in [&marker, &active_marker] {
+            match std::fs::remove_file(stale) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(DaemonError::ReservationIo),
+            }
+        }
         let log = spec.management_path.parent().and_then(|dir| {
             let path = dir.join("gateway-candidate.log");
             let mut options = std::fs::OpenOptions::new();
@@ -3206,7 +3219,7 @@ impl<C: Clock> Daemon<C> {
         let failure = match candidate.child.try_wait() {
             Ok(Some(_)) => Some(DaemonError::ChildExited),
             Err(_) => Some(DaemonError::MonitorFailed),
-            Ok(None) if candidate.ready_marker.exists() => return UpdateProgress::Ready,
+            Ok(None) if marker_present(&candidate.ready_marker) => return UpdateProgress::Ready,
             Ok(None) if candidate.started.elapsed() >= CANDIDATE_READY_TIMEOUT => {
                 Some(DaemonError::StopTimedOut)
             }
@@ -3289,7 +3302,7 @@ impl<C: Clock> Daemon<C> {
             Err(_) => return UpdateProgress::Failed(DaemonError::MonitorFailed),
             Ok(None) => {}
         }
-        if candidate.active_marker.exists() {
+        if marker_present(&candidate.active_marker) {
             UpdateProgress::Ready
         } else if activated.elapsed() >= ACTIVATION_CONFIRM_TIMEOUT {
             UpdateProgress::Failed(DaemonError::StopTimedOut)
@@ -3304,10 +3317,29 @@ impl<C: Clock> Daemon<C> {
     #[cfg(unix)]
     pub fn fail_gateway_activation(&mut self, key: &ShardKey) {
         self.cancel_gateway_update(key);
-        if let Some(entry) = self.entries.get(key)
-            && let Ok(Some(old)) = self.recovery.child_mut(entry.recovery_key)
-        {
-            let _ = old.start_kill();
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        match self.recovery.child_mut(entry.recovery_key) {
+            Ok(Some(old)) => {
+                let _ = old.start_kill();
+            }
+            // The old Gateway exited while the update waited. A clean exit (code 0) is read as
+            // "stopped on purpose" and recovery stands down; the update must not turn that into
+            // a Shard that stays down, so the stopped slot is started again. Budgets are kept.
+            Ok(None) => {
+                let stopped = self
+                    .recovery
+                    .snapshot(entry.recovery_key)
+                    .is_ok_and(|s| s.state == RecoveryState::Stopped);
+                if stopped
+                    && entry.started
+                    && self.recovery.start_stopped(entry.recovery_key).is_ok()
+                {
+                    entry.snapshot.desired_running = true;
+                }
+            }
+            Err(_) => {}
         }
     }
 

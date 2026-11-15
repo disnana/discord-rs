@@ -14,8 +14,8 @@ use crate::core_attach::{SLOTS, identity, prepare_dir, renew_secret, secret_path
 use crate::protocol::{BotId, Shard};
 use crate::redact::Secret;
 use crate::secret_file::{SECRET_BYTES, load_secret_file, wipe};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -52,17 +52,32 @@ pub fn rotate_in_place(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
+    // One descriptor for both the copy and the truncation, and it must be the file that was
+    // checked (same device and inode): a path swapped in since is never touched.
+    let mut live = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let opened = live.metadata()?;
+    if opened.dev() != meta.dev() || opened.ino() != meta.ino() || !opened.file_type().is_file() {
+        return Ok(false);
+    }
+    let measured = opened.len();
     let mut copy = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&older)?;
-    std::io::copy(&mut std::fs::File::open(path)?, &mut copy)?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)?
-        .set_len(0)?;
-    Ok(true)
+    std::io::copy(&mut Read::by_ref(&mut live).take(measured), &mut copy)?;
+    // Lines the writers appended while the copy ran are not in `.1`; emptying the file now
+    // would lose them. Only empty it if nothing arrived; otherwise leave it for the next
+    // check (the copy is then merely a prefix, and nothing is lost).
+    if live.metadata()?.len() == measured {
+        live.set_len(0)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 struct Slot {
