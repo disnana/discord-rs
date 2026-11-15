@@ -124,6 +124,35 @@ botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GAT
 - 実 Discord、systemd 常駐、WSL の再起動後の自動起動、長時間稼働、複数 Shard での separate は未検証です。
 - 結果不明の外部操作と、Core の再起動をまたぐ未確認イベントの扱いは、既定経路と同じく保証しません。
 
+### separate での Gateway 無停止更新：gateway-update
+
+`botd --core-mode separate` では、`botctl gateway-update BOT` で Core を切らずに稼働中の Gateway を差し替えられます。WSL の実プロセス試験（`gateway_update_replaces_the_gateway_and_keeps_the_cores`、模擬 Discord）に加え、WSL と実 Discord で更新の成功、カウンタの継続、重複 5 件の破棄を 1 回確認しています（実 Discord 検証はユーザーが実施）。複数 Shard での運用、長時間稼働、Interaction の重複は未検証です。
+
+操作の前に、新しい `src` を稼働中の Gateway と同じプログラムパスへ配置してください。botd はそのパスから待機 Gateway を `--standby` 付きで起動します。
+
+```text
+botctl gateway-update music --bootstrap-stdin --json
+botctl operation ID --bootstrap-stdin --json
+```
+
+botd は Shard ごとに順番に次を行います。
+
+1. 待機 Gateway を起動します。待機 Gateway は Discord にログインし、Core には接続せずイベントを保留します（保留は 512 件まで。超えると待機 Gateway は終了します）。
+2. 待機 Gateway が `standby-ready` を作るまで最大 90 秒待ちます。
+3. 待機 Gateway の stdin へ `{"command":"activate","epoch":N}` を送ります（N は現在の epoch + 1）。
+4. 待機 Gateway は epoch N で Core に接続します。Core は高い epoch を優先し、旧 Gateway の接続を要求の区切りで閉じます。
+5. botd は監視を待機 Gateway へ移し、旧 Gateway に終了を要求します。旧 Gateway が 30 秒以内に終了しなければ強制終了します。
+
+失敗時の扱いは次のとおりです。
+
+- 待機 Gateway の起動失敗、90 秒以内に ready にならない、activate の送信失敗では、その Shard の待機 Gateway を終了します。稼働中の Gateway は変更しません。
+- 先に完了した Shard の更新は残ります。全体の自動ロールバックはありません。
+- 操作全体は 180 秒で打ち切ります。
+- activate の送信後に失敗した場合の Core と旧 Gateway の状態は未検証です。
+- botd が後で Gateway を起動し直すときは、現在の epoch を `--core-epoch` で渡します。古い epoch の Gateway は Core に拒否されます。
+
+権限は、管理 secret に結び付いた role が `admin` で、scope が Bot の全 Shard を含む場合に限られます（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否され、副作用はありません。単体試験あり）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の開始・完了を残す永続監査（`update-audit.jsonl` 相当）は未実装です（[制約一覧](known-limitations.md) 参照）。
+
 ### Discordに接続しない模擬実行
 
 実GatewayとWorkerの経路をtokenなしで検証するには、試験ランナーがloopbackでcollectorを待ち受け、botdに次の追加オプションを渡します。

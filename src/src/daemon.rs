@@ -1920,6 +1920,45 @@ pub mod control {
             }
         }
 
+        /// `gateway-update` replaces a running Gateway, so it is a mutation like stop: only an
+        /// admin whose scope covers every shard of the Bot may ask for it. A refusal happens
+        /// before any other check, so it cannot start a standby Gateway or read a credential.
+        #[test]
+        fn gateway_update_needs_an_admin_whose_scope_covers_the_bot() {
+            use super::super::update_control::ControlAccess;
+            let mut plane = plane(2, 1);
+            let denied = "control permission or scope denied";
+            let access = |role: &str, scope: Option<Vec<ShardKey>>| ControlAccess {
+                subject: "operator".into(),
+                role: role.into(),
+                scope,
+            };
+            let own = Some(vec![ShardKey {
+                bot_id: "id-0".into(),
+                shard_id: 0,
+            }]);
+            let other = Some(vec![ShardKey {
+                bot_id: "id-1".into(),
+                shard_id: 0,
+            }]);
+            for refused in [
+                access("viewer", None),
+                access("updater", None),
+                access("admin", other),
+                access("nonsense", None),
+            ] {
+                let response = plane.request_as(&request("gateway-update", 0, 1), &refused);
+                assert_eq!(response["error"], denied, "{response}");
+            }
+            // Allowed by role and scope, it reaches the daemon, which (not in the separated
+            // layout here) declines for its own, different reason.
+            for allowed in [access("admin", None), access("admin", own)] {
+                let response = plane.request_as(&request("gateway-update", 0, 2), &allowed);
+                assert_ne!(response["error"], denied, "{response}");
+            }
+            assert!(plane.operations.is_empty(), "nothing was admitted");
+        }
+
         #[test]
         fn scoped_reads_and_lifecycle_do_not_expose_unpermitted_remote_placements() {
             let mut plane = plane(2, 1);

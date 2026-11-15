@@ -102,6 +102,18 @@ Health の広告だけでは有効にしない。未交渉の旧 Worker へは `
 - **切断と再接続（Gateway 側）**：切断は要求の失敗で検知します。再接続は 100 ms から最大 5 秒の指数バックオフです。接続だけが切れた場合は Core が保持する状態を採用します。空の Core（botd が起動し直したもの）にだけ確認済みスナップショットを復元します。
 - **未検証**：この接続型の実 Discord での挙動、待機中の切断の検知、再接続をまたぐ未確認イベントの連番と再送、botd の SIGKILL 時の後始末。
 
+## Gateway 更新の epoch と重複排除（separate）
+
+- **attach 行の epoch**：Gateway は接続の最初の行を `<64 hex>[ <epoch>]` で送ります。epoch を省略した場合は 0 として扱います。認証の後に epoch で順序づけされます。
+  - 高い epoch は、処理中の接続を要求の区切りで閉じさせ、次に処理されます。
+  - 同じ epoch は順番待ちになります（再起動した Gateway が、応答のない古い接続の後ろで待つ場合）。
+  - 低い epoch は直ちに拒否されます。
+- **待機 Gateway の制御フレーム**：botd は待機 Gateway の stdin へ改行区切りの `{"command":"activate","epoch":N}` を送ります。N は 0 であってはなりません。`{"command":"shutdown"}` は待機 Gateway を終了させます。
+- **botd の再起動時**：botd が Gateway を起動し直すときは `--core-epoch <現在の epoch>` を付けます（epoch 0 では付けません）。
+- **Dispatch の重複排除**：Dispatch の `source_id`（Discord message id）は Core ごとに直近 4096 件を記憶し、重複は処理せず破棄します。記憶は永続化されず、Core の再起動で空になります。破棄は `core-<slot>.log` に「重複したメッセージを処理せず破棄しました（累計 N 件）」と出ます。ID も本文も記録しません。
+- **Interaction**：`source_id` による重複排除の対象外です。Interaction は ACK を処理より前に送る設計（`interaction_flow`）で重複を防ぎますが、実 Discord での効果は未検証です。
+- **未検証**：複数 Shard での epoch の順序、実 Discord での重複破棄の全件、Interaction の重複、Core 再起動をまたぐ重複。
+
 ## 診断と切替後の障害記録
 
 Worker の診断はコードで定義した固定原因、IO の種別・OSコード、JSON の分類・行列だけを公開し、任意の Error 本文や source をそのまま整形しない。Worker の Rejected は既知の固定理由だけを採用し、未知の理由本文は `[REDACTED]` に置き換える。秘密らしい文字列を検索して消す処理だけに依存せず、通常の `worker exited` やプロトコル・capability 不一致を識別できるようにする。
