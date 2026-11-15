@@ -289,3 +289,6 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 結果（すべて実 Discord。`!count` は 10 から開始）：(1) 起動：ログイン成功。Core 2 本の親は botd、Gateway も botd の子（`--core-dir` で attach）。ipc のソケット・secret は 0600、ディレクトリは 0700、`botctl status` に `cores` が出る。(2) Gateway `kill -9`：**1.3 秒で新 Gateway が起動**し再ログイン、**Core の PID は不変**、`!count` は 10→**11**（巻き戻りなし）。(3) Core 1 本 `kill -9`：botd が **1.1 秒でその Core だけ再起動**、**Gateway の PID は不変**、`!count` は **12**。(4) Core 2 本とも `kill -9`：両方再起動、Gateway は不変（`BrokenPipe` を検知して記録）、直後の最初の `!count` が **13** で成功（無反応なし）。(5) `systemctl stop`：0.07 秒、`Result=success`、残りプロセス 0、ipc の sock・secret なし、起動予約なし、`core-state.json` は残る。(6) botd `kill -9`：**5.2 秒で systemd が再起動**（`NRestarts=1`）、Gateway・Core とも入れ替わり孤児なし、`!count` は **14**。
 - 分かったこと：期待どおりに動いた。Gateway の再起動時間は、embedded の約 2 秒（前回の記録）より短かった（Core の再起動を含まないため）。(4) で `!count` が失われなかったのは、Gateway が保持する確認済みスナップショットが空の新 Core に戻されたため。
 - 未確認のまま：長時間稼働、複数 Shard、Resume、レート制限、OS 再起動後の自動起動、Core のホットスワップ（separate では未対応）、(4) の切断中に入力が来た場合の拒否の数（今回は入力なし）。
+
+## 2026-11-15：Gateway の無停止更新の設計案
+- `docs/gateway-rolling-update-design.md` を追加（設計案、未実装）。第一候補は Resume ではなく「二重セッション＋待機側のバッファ」（新 Gateway が別セッションで Identify→Standby→Pause/epoch 切替→Active。session_id の引き渡しが不要）。必要な変更：Core の同時 2 接続と epoch による fencing、接続時 identity、候補 Gateway の `--standby`、botd の本番経路。実 Discord での V1（同一 Shard の 2 セッション）が方式を決めるため、実装前に先に確認する案。
