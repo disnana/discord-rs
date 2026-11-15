@@ -283,3 +283,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 1-D（status・smoke・docs）：status の各 Shard 行に、separate のときだけ `cores`（running/failures）を追加。systemd smoke に separate の手順を追加し、Actions の実 systemd で成功（Core 2 本の親が botd、Gateway を `kill -9` しても Core の PID 不変、`systemctl stop` で Gateway・Core・sock・secret が残らない）。docs（known-limitations / shard-runtime-design / operator-guide / ipc-protocol）を更新。
 - 不安定要因（原因未特定）：同じコミットの Rust CI で `update_load` の `crash_old_core`（embedded の Core クラッシュ負荷試験）が 1 回失敗し、再実行で成功した。今回の変更は embedded の経路に触れていないが、再発するまで原因は不明。
 - 分離の第 1 段階（1-A〜1-D）は実装・CI 検証済み。実機（WSL・実 Discord）での確認項目は設計書 §5.4 のとおり未実施。
+
+## 2026-11-15：分離（`botd --core-mode separate`）の実機確認（WSL2 の実 systemd、実 Discord、成功）
+- 環境：WSL2 Ubuntu 24.04（systemd）、テスト用 Bot、Shard 1、main 0703cf1 のリリースビルド。drop-in `zz-separate.conf` で `--core-mode separate` を有効化（`docs/real-separate-verification.md`）。
+- 結果（すべて実 Discord。`!count` は 10 から開始）：(1) 起動：ログイン成功。Core 2 本の親は botd、Gateway も botd の子（`--core-dir` で attach）。ipc のソケット・secret は 0600、ディレクトリは 0700、`botctl status` に `cores` が出る。(2) Gateway `kill -9`：**1.3 秒で新 Gateway が起動**し再ログイン、**Core の PID は不変**、`!count` は 10→**11**（巻き戻りなし）。(3) Core 1 本 `kill -9`：botd が **1.1 秒でその Core だけ再起動**、**Gateway の PID は不変**、`!count` は **12**。(4) Core 2 本とも `kill -9`：両方再起動、Gateway は不変（`BrokenPipe` を検知して記録）、直後の最初の `!count` が **13** で成功（無反応なし）。(5) `systemctl stop`：0.07 秒、`Result=success`、残りプロセス 0、ipc の sock・secret なし、起動予約なし、`core-state.json` は残る。(6) botd `kill -9`：**5.2 秒で systemd が再起動**（`NRestarts=1`）、Gateway・Core とも入れ替わり孤児なし、`!count` は **14**。
+- 分かったこと：期待どおりに動いた。Gateway の再起動時間は、embedded の約 2 秒（前回の記録）より短かった（Core の再起動を含まないため）。(4) で `!count` が失われなかったのは、Gateway が保持する確認済みスナップショットが空の新 Core に戻されたため。
+- 未確認のまま：長時間稼働、複数 Shard、Resume、レート制限、OS 再起動後の自動起動、Core のホットスワップ（separate では未対応）、(4) の切断中に入力が来た場合の拒否の数（今回は入力なし）。
