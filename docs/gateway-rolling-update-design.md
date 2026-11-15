@@ -1,6 +1,6 @@
 # Gateway の無停止更新（ローリング）の本番化：設計
 
-状態：**設計案（未実装）**。前提となる分離（`botd --core-mode separate`）は実装・実機確認済み（[progress.md](progress.md)、[real-separate-verification.md](real-separate-verification.md)）。この文書は、コードと既存の設計文書を読んだ結果と、**読んだだけで実機・実 Discord では確かめていないこと**を分けて書く。AGENTS.md の方針：独自のコンセンサスは実装しない／Core に Bot token を渡さない／未認証の遠隔管理を許可しない／未検証の保証を完成と主張しない。
+状態：**設計案（未実装）**。V1（同一 Shard の 2 セッションが同時に有効で両方にイベントが届く）は実 Discord で確認済み（progress.md）。前提となる分離（`botd --core-mode separate`）は実装・実機確認済み（[progress.md](progress.md)、[real-separate-verification.md](real-separate-verification.md)）。この文書は、コードと既存の設計文書を読んだ結果と、**読んだだけで実機・実 Discord では確かめていないこと**を分けて書く。AGENTS.md の方針：独自のコンセンサスは実装しない／Core に Bot token を渡さない／未認証の遠隔管理を許可しない／未検証の保証を完成と主張しない。
 
 ## 1. 目的と範囲
 

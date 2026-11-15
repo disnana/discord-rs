@@ -292,3 +292,4 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 ## 2026-11-15：Gateway の無停止更新の設計案
 - `docs/gateway-rolling-update-design.md` を追加（設計案、未実装）。第一候補は Resume ではなく「二重セッション＋待機側のバッファ」（新 Gateway が別セッションで Identify→Standby→Pause/epoch 切替→Active。session_id の引き渡しが不要）。必要な変更：Core の同時 2 接続と epoch による fencing、接続時 identity、候補 Gateway の `--standby`、botd の本番経路。実 Discord での V1（同一 Shard の 2 セッション）が方式を決めるため、実装前に先に確認する案。
+- V1（実 Discord、WSL、2026-11-15）：同じ Bot・同じ Shard（1/1）に、botd 配下の Gateway A と、別の状態ディレクトリで手動起動した Gateway B を同時にログインさせ、`!count` を 1 回送ったところ、**2 件の返信**（A の 15、B の 1）が返った。結論：Discord は同じ Shard の 2 つの Identify セッションを同時に有効にし、**両方にイベントが届く**（二重セッション方式の前提は成立）。A の接続は B のログイン後も切れなかった（ログに再接続なし）。B は試験後に停止・削除済み。未確認：2 セッションが長時間共存できるか、Identify の消費数（`session_start_limit` の残りは未記録）、切替中のイベント欠落・重複（V3）、Interaction の 3 秒（V4）。
