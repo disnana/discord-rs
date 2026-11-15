@@ -1101,6 +1101,14 @@ impl Process {
             .any(|cap| cap == capability)
     }
 
+    /// True when the Core's confirmed snapshot is exactly the empty initial state, i.e. it
+    /// has not processed anything since it started. Only such a Core may be given older state.
+    fn core_is_fresh(&self) -> bool {
+        let empty = serde_json::to_value(crate::cogs::State::default()).ok();
+        let transfer = self.transfer.lock().unwrap();
+        empty.is_some() && transfer.checkpoint == empty
+    }
+
     async fn restore(&mut self, version: u32, state: serde_json::Value) -> Result<(), AppError> {
         match self
             .request(&Request::Restore {
@@ -1745,7 +1753,7 @@ impl Manager {
         let (persist, restored) = match deployment
             .state_dir
             .clone()
-            .filter(|_| deployment.core_launch.is_none() && !attached)
+            .filter(|_| deployment.core_launch.is_none())
         {
             Some(dir) => {
                 let _ = tokio::fs::create_dir_all(&dir).await;
@@ -1792,7 +1800,14 @@ impl Manager {
                     .ok_or_else(|| failure("Core initial spawn failed"))?,
             };
             process.prepare(&deployment, launch_policy).await?;
-            if let Some(Some(state)) = restored.get(index) {
+            // A Core that botd has been running keeps its own state, and that state is
+            // newer than any file: persisted state is only ever put into a Core that has
+            // none (a Core botd restarted). Otherwise the Core's own snapshot, which
+            // `prepare` already adopted as the checkpoint, stays.
+            if let Some(Some(state)) = restored
+                .get(index)
+                .filter(|_| !attached || process.core_is_fresh())
+            {
                 // Reuse the established restore path: it re-confirms the state
                 // with the worker and records it as the checkpoint before any
                 // application work is admitted.
@@ -2062,6 +2077,17 @@ impl Manager {
                 process
                     .prepare(&self.deployment, self.launch_policy)
                     .await?;
+                // The connection was lost: either only the connection (the Core still holds
+                // its state, which `prepare` adopted) or the Core itself, restarted by botd
+                // with nothing. Only the second case is given the last confirmed state.
+                let last = previous.transfer.lock().unwrap().checkpoint.clone();
+                if let Some(state) = last
+                    && process.core_is_fresh()
+                    && process.restore(STATE_VERSION, state).await.is_err()
+                    && process.broken
+                {
+                    return Err(failure("restore into a restarted Core failed"));
+                }
                 Ok::<_, AppError>(process)
             })
             .await;

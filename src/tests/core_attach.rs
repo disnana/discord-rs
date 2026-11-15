@@ -123,7 +123,12 @@ async fn exchange(stream: &mut UnixStream, request: &str) -> Option<Value> {
         .ok()?;
     let mut reader = BufReader::new(&mut *stream);
     let mut line = String::new();
-    let read = reader.read_line(&mut line).await.ok()?;
+    let read = reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| eprintln!("EXCH read err {e:?}"))
+        .ok()?;
+    eprintln!("EXCH read {read} {line:?}");
     if read == 0 {
         return None;
     }
@@ -244,9 +249,11 @@ async fn a_stale_socket_is_replaced_but_a_regular_file_is_never_overwritten() {
     let dir = private_dir();
     let socket = dir.join("core.sock");
     {
-        // ソケットファイルを作って、リスナーを閉じる（ファイルは残る）。
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        drop(listener);
+        // ソケットファイルだけを残す。ストリームの listen ではなくデータグラムの bind を
+        // 使うのは、listen 中の fd が、同時に子を起動する別のテストの fork に引き継がれて
+        // 生き残り、古いソケットへの接続が成功してしまうのを避けるため。
+        let stale = std::os::unix::net::UnixDatagram::bind(&socket).unwrap();
+        drop(stale);
     }
     assert!(socket.exists());
     let mut core = Core::start(&socket, SECRET).await;
@@ -561,6 +568,105 @@ async fn a_manager_reconnects_to_a_restarted_core() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(served, "the Manager must reconnect to the restarted Core");
+    bounded(manager.shutdown()).await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn deployment_with_state(dir: &Path) -> src::worker::DeploymentIdentity {
+    deployment().with_state_dir(dir.to_path_buf())
+}
+
+async fn count(manager: &src::worker::Manager) -> Option<String> {
+    bounded(manager.dispatch_key(7, "!count".into()))
+        .await
+        .expect("!count")
+}
+
+/// 生きている Core の状態は、古い core-state.json で巻き戻さない（Core 自身の状態を採用する）。
+#[tokio::test]
+async fn a_stale_state_file_is_not_restored_into_a_live_core() {
+    let dir = private_dir();
+    let state = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    // 状態ファイルを 2 回分で止める。
+    let a = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment_with_state(&state),
+        attach_config(&socket),
+    ))
+    .await
+    .unwrap();
+    count(&a).await;
+    count(&a).await;
+    bounded(a.shutdown()).await.unwrap();
+    assert!(state.join("core-state.json").exists(), "state file written");
+
+    // 状態ファイルなしで、Core をさらに 2 回進める（ファイルは古くなる）。
+    let c = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        attach_config(&socket),
+    ))
+    .await
+    .unwrap();
+    let third = count(&c).await;
+    count(&c).await;
+    bounded(c.shutdown()).await.unwrap();
+
+    let b = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment_with_state(&state),
+        attach_config(&socket),
+    ))
+    .await
+    .unwrap();
+    let fifth = count(&b).await;
+    assert_ne!(
+        third, fifth,
+        "the live Core's counter (5th) must not be rewound to the file's (3rd)"
+    );
+    bounded(b.shutdown()).await.unwrap();
+    let _ = core.child.kill().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// 起動し直された（空の）Core には、最後に確認した状態を入れる。
+#[tokio::test]
+async fn a_restarted_core_is_given_the_last_confirmed_state() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+    let manager = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        attach_config(&socket),
+    ))
+    .await
+    .unwrap();
+    let first = count(&manager).await;
+    let second = count(&manager).await;
+
+    core.child.kill().await.unwrap();
+    let _replacement = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut next = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Ok(value)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.dispatch_key(7, "!count".into()),
+        )
+        .await
+        {
+            next = Some(value);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let next = next.expect("reconnected");
+    assert_ne!(next, first, "an empty Core would answer 1 again");
+    assert_ne!(next, second);
     bounded(manager.shutdown()).await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

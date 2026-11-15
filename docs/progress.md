@@ -276,3 +276,5 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 次：1-B2b-ii（切断検知と上限付き再接続）、1-B2c（`core-state.json` の鮮度判定）、1-C（botd の `--core-mode separate`）。
 - 1-B2b-ii：attach した Manager は、接続が壊れたスロット（`process.broken`）を上限付き指数バックオフ（100 ms〜5 s）で再接続する（`poll_core_reconnect`）。子の起動はしない。再接続した Core へは `core-state.json` を Restore しない（Core 自身の状態を正とする）。`--core-listen <path> --core-persist` で接続をまたいで動く Core を起動できる（試験・1-C 用）。試験：Manager を作り直しても `!count` が続く、落ちて起動し直された Core へ再接続して処理が続く。CI 緑（fmt 修正後、3m48s）。
 - 制約：切断の検知は次の要求の失敗時（待機中の切断は能動的には検知しない）。再接続後のイベントカーソル／未確認イベントの再送、`core-state.json` の鮮度判定（1-B2c）は未実装。前回 CI の `a_stale_socket…` 失敗は再発していない。
+- 1-B2c：attach した Manager は、起動中の Core の状態を `core-state.json` で巻き戻さない。`prepare` が採用する Core 自身のスナップショットを正とし、永続化された状態（起動時）／最後に確認した状態（再接続時）は、Core の確認済みスナップショットが空の初期状態と一致する場合（= botd が起動し直した空の Core）にだけ Restore する（`Process::core_is_fresh`）。attach した Manager も状態を永続化する。試験：古いファイルが生きた Core に入らない、起動し直された Core に最後の状態が入る。
+- 不安定要因の原因（解消）：`a_stale_socket_is_replaced…` の失敗は製品の欠陥ではなく試験側の競合だった。試験が listen 中の古いソケットを作ると、別テストが同時に子を fork した間、その子が fd を引き継いで古いリスナーが生き残り、準備確認の接続が古いソケットに成功して、後で RST になる（WSL で並列 8×40 回の実行で再現、修正後 0/320）。古いソケットはデータグラムの bind で作る方式に変更。
