@@ -813,3 +813,65 @@ async fn a_gateway_with_a_higher_epoch_takes_over_and_the_old_one_cannot_return(
     let _ = core.child.kill().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// R-3: Discord のメッセージ ID が同じ要求は、2 つ目を処理しない（更新中に旧・新の
+/// Gateway が同じメッセージを配送しても二重処理にならない）。ID なしと別 ID は処理する。
+/// 窓は Core が持つので、接続（Gateway）が替わっても効く。
+#[tokio::test]
+async fn a_message_id_seen_before_is_not_handled_again_even_from_another_gateway() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    async fn dispatch(manager: &src::worker::Manager, id: Option<u64>) -> Option<String> {
+        let mut guard = bounded(manager.begin_response_delivery(7))
+            .await
+            .expect("response guard");
+        let reply =
+            bounded(manager.dispatch_key_with_response_id(&mut guard, 7, "!count".into(), id))
+                .await
+                .expect("dispatch");
+        guard.confirm();
+        reply
+    }
+
+    let first = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        attach_config_at_epoch(&socket, 1),
+    ))
+    .await
+    .unwrap();
+    assert!(dispatch(&first, Some(900)).await.is_some(), "handled");
+    assert!(
+        dispatch(&first, Some(900)).await.is_none(),
+        "a repeated id is dropped"
+    );
+    assert!(dispatch(&first, Some(901)).await.is_some());
+    assert!(dispatch(&first, None).await.is_some());
+
+    // 引き継いだ別の Gateway（高い epoch）が同じメッセージを配送しても、処理しない。
+    let second = bounded(src::worker::Manager::attach_gateway_pool(
+        deployment(),
+        attach_config_at_epoch(&socket, 2),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        dispatch(&second, Some(900)).await.is_none(),
+        "duplicate across Gateways"
+    );
+    assert!(dispatch(&second, Some(902)).await.is_some());
+
+    // 重複は状態を進めない：処理したのは 4 回（900, 901, ID なし, 902）なので、次は 5。
+    let next = dispatch(&second, Some(903)).await.expect("handled");
+    assert!(
+        next.contains('5'),
+        "the counter advanced only for handled messages: {next}"
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), first.shutdown()).await;
+    bounded(second.shutdown()).await.unwrap();
+    let _ = core.child.kill().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

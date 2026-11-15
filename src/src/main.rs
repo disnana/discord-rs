@@ -1037,10 +1037,11 @@ async fn live_events(
                         }
                     };
                     match manager
-                        .dispatch_key_with_response(
+                        .dispatch_key_with_response_id(
                             &mut response_guard,
                             message.channel_id.get(),
                             message.content.clone(),
+                            Some(message.id.get()),
                         )
                         .await
                     {

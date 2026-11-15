@@ -398,6 +398,11 @@ enum Request {
     Dispatch {
         key: u64,
         content: String,
+        /// The Discord message id, when known. A Core drops a second request carrying an
+        /// id it has already handled: during a Gateway update both the old and the new
+        /// Gateway can deliver the same message (docs/gateway-rolling-update-design.md).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<u64>,
     },
     Command {
         name: String,
@@ -2619,8 +2624,28 @@ impl Manager {
         key: u64,
         content: String,
     ) -> Result<Option<String>, AppError> {
-        self.execute_with_response(response, key, Request::Dispatch { key, content })
+        self.dispatch_key_with_response_id(response, key, content, None)
             .await
+    }
+    /// Like `dispatch_key_with_response`, carrying the Discord message id so a Core can
+    /// drop a duplicate delivered by two Gateways during an update.
+    pub async fn dispatch_key_with_response_id(
+        &self,
+        response: &mut ResponseGuard,
+        key: u64,
+        content: String,
+        source_id: Option<u64>,
+    ) -> Result<Option<String>, AppError> {
+        self.execute_with_response(
+            response,
+            key,
+            Request::Dispatch {
+                key,
+                content,
+                source_id,
+            },
+        )
+        .await
     }
     pub async fn dispatch_slash_with_response(
         &self,
@@ -2957,8 +2982,15 @@ impl Manager {
         content: String,
     ) -> Result<Option<String>, AppError> {
         let index = ((key ^ (key >> 22)) % self.workers.len() as u64) as usize;
-        self.execute(index, Request::Dispatch { key, content })
-            .await
+        self.execute(
+            index,
+            Request::Dispatch {
+                key,
+                content,
+                source_id: None,
+            },
+        )
+        .await
     }
     pub async fn dispatch_command(
         &self,
@@ -3617,6 +3649,40 @@ pub(crate) struct CoreLife {
     runtime: Arc<crate::cogs::FrameworkRuntime>,
     identity: Option<crate::protocol::Identity>,
     tasks: crate::supervisor::WorkerTasks,
+    /// Discord message ids already handled; shared by every connection of this Core.
+    seen: SeenIds,
+}
+
+/// A bounded memory of recently handled Discord ids. Not persisted: a restarted Core
+/// starts empty, and a duplicate that crosses a restart is not detected.
+struct SeenIds {
+    order: std::collections::VecDeque<u64>,
+    set: std::collections::HashSet<u64>,
+}
+
+impl SeenIds {
+    const CAPACITY: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            order: std::collections::VecDeque::new(),
+            set: std::collections::HashSet::new(),
+        }
+    }
+
+    /// True the first time an id is seen (and remembers it), false for a repeat.
+    fn first_time(&mut self, id: u64) -> bool {
+        if !self.set.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        if self.order.len() > Self::CAPACITY
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.set.remove(&oldest);
+        }
+        true
+    }
 }
 
 impl CoreLife {
@@ -3640,6 +3706,7 @@ impl CoreLife {
             runtime: Arc::new(crate::cogs::FrameworkRuntime::default()),
             identity,
             tasks,
+            seen: SeenIds::new(),
         })
     }
 }
@@ -3723,6 +3790,7 @@ async fn connection_loop(
     });
     let runtime = life.runtime.clone();
     let tasks = &mut life.tasks;
+    let seen = &mut life.seen;
     let mut sequenced_events = false;
     let mut replay_events = false;
     let mut api_results = false;
@@ -4046,19 +4114,33 @@ async fn connection_loop(
             | Request::Tick) => {
                 application_started = true;
                 let previous = state.clone();
-                let owned = std::mem::take(state);
-                match tasks
-                    .request(handle_command(command, owned, runtime.clone()))
-                    .await
-                {
-                    Ok((current, response)) => {
-                        *state = current;
-                        response?
-                    }
-                    Err(_) => {
-                        *state = previous;
-                        Response::Rejected {
-                            reason: "managed command failed".into(),
+                // The same Discord message arriving through another Gateway (an update
+                // overlaps two of them) is answered as "handled, nothing to say".
+                let duplicate = match &command {
+                    Request::Dispatch {
+                        source_id: Some(id),
+                        ..
+                    } => !seen.first_time(*id),
+                    _ => false,
+                };
+                if duplicate {
+                    let mut unchanged = state.clone();
+                    checked_result(&mut unchanged, previous, None)?
+                } else {
+                    let owned = std::mem::take(state);
+                    match tasks
+                        .request(handle_command(command, owned, runtime.clone()))
+                        .await
+                    {
+                        Ok((current, response)) => {
+                            *state = current;
+                            response?
+                        }
+                        Err(_) => {
+                            *state = previous;
+                            Response::Rejected {
+                                reason: "managed command failed".into(),
+                            }
                         }
                     }
                 }
@@ -4134,7 +4216,7 @@ async fn handle_command(
 ) -> (crate::cogs::State, Result<Response, AppError>) {
     let previous = state.clone();
     let result = match request {
-        Request::Dispatch { key, content } => {
+        Request::Dispatch { key, content, .. } => {
             crate::cogs::dispatch(key, &content, &mut state, &runtime).await
         }
         Request::Command { name } => crate::cogs::dispatch_command(&name, &runtime).await,
