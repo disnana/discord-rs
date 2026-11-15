@@ -3658,6 +3658,8 @@ pub(crate) struct CoreLife {
 struct SeenIds {
     order: std::collections::VecDeque<u64>,
     set: std::collections::HashSet<u64>,
+    /// Repeats refused since this Core started (a count only; never an id or content).
+    duplicates: u64,
 }
 
 impl SeenIds {
@@ -3667,12 +3669,14 @@ impl SeenIds {
         Self {
             order: std::collections::VecDeque::new(),
             set: std::collections::HashSet::new(),
+            duplicates: 0,
         }
     }
 
     /// True the first time an id is seen (and remembers it), false for a repeat.
     fn first_time(&mut self, id: u64) -> bool {
         if !self.set.insert(id) {
+            self.duplicates += 1;
             return false;
         }
         self.order.push_back(id);
@@ -4124,6 +4128,11 @@ async fn connection_loop(
                     _ => false,
                 };
                 if duplicate {
+                    // Visible in the Core log, so an update's overlap can be measured.
+                    eprintln!(
+                        "重複したメッセージを処理せず破棄しました（累計 {} 件）",
+                        seen.duplicates
+                    );
                     let mut unchanged = state.clone();
                     checked_result(&mut unchanged, previous, None)?
                 } else {
