@@ -74,10 +74,13 @@ pub fn rotate_in_place(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
     // would grow without bound - so the last few bytes written between the final copy and the
     // truncation can be lost (a window of microseconds). Bounded size wins over completeness.
     for _ in 0..4 {
-        if live.metadata()?.len() <= live.stream_position()? {
+        let end = live.metadata()?.len();
+        let position = live.stream_position()?;
+        if end <= position {
             break;
         }
-        std::io::copy(&mut Read::by_ref(&mut live), &mut copy)?;
+        // Copy exactly what is there now; a writer that keeps ahead cannot keep this loop.
+        std::io::copy(&mut Read::by_ref(&mut live).take(end - position), &mut copy)?;
     }
     live.set_len(0)?;
     Ok(true)

@@ -155,7 +155,7 @@ botd は Shard ごとに順番に次を行います。
 
 権限は、管理 secret に結び付いた role が `admin` で、scope が Bot の全 Shard を含む場合に限られます（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否され、副作用はありません。単体試験あり）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の要求と結果は `runtime-root/gateway-update-audit.jsonl` に 1 行ずつ追記されます（権限 0600）。event は `requested`・`rejected`・`succeeded`・`failed` のいずれかで、記録は subject、role、bot、operation ID と固定の失敗種別だけです。secret、パス、引数、エラー本文は含みません。要求を記録できない場合は、何も始めずに拒否されます（詳細と限界は[制約一覧](known-limitations.md)）。
 
-ログは稼働中も大きさに上限があります。`gateway.log` と `gateway-candidate.log` は 8 MiB、`core-*.log` は 4 MiB を超えると、約 60 秒ごとに `.1` へ写してから空にします（既存の `.1` は置き換えます）。起動時は `gateway.log` が 1 MiB を超えていれば `.1` へ退避します。 常に書き続ける書き手でも回転が止まらないよう、増えた分を数回コピーしてから空にします。その代わり、コピーと空にする間に書かれたごく少量は失われ得ます（上限を優先）。
+ログは稼働中も大きさに上限があります。`gateway.log` と `gateway-candidate.log` は 8 MiB、`core-*.log` は 4 MiB を超えると、約 60 秒ごとに `.1` へ写してから空にします（既存の `.1` は置き換えます）。起動時は `gateway.log` が 1 MiB を超えていれば `.1` へ退避します。 常に書き続ける書き手でも回転が止まらないよう、増えた分を数回コピーしてから空にします。その代わり、コピーと空にする間に書かれた分は失われ得ます（量は保証しません。上限を優先）。ローテーション後は `.1` に直前の分だけが残るため、`soak-diff.sh` の「最初と最後の比較」では回転をまたぐと件数が減ることがあります。
 
 未検証：待機 Gateway の ready・activate・`standby-active` の往復、監査の記録、ログの回転は、自動プロセス試験のみで確認しています。実 Discord での確認はありません。
 

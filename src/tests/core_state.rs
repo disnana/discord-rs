@@ -365,3 +365,37 @@ fn a_lower_epoch_never_replaces_a_state_written_by_a_higher_epoch() {
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
+
+/// Astra の再監査：保存の印は、Gateway が起動するたびに「ファイルの値より必ず大きい」ものを取る。
+/// 時計が戻っても、モードを切り替えても、botd を再起動しても、新しい Gateway の保存は止まらず、
+/// 先に起動していた古い Gateway の遅れた保存は新しい状態を上書きしない。
+#[tokio::test]
+async fn a_newer_writer_always_outranks_the_older_one_whatever_the_file_carries() {
+    let dir = Dir::new();
+    // The file is stamped far in the future (as if the clock had stepped back since).
+    core_state::store_at(&dir.0, &binding(), &[Some(count(1)), None], u64::MAX / 2).unwrap();
+
+    // A writer that starts now still writes: it ranks above whatever the file carries.
+    let (first, loaded) = Persister::open(dir.0.clone(), binding()).await;
+    assert_eq!(loaded, vec![Some(count(1)), None]);
+    first.observe(0, &count(2));
+    first.flush(true).await;
+    assert_eq!(
+        core_state::load(&dir.0, &binding()),
+        vec![Some(count(2)), None],
+        "a new writer is not locked out by a larger stamp already in the file"
+    );
+
+    // A second writer starts later (the replacement Gateway): it outranks the first.
+    let (second, _) = Persister::open(dir.0.clone(), binding()).await;
+    second.observe(0, &count(5));
+    second.flush(true).await;
+    // The first (old) writer flushes late with older content: it must not win.
+    first.observe(0, &count(3));
+    first.flush(true).await;
+    assert_eq!(
+        core_state::load(&dir.0, &binding()),
+        vec![Some(count(5)), None],
+        "an older writer never replaces what a newer one saved"
+    );
+}

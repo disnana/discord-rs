@@ -290,6 +290,24 @@ impl Persister {
                 .await
                 .unwrap_or_else(|_| empty(&binding))
         };
+        // The stamp this writer puts on its saves: the time it started, in nanoseconds, but
+        // always above whatever the file already carries (a clock that stepped back, or a tie,
+        // must not leave a new writer "older" than the file it is about to take over). A writer
+        // that started later therefore always outranks the earlier one, whichever layout, botd
+        // incarnation or ownership epoch either of them had.
+        let stamp = {
+            let dir = dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| {
+                        u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+                    });
+                now.max(stored_epoch(&dir).saturating_add(1))
+            })
+            .await
+            .unwrap_or(1)
+        };
         let persister = Self {
             dir,
             binding,
@@ -301,15 +319,9 @@ impl Persister {
                 oversize_warned: false,
             }),
             writing: Mutex::new(()),
-            epoch: 0,
+            epoch: stamp,
         };
         (persister, loaded)
-    }
-
-    /// The ownership epoch of the Gateway this persister belongs to.
-    pub fn with_epoch(mut self, epoch: u64) -> Self {
-        self.epoch = epoch;
-        self
     }
 
     /// Record a confirmed state. Only a real change marks the file dirty.

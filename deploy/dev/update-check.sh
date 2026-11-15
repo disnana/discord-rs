@@ -92,7 +92,7 @@ for ((round=1; round<=repeat; round++)); do
   id=$(json_string operation_id "$response")
   state=unknown
   if [[ "$id" =~ ^[a-fA-F0-9]{32}$ ]]; then
-    while [ $((SECONDS-start)) -lt 180 ]; do
+    while [ $((SECONDS-start)) -lt 240 ]; do
       response=$(ctl operation "$id") || :
       state=$(json_string state "$response" | tr '[:upper:]' '[:lower:]')
       case "$state" in succeeded|failed) break;; esac
@@ -101,7 +101,11 @@ for ((round=1; round<=repeat; round++)); do
   fi
   echo "Operation elapsed: $((SECONDS-start)) s"
   if [ "$state" = succeeded ]; then record PASS "R$round update" 'operation succeeded'; else record FAIL "R$round update" "operation state: ${state:-unknown}"; fi
-  sleep 5
+  # The old Gateway is asked to exit after the hand-over and is killed after 30 s: wait for it
+  # to be gone before taking the "after" snapshot, so the new Gateway cannot be mistaken for it.
+  deadline=$((SECONDS+40))
+  while kill -0 "$old" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+  sleep 2
   echo "=== Round $round/$repeat POST ==="
   snapshot
   if [ "${#cores[@]}" -eq 2 ] && [ "${cores[*]}" = "$before_cores" ]; then record PASS "R$round cores" "unchanged: $before_cores"; else record FAIL "R$round cores" 'core count or PIDs changed'; fi

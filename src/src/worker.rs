@@ -676,26 +676,6 @@ struct Process {
     credential_free: bool,
 }
 
-/// The value a Gateway stamps into `core-state.json` as its epoch. The ownership epoch alone
-/// restarts at 0 whenever botd restarts (the Cores and their epoch floor restart with it), but
-/// the file outlives botd: a plain epoch would leave every later Gateway "older" than the file
-/// and silently stop its saves. So the stamp is led by the start time of this botd incarnation
-/// (the modification time of the capability secret botd makes for its Cores, in seconds),
-/// followed by the epoch in the low 20 bits. A later incarnation always stamps higher; within
-/// one incarnation a higher epoch stamps higher.
-#[cfg(unix)]
-fn persisted_epoch(attach: &CoreAttach) -> u64 {
-    let incarnation = attach
-        .sockets
-        .first()
-        .and_then(|socket| socket.parent())
-        .and_then(|dir| std::fs::metadata(dir.join("core.secret")).ok())
-        .and_then(|meta| meta.modified().ok())
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |since| since.as_secs());
-    (incarnation << 20) | attach.identity.ownership_epoch.0.min((1 << 20) - 1)
-}
-
 /// Where a Manager gets its Cores from. `Spawn` is the embedded layout: the Manager starts
 /// and owns the child processes. `Attach` is the separated layout: the Cores are started and
 /// supervised by botd, and the Gateway only connects to them (docs/gateway-core-separation-design.md).
@@ -1817,11 +1797,7 @@ impl Manager {
                     workers: count,
                 };
                 let (persister, loaded) = crate::core_state::Persister::open(dir, binding).await;
-                #[cfg(unix)]
-                let epoch = attach.as_ref().map_or(0, persisted_epoch);
-                #[cfg(not(unix))]
-                let epoch = 0;
-                (Some(persister.with_epoch(epoch)), loaded)
+                (Some(persister), loaded)
             }
             None => (None, vec![None; count]),
         };
