@@ -81,3 +81,10 @@ Gateway のバイナリを、Discord の WebSocket を長く切らずに（で�
 - 複数ホストの failover と Raft の本番化は、この設計に含まない。
 - 長時間稼働、複数 Shard、レート制限は未検証のまま。
 - この文書は設計案であり、ここに書いた保証はどれも実装・検証後にだけ主張する。
+
+## 9. R-3 着手前の調査結果（2026-11-15）：待機側に Core の「待機接続」は要らない
+
+- R-1／R-2 で、Core 側は「高い epoch が来たら古い接続を止めて引き継ぐ」ことができる。したがって待機の Gateway は、**活性化まで Core に attach しなくてよい**（Discord にログインしてイベントをバッファするだけ）。活性化の合図で `attach(epoch+1)` すれば、その瞬間に旧 Gateway の Core 接続が止まる。Core に読み取り専用の待機モードを作る必要はない（§4.1 の「Standby は Hello／Health のみ」は不要になった）。
+- 実装の形：`--standby` の Gateway は `Manager` を作らず、`live_events` の前段でイベントを上限付きで溜め、制御入力（stdin の `GatewayControl::Activate { epoch }`）が来たら `attach_gateway_pool` → 溜めたイベントを通常の経路で先に処理 → 通常動作。`GatewayControl` に `Activate` を足し、`shutdown_input`（1 フレームだけ読んで終了する）を連続読みに直す必要がある。
+- **未解決の核心（V3）：切替境界の重複と欠落。** 旧と新は同じ Discord イベントを両方受ける。新が溜めたイベントのうち、旧が既に処理したものを再生すると**二重処理**（`!count` が 2 つ進む）になる。逆に境界を厳しく切ると欠落する。候補：(a) 旧が処理した最大のメッセージ ID（snowflake）を境界として Core に記録し、新は境界より後の ID だけを再生する（at-least-once に近い。ID の順序が崩れる稀なケースは残る）。(b) Core が直近のメッセージ ID／interaction ID の窓で重複排除する（`Request::Dispatch` に ID を足す必要があり、プロトコルが広がる）。いずれも、実 Discord での重複・欠落の実測（V3）なしに「保証」とは言えない。
+- 判断を仰ぎたい点：境界の方式を (a) と (b) のどちらにするか。推奨は **(b)（Core 側の ID 窓による重複排除）**：旧・新の Gateway 間に追加の連絡経路が要らず、旧が突然死しても働く。ただし `Dispatch`／`Command`／`Interaction` 要求に Discord の ID を載せる変更が入る。
