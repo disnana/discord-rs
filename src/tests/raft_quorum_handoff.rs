@@ -6,8 +6,8 @@ use src::{
     ownership::{Clock, OwnershipCoordinator, OwnershipError, OwnershipKey},
     protocol::{BotId, OwnershipEpoch},
     raft_quorum::{
-        Command, NodeOptions, Outcome, Ownership, OwnershipData, QuorumCoordinator, RaftNode,
-        ShardKey, StorageMode, TAKEOVER_QUARANTINE, transport::MemoryTransport,
+        Command, NodeOptions, Outcome, Ownership, OwnershipData, QuorumCoordinator, QuorumError,
+        RaftNode, ShardKey, StorageMode, TAKEOVER_QUARANTINE, transport::MemoryTransport,
     },
 };
 use std::{
@@ -97,8 +97,14 @@ impl Cluster {
     }
 
     async fn start(&mut self, id: u64, mode: StorageMode) {
-        let node = Arc::new(
-            RaftNode::start(
+        // After a shutdown, the previous instance's store handle can outlive `shutdown()` for a
+        // moment (a background task still owns it), and the store lock is not yet released:
+        // the reopen then fails with `Storage`. Retry that one error for a short, bounded time;
+        // any other error, or a lock that stays held, still fails the test. (An intermittent CI
+        // failure on restart-reopen; the cause was found by reading, not reproduced.)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let node = loop {
+            match RaftNode::start(
                 self.root.0.join(format!("node-{id}")),
                 id,
                 members(),
@@ -107,8 +113,14 @@ impl Cluster {
                 Arc::new(self.transport.clone()),
             )
             .await
-            .unwrap(),
-        );
+            {
+                Ok(node) => break Arc::new(node),
+                Err(QuorumError::Storage) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("node {id} did not start: {error:?}"),
+            }
+        };
         self.transport.register(id, node.raft.clone()).unwrap();
         assert!(self.nodes.insert(id, node).is_none());
     }

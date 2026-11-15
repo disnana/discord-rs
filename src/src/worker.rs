@@ -3740,6 +3740,29 @@ pub(crate) struct Fence {
     pub epoch: u64,
 }
 
+/// How long a response may take to be written to a socket peer before the connection is
+/// given up (state is kept; the peer reconnects or is replaced).
+const SOCKET_WRITE_DEADLINE: Duration = Duration::from_secs(10);
+
+async fn write_frame(
+    output: &mut Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    data: &[u8],
+    bounded: bool,
+) -> Result<(), AppError> {
+    let write = async {
+        output.write_all(data).await?;
+        output.flush().await
+    };
+    if bounded {
+        timeout(SOCKET_WRITE_DEADLINE, write)
+            .await
+            .map_err(|_| failure("core response write timed out"))??;
+    } else {
+        write.await?;
+    }
+    Ok(())
+}
+
 async fn next_request(
     input: &mut tokio::sync::mpsc::Receiver<Result<Request, AppError>>,
     fence: Option<&mut Fence>,
@@ -3789,6 +3812,9 @@ async fn connection_loop(
         input: source,
     } = io;
     let mut output = output;
+    // A socket peer (a Gateway attached to a separated Core) can stop reading. A write to it
+    // then has a deadline, so a stalled old Gateway cannot hold up the takeover by a new one.
+    let socket_peer = fence.is_some();
     let backend = life.backend.clone();
     // A connection that attached with an ownership epoch is that Gateway's epoch: Hello
     // must then present the same identity, epoch included.
@@ -3939,8 +3965,7 @@ async fn connection_loop(
                 event_stream_initialized = true;
                 let mut ack = serde_json::to_vec(&Response::EventAccepted { local_sequence })?;
                 ack.push(b'\n');
-                output.write_all(&ack).await?;
-                output.flush().await?;
+                write_frame(&mut output, &ack, socket_peer).await?;
                 Request::ReadyEvent { bot_name }
             }
             request => request,
@@ -4211,8 +4236,7 @@ async fn connection_loop(
         }
         let mut data = serde_json::to_vec(&response)?;
         data.push(b'\n');
-        output.write_all(&data).await?;
-        output.flush().await?;
+        write_frame(&mut output, &data, socket_peer).await?;
     }
     tasks.begin_drain();
     tasks.wait_drained().await?;

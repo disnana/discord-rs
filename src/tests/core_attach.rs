@@ -981,3 +981,50 @@ fn an_oversized_log_is_rotated_in_place_and_writers_keep_appending() {
     assert_eq!(std::fs::metadata(&log).unwrap().len(), 2048);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Sol のレビュー指摘：古い Gateway が応答を読まなくなっても、新しい epoch の引き継ぎが
+/// 無期限に待たされない（ソケットの相手への書き込みには期限がある）。
+#[tokio::test]
+async fn a_peer_that_stops_reading_cannot_hold_up_a_takeover() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let identity_json = serde_json::to_string(&identity()).unwrap();
+    let mut core = Core::start_persistent(&socket, SECRET, &identity_json).await;
+
+    // The stalled Gateway: floods requests and never reads a response, so the Core's writes
+    // fill the socket buffer and block.
+    let stalled = attach_with_epoch(&socket, SECRET, 1).await;
+    let (_read, mut write) = stalled.into_split();
+    let flood = tokio::spawn(async move {
+        for _ in 0..20_000 {
+            if write.write_all(b"{\"type\":\"health\"}\n").await.is_err() {
+                break;
+            }
+        }
+        // keep the write half (and so the connection) open
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The replacement authenticates at once but is only served after the blocked write gives
+    // up (its deadline is 10 s), and then it works.
+    let started = std::time::Instant::now();
+    let mut next = attach_with_epoch(&socket, SECRET, 2).await;
+    let served = tokio::time::timeout(
+        Duration::from_secs(40),
+        exchange(&mut next, r#"{"type":"health"}"#),
+    )
+    .await
+    .expect("the takeover is not held up forever")
+    .is_some();
+    assert!(served, "the higher epoch is served");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+
+    flood.abort();
+    let _ = core.child.kill().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
