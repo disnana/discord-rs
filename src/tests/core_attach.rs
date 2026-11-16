@@ -788,6 +788,7 @@ async fn a_gateway_with_a_higher_epoch_takes_over_and_the_old_one_cannot_return(
     .await
     .expect("epoch 3 attaches (Hello carries the same epoch)");
     let first = count(&old).await;
+    assert!(old.workers_reply_allowed().await);
 
     let new = bounded(src::worker::Manager::attach_gateway_pool(
         deployment(),
@@ -795,6 +796,8 @@ async fn a_gateway_with_a_higher_epoch_takes_over_and_the_old_one_cannot_return(
     ))
     .await
     .expect("epoch 5 takes over");
+    assert!(new.workers_reply_allowed().await);
+    assert!(!old.workers_reply_allowed().await);
     let second = count(&new).await;
     assert_ne!(first, second, "the counter continues across the takeover");
 

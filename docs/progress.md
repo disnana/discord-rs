@@ -556,3 +556,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - **B3 の観測（第一段階）**：Core が、30 秒以上完了しない要求を、標準エラーに 1 行（`要求が 30 秒以上完了していません（経過 N 秒、未完了 M 件）`）で出す（同じ要求の再警告は 5 分以上空ける）。**要求は打ち切らず、ドロップも再試行もしない**（ハンドラが状態を持つため打ち切りは危険、という既知の理由）。内容・ID・秘密は出さない。IPC は変えていない。試験：判定（時刻を注入）の単体テスト 2 件と、実時間の短い値で本物の `select!` を通すテスト 1 件（遅い要求は 1 回だけ警告され結果を返す、速い要求は警告されない、完了後は保留 0）。実際の stuck の再現と実機での確認は未実施。
 - **`deploy/dev/update-check.sh`**：N シャードに対応（`botctl inspect` で shard 数を取り、Core が 2×N・Gateway が N あることを確認、更新後は全 Core 不変・全 Gateway 入れ替え、シャードごとの IPC）、`--shard N`（対象の Gateway だけが変わり他は不変）、`ROOT=...` で runtime のルートを上書き可。WSL（実 Discord、2 シャード）で、全更新と `--shard 1` の両方が全 PASS。Core を落とした直後・存在しないシャード・`--repeat 0` は FAIL／拒否されることを確認。Ubuntu の Oracle での実行は未確認。
 - **WSL 固有の失敗の原因と解消**：`botctl_update_control`（1 件）と `botctl_update_daemon`（4 件）が WSL でだけ失敗していたのは、テストが一時ディレクトリを `CARGO_MANIFEST_DIR/target`（WSL では NTFS の `/mnt/d` 上で、Unix の権限が効かず 0600 の検査が `Io` エラー）に作っていたため。cargo の `CARGO_TARGET_TMPDIR`（`CARGO_TARGET_DIR` の下）を使うように変更し、WSL でも 9 件と 6 件が全て成功。本番のコードの問題ではない。
+
+### 2026-11-16: `!workers` ? fence ??????
+
+- ? Core ????? Health ??????????????? `!workers` ??????????????? fence ?????????????? fence ????????
+- ?????????? epoch ?????????????????Cargo ??????????????????? Discord ?????????
