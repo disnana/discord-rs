@@ -91,7 +91,10 @@ fn cli(args: &[&str], input: &[u8]) -> Output {
         .spawn()
         .unwrap();
     if !input.is_empty() {
-        let _ = child.stdin.take().unwrap().write_all(input);
+        // The CLI may reject arguments and close stdin before reading bootstrap.
+        if let Err(err) = child.stdin.take().unwrap().write_all(input) {
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
     } else {
         drop(child.stdin.take());
     }
