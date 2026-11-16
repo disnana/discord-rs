@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # soak-report.sh を繰り返し実行したログ（tee -a soak.log）の、最初と最後のスナップショットを比べる。
-# 読み取り専用。秘密は扱わない。使い方: soak-diff.sh [LOG=~/soak.log]
+# 読み取り専用。秘密は扱わない。使い方: soak-diff.sh [LOG=/home/ubuntu/soak.log]
 # 役割（botd / core / gateway）ごとに pid の昇順で「役割#番号」を振る。pid が変われば再起動として WATCH。
 # Core が複数あると再起動で番号が入れ替わり得る。soak-report.sh は cmd を 90 文字で切るため、
 # --core-listen / --core-dir が切れると役割を判定できない（その場合は行が数えられない）。
 set -u
-LOG=${1:-$HOME/soak.log}
+LOG=${1:-/home/ubuntu/soak.log}
 if [ ! -r "$LOG" ]; then echo "cannot read: $LOG" >&2; exit 2; fi
 T=$(mktemp -d) || exit 2
 trap 'rm -rf "$T"' EXIT

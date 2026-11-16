@@ -34,10 +34,10 @@ sudo systemctl enable --now botd
 
 ```bash
 sudo install -m 0755 deploy/dev/soak-report.sh /usr/local/bin/soak-report
-sudo soak-report | tee -a ~/soak.log          # 開始時
-sudo soak-report | tee -a ~/soak.log          # 数時間後、翌日
+sudo soak-report | tee -a /home/ubuntu/soak.log          # 開始時
+sudo soak-report | tee -a /home/ubuntu/soak.log          # 数時間後、翌日
 ```
-cron で自動化する場合（1 時間おき）：`0 * * * * /usr/local/bin/soak-report >> /var/log/soak.log 2>&1`
+cron で自動化する場合（1 時間おき。`/etc/cron.d/soak-hourly` に、root で）：`0 * * * * root /usr/local/bin/soak-report >> /home/ubuntu/soak.log 2>&1`。**`sudo su` で root になった状態の `~` は `/root` なので、記録の場所は必ず `/home/ubuntu/soak.log` と絶対パスで指定する**（`~/soak.log` と書くと、cron の記録と別のファイルになる。2026-11-16 に実際にそうなった）。
 
 ## 3. 何を見るか（合格の目安。数字は目安で、保証ではない）
 

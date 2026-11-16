@@ -531,3 +531,7 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 約 3.5 時間（08:06Z〜11:45Z）で再接続の要求は 1 回。頻度の傾向や、ユーザーの操作との関係（「操作の直後に切れる」仮説）は、この 1 回では判断できない。
 - 候補ログに 11:46:55Z（`--all` の更新）の世代が追記されていることを確認（更新ごとに追記される）。botd の再起動後の Gateway（11:45:34Z）は `gateway.log` に出る。
 - cron の毎時の記録（09:00〜11:00 UTC）が `soak.log` にない件は、ファイル（0644、root、08:07 作成）に問題はなく、原因は未確認（調査中）。
+
+### 追記（2026-11-16 夜）：cron の記録の場所の取り違え（解決）
+
+- cron（`/etc/cron.d/soak-hourly`）は動いていた（journal に 09:00・10:00・11:00 UTC の `soak-report` の実行）。毎時の記録は `/home/ubuntu/soak.log` に溜まっていた。ユーザーが `sudo su` の root で `~/soak.log` を読んだため `/root/soak.log`（手動の記録だけ）を見ていた。私の案内が `~` を使っていたのが原因。手順書（`docs/soak-test.md`）と `deploy/dev/soak-diff.sh` の既定を、絶対パス `/home/ubuntu/soak.log` に直した。
