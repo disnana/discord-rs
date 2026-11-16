@@ -1,5 +1,7 @@
 # 開発計画・引き継ぎ
 
+- B3 観測：Core の管理対象ハンドラーを待機中に未完了時間と件数を確認し、30 秒以上の要求を標準エラーに警告する。同一要求の再警告は 5 分以上空ける。期限や取消は追加していない。単体テストを追加したが、指定により cargo は未実行。Tokio の `test-util` feature が現在の manifest にないため、許可された変更範囲内では `time::pause` を使用できず、注入した時刻によるテストとしている。
+
 ## 基準と現状
 2026-11-11、`tp-li-dev/discord-rs` の main（0843664）を取得。仕様は architecture.md。既存実装は単一 Shard の Gateway、2 Worker の stdin/stdout JSON IPC、管理プロセスと更新 CLI。Worker は token を継承しない。更新は Worker ごとに順次行われ、途中失敗時に新旧が混在する。状態は親プロセスのメモリのみ。仕様の shard 単位 Gateway/Core、複数 Bot、分散制御、属性マクロ、ハイブリッドコマンドは未実装。
 
@@ -548,3 +550,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 変更：待機（候補）Gateway の出力先を `gateway-candidate.log` から、そのシャードの `gateway.log`（追記）に変更。旧 Gateway と新 Gateway は更新の重なりの短い間だけ、行単位で混ざる（出力に時刻が入る）。これで運用者が `gateway.log` を読めば、常に現在の Gateway の出力が見える。旧版が作った `gateway-candidate.log` は、残っていてもローテーション（8 MiB）の対象とし、`soak-report` も合算して読む。
 - 試験：統合テスト `gateway_update_replaces_the_gateway_and_keeps_the_cores` に「更新後に `gateway-candidate.log` が作られず、`gateway.log` が 1 つだけ」の確認を追加。**変更を外すとこのテストが失敗することを確認**（`a separate candidate log was created`）。WSL で clippy 警告なし、統合テスト 2 回成功、lib 223 件成功。実 Discord・Oracle での確認は未実施（次回の更新で確認）。
 - 運用者ガイド（`docs/operator-guide.md`）に、`--shard`／`--guild`／`--all`、既定のタイムアウト、障害時の確認先、バイナリの復旧を追加（Terra が作成、私が内容をコードと照合）。
+
+### 2026-11-16 夜：B3 の観測、update-check.sh の複数シャード対応、WSL 固有のテスト失敗の解消（work/next）
+
+- **B3 の観測（第一段階）**：Core が、30 秒以上完了しない要求を、標準エラーに 1 行（`要求が 30 秒以上完了していません（経過 N 秒、未完了 M 件）`）で出す（同じ要求の再警告は 5 分以上空ける）。**要求は打ち切らず、ドロップも再試行もしない**（ハンドラが状態を持つため打ち切りは危険、という既知の理由）。内容・ID・秘密は出さない。IPC は変えていない。試験：判定（時刻を注入）の単体テスト 2 件と、実時間の短い値で本物の `select!` を通すテスト 1 件（遅い要求は 1 回だけ警告され結果を返す、速い要求は警告されない、完了後は保留 0）。実際の stuck の再現と実機での確認は未実施。
+- **`deploy/dev/update-check.sh`**：N シャードに対応（`botctl inspect` で shard 数を取り、Core が 2×N・Gateway が N あることを確認、更新後は全 Core 不変・全 Gateway 入れ替え、シャードごとの IPC）、`--shard N`（対象の Gateway だけが変わり他は不変）、`ROOT=...` で runtime のルートを上書き可。WSL（実 Discord、2 シャード）で、全更新と `--shard 1` の両方が全 PASS。Core を落とした直後・存在しないシャード・`--repeat 0` は FAIL／拒否されることを確認。Ubuntu の Oracle での実行は未確認。
+- **WSL 固有の失敗の原因と解消**：`botctl_update_control`（1 件）と `botctl_update_daemon`（4 件）が WSL でだけ失敗していたのは、テストが一時ディレクトリを `CARGO_MANIFEST_DIR/target`（WSL では NTFS の `/mnt/d` 上で、Unix の権限が効かず 0600 の検査が `Io` エラー）に作っていたため。cargo の `CARGO_TARGET_TMPDIR`（`CARGO_TARGET_DIR` の下）を使うように変更し、WSL でも 9 件と 6 件が全て成功。本番のコードの問題ではない。

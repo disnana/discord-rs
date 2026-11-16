@@ -72,8 +72,7 @@ impl Fixture {
     async fn new(access: Option<Value>) -> Self {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).unwrap();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("update-daemon-{:032x}", u128::from_ne_bytes(nonce)));
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("placement.toml");
@@ -237,8 +236,7 @@ impl Fixture {
             }
         }
         let target = std::fs::canonicalize(&self.root).unwrap();
-        let parent =
-            std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("target")).unwrap();
+        let parent = std::fs::canonicalize(Path::new(env!("CARGO_TARGET_TMPDIR"))).unwrap();
         assert_eq!(target.parent(), Some(parent.as_path()));
         assert!(
             target

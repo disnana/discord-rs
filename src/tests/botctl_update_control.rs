@@ -19,13 +19,11 @@ struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "update-control-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "update-control-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&path).unwrap();
         // Read-only artifact validation, with no candidate ever executed.
         let executable = std::env::current_exe().unwrap();
@@ -104,8 +102,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let target = std::fs::canonicalize(&self.0).unwrap();
-        let root = std::fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
-            .unwrap();
+        let root = std::fs::canonicalize(PathBuf::from(env!("CARGO_TARGET_TMPDIR"))).unwrap();
         assert_eq!(target.parent(), Some(root.as_path()));
         assert!(
             target

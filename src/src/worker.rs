@@ -3678,8 +3678,201 @@ pub(crate) struct CoreLife {
     runtime: Arc<crate::cogs::FrameworkRuntime>,
     identity: Option<crate::protocol::Identity>,
     tasks: crate::supervisor::WorkerTasks,
+    requests: RequestObservations,
     /// Discord message ids already handled; shared by every connection of this Core.
     seen: SeenIds,
+}
+
+const REQUEST_WARN_AFTER: Duration = Duration::from_secs(30);
+const REQUEST_CHECK_EVERY: Duration = Duration::from_secs(5);
+const REQUEST_WARN_REPEAT: Duration = Duration::from_secs(300);
+
+#[derive(Default)]
+struct RequestObservations {
+    next: u64,
+    pending: std::collections::HashMap<u64, (tokio::time::Instant, Option<tokio::time::Instant>)>,
+}
+
+impl RequestObservations {
+    fn start(&mut self, now: tokio::time::Instant) -> u64 {
+        let id = self.next;
+        self.next = self.next.checked_add(1).expect("request counter exhausted");
+        self.pending.insert(id, (now, None));
+        id
+    }
+
+    fn finish(&mut self, id: u64) {
+        self.pending.remove(&id);
+    }
+
+    fn check(
+        &mut self,
+        now: tokio::time::Instant,
+        threshold: Duration,
+        mut warn: impl FnMut(Duration, usize),
+    ) {
+        let count = self.pending.len();
+        for (started, last_warning) in self.pending.values_mut() {
+            let elapsed = now.duration_since(*started);
+            if elapsed >= threshold
+                && last_warning.is_none_or(|last| now.duration_since(last) >= REQUEST_WARN_REPEAT)
+            {
+                *last_warning = Some(now);
+                warn(elapsed, count);
+            }
+        }
+    }
+}
+
+/// Observe a request that is awaited anyway: it is never cancelled, dropped early, retried or
+/// timed out (cancelling `WorkerTasks::request` is unsafe because the handler owns the state).
+async fn observe_request<F: std::future::Future>(
+    observations: &mut RequestObservations,
+    request: F,
+) -> F::Output {
+    observe_request_with(
+        observations,
+        request,
+        REQUEST_CHECK_EVERY,
+        REQUEST_WARN_AFTER,
+        |elapsed, count| {
+            eprintln!(
+                "要求が 30 秒以上完了していません（経過 {} 秒、未完了 {} 件）",
+                elapsed.as_secs(),
+                count
+            );
+        },
+    )
+    .await
+}
+
+async fn observe_request_with<F: std::future::Future>(
+    observations: &mut RequestObservations,
+    request: F,
+    check_every: Duration,
+    threshold: Duration,
+    mut warn: impl FnMut(Duration, usize),
+) -> F::Output {
+    let id = observations.start(tokio::time::Instant::now());
+    tokio::pin!(request);
+    let mut checks =
+        tokio::time::interval_at(tokio::time::Instant::now() + check_every, check_every);
+    checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut request => break result,
+            _ = checks.tick() => {
+                observations.check(tokio::time::Instant::now(), threshold, &mut warn);
+            }
+        }
+    };
+    observations.finish(id);
+    result
+}
+
+#[cfg(test)]
+mod request_observation_tests {
+    use super::*;
+
+    /// The real `select!` loop with short real timers: a slow request is reported exactly once
+    /// (the repeat interval is five minutes) and is still awaited to completion with its own
+    /// result; a fast request is never reported; nothing stays pending afterwards.
+    #[tokio::test]
+    async fn the_observer_reports_a_slow_request_once_and_still_returns_its_result() {
+        let mut observations = RequestObservations::default();
+        let mut warnings = Vec::new();
+        let value = observe_request_with(
+            &mut observations,
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                7
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            |elapsed, count| warnings.push((elapsed, count)),
+        )
+        .await;
+        assert_eq!(value, 7, "the request's own result is returned");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].1, 1);
+        assert!(warnings[0].0 >= Duration::from_millis(80));
+        assert!(observations.pending.is_empty());
+
+        let mut fast = Vec::new();
+        let value = observe_request_with(
+            &mut observations,
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                1
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            |elapsed, count| fast.push((elapsed, count)),
+        )
+        .await;
+        assert_eq!(value, 1);
+        assert!(fast.is_empty());
+        assert!(observations.pending.is_empty());
+    }
+
+    #[test]
+    fn completed_request_is_not_reported() {
+        let mut observations = RequestObservations::default();
+        let start = tokio::time::Instant::now();
+        let id = observations.start(start);
+        let mut warnings = Vec::new();
+        observations.check(
+            start + Duration::from_secs(29),
+            REQUEST_WARN_AFTER,
+            |elapsed, count| warnings.push((elapsed, count)),
+        );
+        observations.finish(id);
+        observations.check(
+            start + Duration::from_secs(35),
+            REQUEST_WARN_AFTER,
+            |elapsed, count| warnings.push((elapsed, count)),
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn pending_requests_warn_once_and_stop_after_completion() {
+        let mut observations = RequestObservations::default();
+        let start = tokio::time::Instant::now();
+        let first = observations.start(start);
+        let second = observations.start(start + Duration::from_secs(20));
+        let mut warnings = Vec::new();
+        let threshold = Duration::from_secs(10);
+        observations.check(
+            start + Duration::from_secs(30),
+            threshold,
+            |elapsed, count| warnings.push((elapsed, count)),
+        );
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().all(|(_, count)| *count == 2));
+        observations.finish(first);
+        observations.check(
+            start + Duration::from_secs(35),
+            threshold,
+            |elapsed, count| warnings.push((elapsed, count)),
+        );
+        assert_eq!(warnings.len(), 2);
+        observations.check(
+            start + Duration::from_secs(330),
+            threshold,
+            |elapsed, count| warnings.push((elapsed, count)),
+        );
+        assert_eq!(warnings.len(), 3);
+        assert_eq!(warnings[2].1, 1);
+        observations.finish(second);
+        observations.check(
+            start + Duration::from_secs(630),
+            threshold,
+            |elapsed, count| warnings.push((elapsed, count)),
+        );
+        assert_eq!(warnings.len(), 3);
+    }
 }
 
 /// A bounded memory of recently handled Discord ids. Not persisted: a restarted Core
@@ -3739,6 +3932,7 @@ impl CoreLife {
             runtime: Arc::new(crate::cogs::FrameworkRuntime::default()),
             identity,
             tasks,
+            requests: RequestObservations::default(),
             seen: SeenIds::new(),
         })
     }
@@ -3852,6 +4046,7 @@ async fn connection_loop(
     });
     let runtime = life.runtime.clone();
     let tasks = &mut life.tasks;
+    let observations = &mut life.requests;
     let seen = &mut life.seen;
     let mut sequenced_events = false;
     let mut replay_events = false;
@@ -4119,8 +4314,9 @@ async fn connection_loop(
                         let registry = registry.clone();
                         let signal = drain.subscribe();
                         let snapshot = serde_json::to_value(&*state)?;
-                        tasks
-                            .request(async move {
+                        observe_request(
+                            observations,
+                            tasks.request(async move {
                                 let replies = StdMutex::new(Vec::new());
                                 let result = registry
                                     .dispatch_with_drain(
@@ -4159,9 +4355,10 @@ async fn connection_loop(
                                     });
                                 }
                                 Ok::<_, AppError>(response)
-                            })
-                            .await
-                            .map_err(|_| failure("managed interaction failed"))??
+                            }),
+                        )
+                        .await
+                        .map_err(|_| failure("managed interaction failed"))??
                     }
                     _ => Response::Rejected {
                         reason: "interaction state unavailable or draining".into(),
@@ -4196,9 +4393,11 @@ async fn connection_loop(
                     let owned = std::mem::take(state);
                     // Do not timeout this future: cancellation abandons its registered
                     // request and running task, so draining and state ownership are unsafe.
-                    match tasks
-                        .request(handle_command(command, owned, runtime.clone()))
-                        .await
+                    match observe_request(
+                        observations,
+                        tasks.request(handle_command(command, owned, runtime.clone())),
+                    )
+                    .await
                     {
                         Ok((current, response)) => {
                             *state = current;
