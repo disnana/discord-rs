@@ -933,14 +933,10 @@ pub mod control {
         pending_audit: Vec<PendingAudit>,
     }
 
-    /// A terminal record not yet written: event word, operation ID, Bot, (subject, role), error.
-    type PendingAudit = (
-        String,
-        String,
-        String,
-        (String, String),
-        Option<DaemonError>,
-    );
+    struct PendingAudit {
+        bytes: Vec<u8>,
+        written: bool,
+    }
 
     impl ControlPlane {
         /// Records `gateway-update` requests and outcomes in an append-only file. A request
@@ -959,10 +955,38 @@ pub mod control {
             actor: &(String, String),
             error: Option<DaemonError>,
         ) -> std::io::Result<()> {
+            let mut record = Self::audit_record(event, operation_id, bot, actor, error)?;
+            self.write_audit(&mut record)
+        }
+
+        fn audit_record(
+            event: &str,
+            operation_id: &str,
+            bot: &str,
+            actor: &(String, String),
+            error: Option<DaemonError>,
+        ) -> std::io::Result<PendingAudit> {
+            let at_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            let mut bytes = serde_json::to_vec(&json!({
+                "at_ms": at_ms, "event": event, "operation_id": operation_id,
+                "bot": bot, "subject": actor.0, "role": actor.1,
+                "error": error.map(|e| format!("{e:?}")),
+            }))
+            .map_err(std::io::Error::other)?;
+            bytes.push(b'\n');
+            Ok(PendingAudit {
+                bytes,
+                written: false,
+            })
+        }
+
+        fn write_audit(&self, record: &mut PendingAudit) -> std::io::Result<()> {
             let Some(path) = &self.gateway_update_audit else {
                 return Ok(());
             };
-            use std::io::Write;
+            use std::io::{Read, Seek, SeekFrom, Write};
             #[cfg(unix)]
             let mut file = crate::core_units::open_append_private(path)?;
             #[cfg(not(unix))]
@@ -970,28 +994,37 @@ pub mod control {
                 .create(true)
                 .append(true)
                 .open(path)?;
-            let at_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis());
-            let mut line = serde_json::to_vec(&json!({
-                "at_ms": at_ms, "event": event, "operation_id": operation_id,
-                "bot": bot, "subject": actor.0, "role": actor.1,
-                "error": error.map(|e| format!("{e:?}")),
-            }))
-            .map_err(std::io::Error::other)?;
-            line.push(b'\n');
-            file.write_all(&line)?;
+            if !record.written {
+                // Read separately: the private append handle is write-only.
+                let mut reader = std::fs::File::open(path)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let opened = file.metadata()?;
+                    let read_meta = reader.metadata()?;
+                    if opened.dev() != read_meta.dev() || opened.ino() != read_meta.ino() {
+                        return Err(std::io::Error::other("audit file changed"));
+                    }
+                }
+                if reader.metadata()?.len() > 0 {
+                    reader.seek(SeekFrom::End(-1))?;
+                    let mut last = [0];
+                    reader.read_exact(&mut last)?;
+                    if last[0] != b'\n' {
+                        file.write_all(b"\n")?;
+                    }
+                }
+                file.write_all(&record.bytes)?;
+                record.written = true;
+            }
             file.sync_data()
         }
 
         fn retry_pending_audit(&mut self) {
             let pending = std::mem::take(&mut self.pending_audit);
-            for (event, id, bot, actor, error) in pending {
-                if self
-                    .audit_gateway_update(&event, &id, &bot, &actor, error)
-                    .is_err()
-                {
-                    self.pending_audit.push((event, id, bot, actor, error));
+            for mut record in pending {
+                if self.write_audit(&mut record).is_err() {
+                    self.pending_audit.push(record);
                 }
             }
         }
@@ -1220,18 +1253,14 @@ pub mod control {
                 let event = if failed { "failed" } else { "succeeded" };
                 // The request was recorded before it started; a failure to record the
                 // outcome cannot undo it, so it is only reported.
-                if self
-                    .audit_gateway_update(event, &op.id, &op.bot_id, actor, first_error)
-                    .is_err()
+                if let Ok(mut record) =
+                    Self::audit_record(event, &op.id, &op.bot_id, actor, first_error)
+                    && self.write_audit(&mut record).is_err()
                 {
-                    self.pending_audit.push((
-                        event.to_owned(),
-                        op.id.clone(),
-                        op.bot_id.clone(),
-                        actor.clone(),
-                        first_error,
-                    ));
-                    eprintln!("gateway-update の完了を監査に記録できません");
+                    self.pending_audit.push(record);
+                    eprintln!(
+                        "gateway-update の完了を監査に記録できません（保留して再試行します）"
+                    );
                 }
             }
         }
@@ -1500,7 +1529,8 @@ pub mod control {
             }
             match op.update_stage {
                 UpdateStage::Begin => match self.daemon.begin_gateway_update(&key, credentials) {
-                    Ok(()) => op.update_stage = UpdateStage::Warming,
+                    Ok(true) => op.update_stage = UpdateStage::Warming,
+                    Ok(false) => {}
                     Err(error) => {
                         op.errors.insert(key, error);
                         self.finish(op);
@@ -2123,6 +2153,58 @@ pub mod control {
             );
             assert!(unwritable.operations.is_empty());
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn audit_partial_tail_and_stable_retry_bytes() {
+            let dir = log_dir("audit-partial-tail");
+            let path = dir.join("audit.jsonl");
+            std::fs::write(&path, b"{partial").unwrap();
+            let mut plane = plane(1, 1);
+            let actor = ("subject".to_owned(), "admin".to_owned());
+            let mut record =
+                ControlPlane::audit_record("succeeded", "id", "bot", &actor, None).unwrap();
+            let bytes = record.bytes.clone();
+            plane.set_gateway_update_audit(dir.clone());
+            assert!(plane.write_audit(&mut record).is_err());
+            plane.pending_audit.push(record);
+            assert_eq!(plane.pending_audit[0].bytes, bytes);
+            plane.set_gateway_update_audit(path.clone());
+            plane.retry_pending_audit();
+            assert!(plane.pending_audit.is_empty());
+            let data = std::fs::read(&path).unwrap();
+            assert_eq!(&data[..9], b"{partial\n");
+            assert_eq!(&data[9..], bytes.as_slice());
+            serde_json::from_slice::<Value>(&data[9..]).unwrap();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn update_identify_cooldown_and_exhaustion() {
+            use crate::local_identify::{
+                LocalAdmission, LocalIdentifyPolicy, LocalIdentifyRegistry,
+            };
+            let now = std::time::Instant::now();
+            let mut registry = LocalIdentifyRegistry::with_policy(LocalIdentifyPolicy {
+                min_interval: Duration::from_secs(30),
+                window: Duration::from_secs(3600),
+                max_per_window: 3,
+            });
+            registry.record("bot", now);
+            assert!(matches!(
+                Daemon::<crate::supervisor::MonotonicClock>::gateway_update_identify_check(
+                    &registry, "bot", now
+                ),
+                LocalAdmission::Pending { .. }
+            ));
+            registry.record("bot", now);
+            assert!(matches!(
+                Daemon::<crate::supervisor::MonotonicClock>::gateway_update_identify_check(
+                    &registry, "bot", now
+                ),
+                LocalAdmission::Exhausted { .. }
+            ));
         }
 
         #[test]
@@ -3181,6 +3263,31 @@ impl<C: Clock> Daemon<C> {
         self.entries.values().any(|entry| entry.cores.is_some())
     }
 
+    #[cfg(unix)]
+    fn gateway_update_identify_check(
+        registry: &crate::local_identify::LocalIdentifyRegistry,
+        bot: &str,
+        now: std::time::Instant,
+    ) -> crate::local_identify::LocalAdmission {
+        use crate::local_identify::LocalAdmission;
+        let mut probe = registry.clone();
+        let first = probe.try_acquire(bot, now);
+        let when = match first {
+            LocalAdmission::Exhausted { .. } => return first,
+            LocalAdmission::Pending { retry_after } => {
+                match probe.try_acquire(bot, now + retry_after) {
+                    LocalAdmission::Granted => now + retry_after,
+                    other => return other,
+                }
+            }
+            LocalAdmission::Granted => now,
+        };
+        match probe.try_acquire(bot, when) {
+            LocalAdmission::Exhausted { retry_after } => LocalAdmission::Exhausted { retry_after },
+            _ => first,
+        }
+    }
+
     /// Starts a standby Gateway for `key` from the same program path (the operator has put
     /// the new build there). It logs in to Discord with its own session and holds events;
     /// it does not touch the Cores until `activate_gateway_update`.
@@ -3189,7 +3296,7 @@ impl<C: Clock> Daemon<C> {
         &mut self,
         key: &ShardKey,
         credentials: &impl CredentialSource,
-    ) -> Result<(), DaemonError> {
+    ) -> Result<bool, DaemonError> {
         tokio::runtime::Handle::try_current().map_err(|_| DaemonError::NoRuntime)?;
         let sequence = self
             .sequence
@@ -3209,14 +3316,11 @@ impl<C: Clock> Daemon<C> {
         if entry.mock_discord.is_none() {
             use crate::local_identify::LocalAdmission;
             let now = std::time::Instant::now();
-            let mut probe = self.local_identify.clone();
-            if probe.try_acquire(&entry.spec.bot_id, now) != LocalAdmission::Granted
-                || matches!(
-                    probe.try_acquire(&entry.spec.bot_id, now),
-                    LocalAdmission::Exhausted { .. }
-                )
+            match Self::gateway_update_identify_check(&self.local_identify, &entry.spec.bot_id, now)
             {
-                return Err(DaemonError::InvalidState);
+                LocalAdmission::Granted => {}
+                LocalAdmission::Pending { .. } => return Ok(false),
+                LocalAdmission::Exhausted { .. } => return Err(DaemonError::InvalidState),
             }
         }
         let spec = &entry.spec.gateway;
@@ -3297,7 +3401,7 @@ impl<C: Clock> Daemon<C> {
             active_marker,
             activated: None,
         });
-        Ok(())
+        Ok(true)
     }
 
     /// Where the standby Gateway is. A failure kills and forgets it.

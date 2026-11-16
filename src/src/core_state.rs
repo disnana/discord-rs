@@ -368,11 +368,16 @@ impl Persister {
             match tokio::task::spawn_blocking(move || allocate_stamp(&dir)).await {
                 Ok(Ok(stamp)) => Some(stamp),
                 Ok(Err(error)) => {
-                    eprintln!("??: ?????????????? (kind={:?})", error.kind());
+                    eprintln!(
+                        "警告: Coreの確認済み状態の保存を無効にしました（書き手の採番に失敗: kind={:?}）。この Gateway を再起動するまで、変更は保存されません",
+                        error.kind()
+                    );
                     None
                 }
                 Err(_) => {
-                    eprintln!("??: ?????????????? (???????)");
+                    eprintln!(
+                        "警告: Coreの確認済み状態の保存を無効にしました（書き手の採番が中断）。この Gateway を再起動するまで、変更は保存されません"
+                    );
                     None
                 }
             }
