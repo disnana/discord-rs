@@ -351,3 +351,65 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - Astra 第7回の 5 件（ed8f21d）、第8回の 1 件（2746d26）を修正。第9回の再監査は「NO FURTHER ACTIONABLE ISSUES」。main の試験用コードは 2746d26（以降はドキュメントのみ）。CI（Rust CI・systemd smoke）は green。`botctl_update_control` の stdin 書き込み競合による失敗が 1 回あり、再実行で通過（原因は未調査の既存の不安定さ）。
 - `work/next`（main には未反映）：2 シャードの更新中に Core が落ちるテスト（471606b、CI green、WSL で 3 回成功）、今後の作業案と質問 `docs/next-steps.md`（Astra の設計レビュー込み）。
 - 未検証：新版の Oracle 実機、複数シャード、B3、`!workers` の重複排除。
+## 2026-11-16：Oracle（aarch64）放置試験の結果（約 9 時間 50 分）
+
+**出典：ユーザーの報告（`soak-report` の要約）。私は生のログを見ていない。** 対象は 2026-11-15 の開始時の版（`src.zip` は main ba7b5f7 相当）で、2746d26 の新版ではない。
+
+- 稼働：2026-11-15 13:10:12 UTC 開始、最終スナップショット 23:00 UTC で約 9 時間 50 分。botd・Core 2 本・Gateway は PID 不変、`--core-mode separate`、Shard 1。プロセス再起動 0、`worker_unavailable` 0、REST unknown 0、journal 警告 0、`botctl` は Running・failures 0・restarts 0。
+- RSS（KiB）：5 時間 58 分／8 時間 44 分／9 時間 50 分で、botd 7,976／7,988／7,996、Core 0 は 6,168 のまま、Core 1 は 6,164 のまま、Gateway 11,268／11,384／11,384。fd は全スナップショットで不変（botd 16、Core 各 11、Gateway 12）。観測期間では、リークを示す単調増加は見られなかった。
+- Gateway：generations 1、login 1、closes は 4 → 6 → 7（5 時間 58 分／8 時間 44 分／9 時間 50 分）。
+- タイマー：`soak-3h`（19:08:20 UTC）と `soak-morning`（23:00:00 UTC）が実行され、`~/soak.log` に記録（11-15 夜に「出ていない」としていた件は、報告では解消）。
+
+**この結果から言えること（限定）**：単一 Shard・separate・約 10 時間の範囲で、メモリ・fd・再起動・警告の悪化は観測されなかった。
+
+**この結果では確認できていないこと（成功扱いにしない）**
+- **closes の原因は未確認。** 報告には「未使用時に切断されるのは仕様」とあるが、これは私の側では検証していない。`closes` が何を数えるか（切断か再接続か）、close code、再接続の成否は、`/var/lib/discord-rs/runtime/bot-313031/shard-0/gateway.log` を見ないと分からない（未回収）。Discord が通常の運用で空の接続を切るという前提も未確認。closes が増えるたびに Identify（1 時間 10 回の上限）を消費していないかも、このログからは分からない。
+- 2 シャード、Core／Gateway の障害注入、`gateway-update` の実機での長時間・繰り返しは、この試験の対象外。
+- **新版（2746d26）は未試験。** この結果を新版の合格として使わない。
+- `!count` が試験中ずっと続いていたか（返信の欠落・数の飛び）の記録は、報告に含まれない。
+- `systemctl show discord-rs` が inactive/dead だったのは、ユニット名の違いの可能性（報告）。正しいユニット名（`botd`）で `NRestarts` を確認した記録はスナップショット側にあるが、私は未確認。
+
+**残る実機確認**
+1. 新版の入れ替え（§5）と `update-check.sh`（1 シャード）。
+2. 新版での再度の放置（6 時間以上）。
+3. `gateway.log` の close code 確認（切断の原因、再接続、Identify 消費）。
+4. 複数シャード（両方のシャード ID に当たる通信が必要）。
+5. Interaction（スラッシュ）の重複。
+
+**次に優先する作業（`docs/next-steps.md` の見直しを反映）**：(a) 実機で新版の入れ替えと close code の確認、(b) CI の不安定なテストの原因調査、(c) `!workers` の重複排除と B3 の観測、(d) Core の無停止差し替え。(a) の結果で順序を変える。
+
+### 追記（2026-11-16、サーバーの実出力を確認）
+
+- **タイマー（解決）**：journal に `soak-3h`（19:08:20 UTC）と `soak-morning`（23:00:00 UTC）の起動・正常終了があり、`soak.log` に 19:08・21:54（手動）・23:00 の 3 件がある。11-15 夜に「16:14 などの定時が出ていない」としたのは、設定（開始 3 時間後と 23:00）と合わない私の読み違い。未解決の項目ではない。
+- **ユニット名**：`soak-report` の既定は `UNIT=botd`（`deploy/dev/soak-report.sh`）。`systemctl show discord-rs` が inactive/dead だったのは、存在しない名前を見たため。実際のサービスは `botd`（`NRestarts=0`、スナップショットで確認）。
+- **closes の意味**：`closes` は `gateway.log` 内の「Gateway 切断」を含む行の数（同スクリプト）。`gateway.log` は 9 時間 50 分で 324 バイト（5:58 で 228、8:44 で 292 バイト）しかなく、1 行は小さい。close code と再接続の結果は、この小さなファイルの中身で確認できる見込みだが、まだ貼られていない（今回の grep は存在しない `/var/log/discord-rs/` を見たため空）。**切断の原因は未確認のまま。**
+- 稼働中のプロセスは `ps` で PID 4147850／55／56／57、経過時間は 11-15 開始から継続（botd の引数に `--core-mode separate`）。
+
+### 追記（2026-11-16、`gateway.log` の中身）
+
+- 全文：`generation 1`、`ログイン成功` 1 回、その後 `Gateway 切断: close code 4000` が **10 回**（サーバーでの 2026-11-16 の確認時点。23:00 UTC の記録では 7 回で、その後に 3 回増えている）。他の致命的な close code（4004、4010〜4014 など）はない。
+- **解釈（Discord の一般的な仕様に基づく推測で、このログだけでは確認できない）**：4000 は「不明なエラー」で、Discord は再接続を許す（再開可能な）コードとされる。ログイン成功が 1 回のままなので、Gateway プロセスは終了せず、twilight が同じセッションで再接続（Resume）している可能性が高い。ただし **再接続の成功、Resume か新規 Identify か、切断中に落としたイベントの有無は、現在のログに出ないため未確認。**
+- 頻度：約 10 時間（開始から確認時点まで）に 10 回、およそ 1 時間に 1 回前後。Discord 側の都合による切断として珍しくはないが、原因はこのログからは分からない。切断のたびに新規 Identify を消費している証拠はない（`login=1`）が、これも直接の確認ではない。
+- **ログの不足（改善案、未実装）**：切断行に時刻がなく、再接続の成功・Resume の有無・切断から復帰までの時間が出ない。次の版で、切断と再接続の各行に時刻と結果（resumed／identify）を出すと、実機で原因を切り分けられる。
+
+## 2026-11-16 午後：新版（main 2746d26 のコード）の WSL 実機試験（実 Discord、separate、1 Shard）
+
+環境：WSL2 Ubuntu 24.04、release ビルド（`cargo build --release --locked -j 4`）、`botd --core-mode separate --stop-children-on-exit`、テスト用 Bot（Oracle と同じ token のため、Oracle の botd は事前に `systemctl stop` して停止）。ユーザーが `!count` を送って数と返信件数を確認。**実機の確認はこの 1 回の範囲で、再現性・長時間・複数 Shard は未確認。**
+
+| 項目 | 結果 |
+|---|---|
+| 起動 | ログイン成功、`!ping`・`!count`（61）が返る。Core 2 本、Gateway 1 本、親は botd |
+| `gateway-update`（1 回）`update-check.sh` | 全 PASS：Core PID 不変、Gateway 961→1105、旧 Gateway 消滅、IPC・マーカー・監査（requested→succeeded、約 1 秒）。`!count` 61→65 が連続 |
+| Gateway `kill -9` | 約 1.5 秒で再起動、Core 不変。**ログインの成功時間は未計測**（PID の出現のみ） |
+| Core 1 本 `kill -9`／2 本 `kill -9` | botd が再起動（約 6 秒／約 9〜11 秒）、Gateway 不変。`!count` 65→70 が連続（巻き戻りなし） |
+| botd `kill -9`（#6） | systemd が約 5 秒で再起動、Core・Gateway は新しい PID に入れ替わり、古い予約を整理。`!count` 70→73 が連続 |
+| `gateway-update` ×3（`--repeat 3`）| 全 PASS（各回 Core 不変、Gateway 1 本、RSS 10.7〜11.1 MB で増加なし）。`!count` 73→76 が連続 |
+| 更新中に Core 0 を `kill -9` | 更新は成功（約 1.5 秒）、Core 0 は botd が 1 本だけ再起動、Gateway 1 本。`!count` 76→79 が連続 |
+| `systemctl stop`（#5） | 0 秒、`Result=success`、残りプロセス 0、ipc に sock・secret なし、`core-state.json` は残る |
+
+- journal の警告 4 件は、私が行った botd の `kill -9` に対する systemd のメッセージ（WSL の cgroup の `Failed to kill control group … Invalid argument`）で、更新中の警告ではない。
+- 途中、WSL の botd が 15:54:11 に正常停止していた（原因は未確認。WSL の呼び出し終了の影響の可能性があるが推測）。端末を開いたままにしてからは再発していない。
+- 未確認：更新中の「重複の抑止」（今回の試験では重複返信は観察されなかったが、観察は `!count` の返信件数のみ）、複数 Shard、長時間、Interaction の重複、`!workers` の重複。
+- 試験後、WSL の botd は停止・無効のまま（Oracle で再開するため）。
+
+次：Oracle で新版を入れ替え（`docs/soak-test.md` §5）、新版の放置（6 時間以上）。

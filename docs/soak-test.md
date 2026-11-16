@@ -80,3 +80,9 @@ sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --secret-file 
 - 戻す：`.prev` を `mv` で元の名前に戻し、`sudo systemctl restart botd`（Bot は数秒止まる）。
 - `gateway-update` が `failed` になった場合は、旧 Gateway が再起動されて Bot は応答し続けるはず。`sudo -u discord-rs /opt/discord-rs/bin/botctl operation <操作ID> ...` と `gateway-update-audit.jsonl` の最後の行、`journalctl -u botd -n 100` を控える。
 - 更新中に同じ `!workers` が二重に返る可能性がある（既知の制限。`docs/known-limitations.md`）。`!count` / `!ping` の重複は Core 側で抑止される想定。
+
+## 6. 実施記録
+
+- **2026-11-15 13:10 UTC 〜 約 9 時間 50 分（Oracle aarch64、1 Shard、separate、旧版）**：再起動 0、worker_unavailable 0、REST unknown 0、journal 警告 0、RSS・fd に増加傾向なし（数値と限定は `docs/progress.md` の 2026-11-16 の節）。ユーザーの報告による。**`closes`（4 → 7）の原因は `gateway.log` の close code が未回収のため未確認。** 新版（2746d26）の放置は未実施。
+- 次回の記録欄：新版の入れ替え日時／`update-check.sh` の結果／再放置の時間と数値／`closes` の内訳。
+- **2026-11-16（WSL、実 Discord、新版）**：更新 ×4（うち 1 回は Core を落としながら）、Gateway・Core・botd の `kill -9`、`systemctl stop` を実施し、`!count` 61→79 が連続。詳細は `docs/progress.md`。Oracle での新版の入れ替えと再放置は未実施。
