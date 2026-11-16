@@ -75,7 +75,10 @@ impl Fixture {
             err.read_to_end(&mut v).unwrap();
             v
         });
-        child.stdin.take().unwrap().write_all(input).unwrap();
+        // The CLI may reject the request and close stdin before reading bootstrap.
+        if let Err(err) = child.stdin.take().unwrap().write_all(input) {
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
         let deadline = Instant::now() + Duration::from_secs(20);
         while child.try_wait().unwrap().is_none() {
             if Instant::now() >= deadline {

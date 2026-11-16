@@ -160,12 +160,16 @@ impl Fixture {
             .kill_on_drop(true);
         let mut child = program.spawn().unwrap();
         let bootstrap = json!({"port":self.port,"secret":SECRET});
-        let _ = child
+        // The CLI may reject the request and close stdin before reading bootstrap.
+        if let Err(err) = child
             .stdin
             .take()
             .unwrap()
             .write_all(format!("{bootstrap}\n").as_bytes())
-            .await;
+            .await
+        {
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
         let output = bounded(child.wait_with_output()).await.unwrap();
         assert!(output.stderr.is_empty());
         let text = String::from_utf8(output.stdout).unwrap();

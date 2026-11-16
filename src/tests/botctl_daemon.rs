@@ -286,12 +286,15 @@ async fn cli(port: u16, secret: [u8; 32], args: &[&str]) -> Output {
     let mut bootstrap = json!({"port": port, "secret": secret.to_vec()}).to_string();
     bootstrap.push('\n');
     // Rejected arguments may cause the CLI to close stdin before bootstrap.
-    let _ = child
+    if let Err(err) = child
         .stdin
         .take()
         .unwrap()
         .write_all(bootstrap.as_bytes())
-        .await;
+        .await
+    {
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
     bounded(child.wait_with_output()).await.unwrap()
 }
 
