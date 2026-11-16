@@ -1290,6 +1290,9 @@ async fn live_events(
                     let no_mentions = AllowedMentions::default();
                     if message.content.trim() == "!workers" {
                         let content = clamp_reply(&manager.describe_workers().await);
+                        if !manager.workers_reply_allowed().await {
+                            return;
+                        }
                         if !confirmed_response(
                             std::time::Duration::from_secs(10),
                             http.create_message(message.channel_id)

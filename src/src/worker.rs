@@ -1616,6 +1616,16 @@ impl ResponseGuard {
     }
 }
 
+/// How long `!workers` waits for a Core to answer its pre-reply Health probe.
+const WORKERS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn should_reply_to_workers(stopping: bool, connected: Option<bool>) -> bool {
+    if stopping {
+        return false;
+    }
+    connected.unwrap_or(true)
+}
+
 impl Manager {
     pub async fn worker_identities(&self) -> Vec<WorkerIdentity> {
         let mut identities = Vec::with_capacity(self.workers.len());
@@ -1649,6 +1659,36 @@ impl Manager {
             })
             .collect()
     }
+    /// Check attached Core connections without reconnecting or changing the IPC protocol.
+    /// A failed health exchange includes fencing, but can also mean an ordinary outage.
+    pub async fn workers_reply_allowed(&self) -> bool {
+        let stopping = || {
+            self.stopping.load(Ordering::Acquire) || self.reconnect_disabled.load(Ordering::Acquire)
+        };
+        if stopping() {
+            return should_reply_to_workers(true, None);
+        }
+        if !self.attached || self.workers.is_empty() {
+            return should_reply_to_workers(false, None);
+        }
+        for worker in &self.workers {
+            let probe = async {
+                let generation = worker.read().await.clone();
+                let mut process = generation.process.lock().await;
+                process.request(&Request::Health).await
+            };
+            match tokio::time::timeout(WORKERS_PROBE_TIMEOUT, probe).await {
+                // A busy connection (for example a stuck handler holding it) is not evidence of
+                // fencing, and a diagnostic command must not hang on the fault it diagnoses:
+                // keep today's behaviour and answer.
+                Err(_) => continue,
+                Ok(Ok(Response::Ready { .. })) => {}
+                Ok(_) => return should_reply_to_workers(stopping(), Some(false)),
+            }
+        }
+        should_reply_to_workers(stopping(), Some(true))
+    }
+
     pub async fn describe_workers(&self) -> String {
         let mut lines = vec!["稼働中のWorker:".to_string()];
         for (index, worker) in self.workers.iter().enumerate() {
@@ -4806,4 +4846,19 @@ pub async fn probe_attach(
         credential_free: process.credential_free,
         capabilities: process.supported_capabilities.clone(),
     })
+}
+
+#[cfg(test)]
+mod workers_reply_tests {
+    use super::should_reply_to_workers;
+
+    #[test]
+    fn workers_reply_decision_respects_shutdown_and_connection() {
+        assert!(should_reply_to_workers(false, None));
+        assert!(should_reply_to_workers(false, Some(true)));
+        assert!(!should_reply_to_workers(false, Some(false)));
+        for connected in [None, Some(true), Some(false)] {
+            assert!(!should_reply_to_workers(true, connected));
+        }
+    }
 }
