@@ -11,7 +11,7 @@
 
 証明書の leaf 切替・失効、永続ポリシーと CA チェーンを扱う部品はあるが、配布・本番運用への自動統合は保証されない。`update_rollback` と daemon 更新制御は実装され、capability による role / shard scope と監査を用いるが、実行できる更新には下記の制約がある。
 
-`src/tests/update_load.rs` の `continuous_events_during_updates_and_core_crashes` は受入基準未達の既知失敗として `#[ignore]`。実Discord smoke CLI（`src/src/bin/discord_smoke.rs`、`src/tests/discord_smoke/cli.rs`）の実接続はユーザーが実施する検証範囲。`stress.yml` と `bench.yml` は手動ワークフローである。[progress.md](progress.md) は過去の Linux CI 成功を記録するが、Windows はサポート外となったため Windows Actions 再確認は対象外。この文書更新では CI やテストを実行していない。
+`src/tests/update_load.rs` の `continuous_events_during_updates_and_core_crashes` は有効。`crash_old_core` は送信を一時停止し、それ以前の結果と Core 受領確認が揃ってから旧 Worker を落とす静止状態の障害試験に変更した。欠落ゼロの基準は維持するが、処理中の強制終了について欠落ゼロを保証する試験ではない。処理中の障害は別ケース `crash_old_core_busy`（`old_core_receipt_failure_keeps_gateway_running`）に分け、WSL／CI で安定性と総実行時間 30 秒未満を確認するまで `#[ignore]` とする。既存の `continuous_events_after_handler_outcome_unknown` も引き続き `#[ignore]`。今回の変更は未実行。実Discord smoke CLI（`src/src/bin/discord_smoke.rs`、`src/tests/discord_smoke/cli.rs`）の実接続はユーザーが実施する検証範囲。`stress.yml` と `bench.yml` は手動ワークフローである。[progress.md](progress.md) は過去の Linux CI 成功を記録するが、Windows はサポート外となったため Windows Actions 再確認は対象外。
 
 2026-11-12時点の実装と [progress.md](progress.md) に基づきます。[architecture.md](architecture.md) §16.2 の全条件は未達です。個々の条件と試験の根拠は [conformance.md](conformance.md) を参照してください。模擬試験や独立した部品の成功は、実Discord・実ネットワークでの保証ではありません。実Discordでの検証はユーザーが実施する範囲です。
 
@@ -44,6 +44,8 @@
 - botd が起動し直した空の Core へは、Gateway の確認済みスナップショット（`core-state.json`）を復元します（模擬の試験のみ）。確認済み以降の変化は失われ得ます。実 Discord での `!count` 継続は未確認です。
 
 ## Worker更新・配送・外部副作用
+
+- 第11回への対応（未ビルド・未試験）：模擬 Discord の各イベントで `ApiResult` の受領確認が失敗した場合は、`outcome=unknown`・`receipt=null` を返し、受信ループを終了させない。Manager に残る未解決の記録は消さず、正常終了を拒否する保護も維持する。実 Discord の経路は変更していない。busy 障害試験は HTTP 応答をゲートで止めて旧 Worker を落とし、不明結果、重複送信なし、Gateway の PID／世代継続、その後の通信、正常終了の拒否を検査する。未解決の旧世代が残るため、対象スロットの切替後もプール全体の更新完了は要求しない。Python fixture は 25 秒の watchdog を持つが、Rust 側の fixture 準備を含む総時間は未計測。
 
 - `manage` の更新は Gateway が所有する Worker プロセスの更新です。Gateway 自体の更新や、daemonからのShard単位ローリング更新ではありません。対応 capability を交渉した Worker は旧世代の処理・応答を保持しつつ新世代へ配送します。旧版との互換経路は直列切替です。任意のアプリ状態や Future は移行せず、snapshot 対象も限定されます。複数Workerの途中失敗では新旧混在があり、全体の自動rollbackはありません。
 - 結果不明の外部操作は自動再送しません。旧世代を保持して更新を失敗または未完了とする場合があり、結果不明の追跡は親の再起動で失われます。照合APIと読み取り用管理操作はありますが、永続監査や解除CLIはありません。reload の確認timeout後に処理が進む可能性もあります。

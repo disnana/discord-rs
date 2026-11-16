@@ -745,8 +745,12 @@ async fn mock_command(
                         Some(_) => "failed",
                         None => "unknown",
                     };
-                    let receipt = manager.finish_response(guard, api_outcome(status)).await?;
-                    (Some(content), outcome, Some(receipt))
+                    match manager.finish_response(guard, api_outcome(status)).await {
+                        Ok(receipt) => (Some(content), outcome, Some(receipt)),
+                        // finish_response leaves its dropped guard unresolved on failure.
+                        // Report this event without retrying REST or ending mock ingress.
+                        Err(_) => (Some(content), "unknown", None),
+                    }
                 }
                 Ok(None) => {
                     guard.confirm();
@@ -821,7 +825,12 @@ async fn mock_command(
                 )
             };
             let receipt = if dispatched {
-                Some(manager.finish_response(guard, api_outcome(status)).await?)
+                // As for prefix responses, retain uncertainty in the Manager and report
+                // it per event. A missing Core receipt is not a collector failure.
+                manager
+                    .finish_response(guard, api_outcome(status))
+                    .await
+                    .ok()
             } else if outcome == src::interaction_flow::Outcome::Completed {
                 guard.confirm();
                 None
@@ -832,7 +841,9 @@ async fn mock_command(
             };
             (
                 content,
-                if dispatched {
+                if dispatched && receipt.is_none() {
+                    "unknown"
+                } else if dispatched {
                     match status {
                         Some(200..=299) => "completed",
                         Some(_) => "failed",

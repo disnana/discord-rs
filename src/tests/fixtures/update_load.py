@@ -23,7 +23,8 @@ import time
 import uuid
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-CASES = ("core_series", "gateway_switch", "crash_old_core", "crash_new_core", "crash_new_core_after_handler")
+CASES = ("core_series", "gateway_switch", "crash_old_core", "crash_old_core_busy",
+         "crash_new_core", "crash_new_core_after_handler")
 OPERATION_ERRORS = {"Gateway control acknowledgement identity mismatch", "Gateway acknowledgement state mismatch",
                     "local authority expired", "local lease expired", "Gateway or its control connection exited",
                     "Gateway process exited", "Gateway exited abnormally before stop", "Gateway recovery requires operator review",
@@ -56,7 +57,7 @@ def emit(value):
     print(json.dumps(value, separators=(",", ":")), flush=True)
 
 
-def http_fixture():
+def http_fixture(gate=None):
     """One endpoint per serial Gateway; correlate PATCH with its preceding ACK.
 
     The mock Gateway serializes commands. Never use this correlation scheme for
@@ -88,6 +89,19 @@ def http_fixture():
                 event_id, kind, status = Handler.last_slash, "effect", 200
             if kind == "effect" and body.get("content") != "Pong! 🦀":
                 kind = "failed_effect"
+            # Busy-crash only: hold a slot-0 effect after its handler returned, before
+            # HTTP confirmation lets the Gateway send ApiResult to the old Worker.
+            if (gate is not None and kind == "effect"
+                    and (event_id ^ (event_id >> 22)) % 2 == 0
+                    and (gate / "armed").exists() and not (gate / "waiting").exists()):
+                temporary = gate / "waiting.tmp"
+                temporary.write_text(str(event_id), encoding="utf-8")
+                temporary.replace(gate / "waiting")
+                deadline = time.monotonic() + 5
+                while not (gate / "release").exists() and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                if not (gate / "release").exists():
+                    emit({"kind": "gate_timeout", "id": event_id, "ns": time.monotonic_ns()})
             # Small fixed service cost makes backlog visible without CPU spinning.
             time.sleep(0.004)
             self.send_response(status)
@@ -234,7 +248,20 @@ def violations(result):
     zero = ("missing_effects", "duplicate_effects", "unexpected_effects", "failed_effects", "order_inversions",
             "interaction_missing_ack", "interaction_duplicate_ack", "interaction_over_3s", "missing_results", "duplicate_results",
             "failed_results", "double_active_samples", "orphans", "harness_errors", "operation_failures")
+    if result["case"] == "crash_old_core_busy":
+        # Fault-window losses/failures are measured, not silently called successful.
+        # Every input still needs a result; all traffic after the handoff is checked below.
+        zero = ("duplicate_effects", "unexpected_effects", "missing_results", "duplicate_results",
+                "interaction_duplicate_ack", "double_active_samples", "orphans",
+                "harness_errors", "operation_failures")
     failures = [key for key in zero if result.get(key, 0) != 0]
+    if result["case"] == "crash_old_core_busy":
+        for key in ("uncertainty_reported", "gateway_continuity", "subsequent_traffic",
+                    "shutdown_rejected", "http_gate_completed"):
+            if not result.get("busy_checks", {}).get(key, False):
+                failures.append(key)
+        if result["elapsed_s"] >= 30:
+            failures.append("busy_runtime_budget")
     if result.get("sent", 0) < 20 or result.get("interactions", 0) < 10:
         failures.append("insufficient_load")
     if result.get("active_samples", 0) == 0:
@@ -320,7 +347,10 @@ class Gateway:
         self.done = False
         self.status = self.ready
         self.observe_workers(self.ready)
-        self.http = spawn([sys.executable, "-u", __file__, "--http-fixture"],
+        http_args = [sys.executable, "-u", __file__, "--http-fixture"]
+        if owner.busy:
+            http_args += ["--http-gate", str(owner.http_gate)]
+        self.http = spawn(http_args,
                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         owner.processes.append(self.http)
         owner.pids.add(self.http.pid)
@@ -386,6 +416,16 @@ class Run:
         self.pids, self.processes, self.gateways = set(), [], []
         self.active_samples = self.double_active = self.send_errors = self.background_errors = 0
         self.stop = threading.Event()
+        self.production_enabled = threading.Event()
+        self.production_enabled.set()
+        self.production_lock = threading.Lock()
+        self.status_probe = 1 << 63
+        self.busy = options.case == "crash_old_core_busy"
+        self.busy_checks = {}
+        self.http_gate = self.root / "http-gate"
+        if self.busy:
+            self.http_gate.mkdir()
+        self.deadline_seconds = 25 if self.busy else 75
         self.port, self.daemon = None, None
         self.changes, self.faults, self.errors = [], [], []
         self.operation_failures = []
@@ -466,29 +506,60 @@ class Run:
     def produce(self):
         event_id, deadline = 0, time.monotonic()
         while not self.stop.is_set():
-            event_id += 1
-            self.sent[event_id] = {"slash": event_id % 2 == 0, "ns": time.monotonic_ns()}
-            # Broadcast to all currently connected sessions; never choose Active
-            # in the harness or retry a suppressed/failed event.
-            for gateway in list(self.gateways):
-                if gateway.done:
+            if not self.production_enabled.is_set():
+                self.production_enabled.wait(0.05)
+                deadline = time.monotonic()  # Paused time must not cause a catch-up burst.
+                continue
+            with self.production_lock:
+                if not self.production_enabled.is_set():
                     continue
-                slash = event_id % 2 == 0
-                value = {"type": "slash" if slash else "prefix", "id": event_id,
-                         "key": event_id, "rest_addr": gateway.addr}
-                if self.rolling:
-                    # Stable semantic identity across both mock sessions for
-                    # the local admission barrier; it does not select Core/Shard.
-                    value["event_id"] = event_id
-                value["name" if slash else "content"] = "ping" if slash else "!ping"
-                try:
-                    gateway.send(value)
-                    if event_id % 5 == 0:
-                        gateway.send({"type": "status", "id": 0})
-                except OSError:
-                    self.send_errors += 1
+                event_id += 1
+                self.sent[event_id] = {"slash": event_id % 2 == 0, "ns": time.monotonic_ns()}
+                # Broadcast to all connected sessions, without choosing Active or replaying.
+                for gateway in list(self.gateways):
+                    if gateway.done:
+                        continue
+                    slash = event_id % 2 == 0
+                    value = {"type": "slash" if slash else "prefix", "id": event_id,
+                             "key": event_id, "rest_addr": gateway.addr}
+                    if self.rolling:
+                        value["event_id"] = event_id
+                    value["name" if slash else "content"] = "ping" if slash else "!ping"
+                    try:
+                        gateway.send(value)
+                        if event_id % 5 == 0:
+                            gateway.send({"type": "status", "id": 0})
+                    except OSError:
+                        self.send_errors += 1
             deadline += 1 / self.options.rate
             self.stop.wait(max(0, deadline - time.monotonic()))
+
+    def pause_production(self):
+        self.production_enabled.clear()
+        # Acknowledged pause: no send or sent-ID registration can cross this boundary.
+        if not self.production_lock.acquire(timeout=3):
+            raise TimeoutError("producer pause deadline")
+        self.production_lock.release()
+
+    def wait_receipts(self, ids):
+        eventually(lambda: ids.issubset({row["id"] for row in list(self.replies)
+                                        if row.get("outcome") == "completed" and row.get("receipt")}),
+                   seconds=5)
+
+    def gateway_continuity(self, gateway):
+        self.status_probe += 1
+        probe = self.status_probe
+        gateway.send({"type": "status", "id": probe})
+        # Wait for this response, not an earlier periodic status sample.
+        status = eventually(lambda: gateway.status if gateway.status.get("id") == probe else None,
+                            seconds=5)
+        assert not gateway.done and status["pid"] == gateway.ready["pid"]
+        processes = self.request("status", bot="load")["status"]["processes"]
+        assert len(processes) == 1
+        assert processes[0]["identity"]["pid"] == gateway.ready["pid"]
+        assert processes[0]["identity"]["generation"]["sequence"] == 1
+        assert processes[0]["restarts"] == 0
+        return status
 
     def relay(self, name, mode):
         path = self.root / (name + self.options.relay.suffix)
@@ -515,6 +586,60 @@ class Run:
                     self.errors.append("unreadable_final_process_marker")
                 continue  # writer may still own the newly created record
             self.pids.update((value["relay_pid"], value["worker_pid"]))
+
+    def busy_old_core(self, gateway):
+        before = len(self.sent)
+        started = time.monotonic_ns()
+        old = gateway.ready["workers"][0]["pid"]
+        path = self.relay("busy-fault-core", "hold-restore")
+        self.publish(gateway, path)
+        eventually(lambda: list(self.root.glob(path.name + ".*.restored")), seconds=5)
+        self.discover_relays()
+        (self.http_gate / "armed").touch()
+        try:
+            eventually(lambda: (self.http_gate / "waiting").exists(), seconds=5)
+            event_id = int((self.http_gate / "waiting").read_text(encoding="utf-8"))
+            assert event_id in self.sent and old in self.pids and live(old)
+            kill_owned(old)
+            self.faults.append({"target": "old_worker", "pid": old, "id": event_id,
+                                "ns": time.monotonic_ns(), "stage": "http_reply_before_core_receipt"})
+        finally:
+            Path(str(path) + ".release").touch()
+            (self.http_gate / "release").touch()
+        self.faults[-1]["release_ns"] = time.monotonic_ns()
+        uncertain = eventually(lambda: next((row for row in list(self.replies)
+                                            if row["id"] == event_id), None), seconds=5)
+        self.busy_checks["uncertainty_reported"] = (
+            uncertain["outcome"] == "unknown" and uncertain.get("receipt") is None
+            and uncertain.get("unknown_responses", 0) > 0)
+        # Unknown old receipts intentionally prevent a clean *pool* update. Prove
+        # routing committed for the affected slot without requiring a success marker.
+        eventually(lambda: gateway.status["workers"][0]["pid"] != old, seconds=5)
+        self.changes.append({"kind": "legacy_worker_slot", "revision": 1,
+                             "start_ns": started, "end_ns": time.monotonic_ns(),
+                             "events_during": len(self.sent) - before})
+        with self.production_lock:
+            after = max(self.sent)
+        eventually(lambda: sum(row["id"] > after and row.get("outcome") == "completed"
+                               and bool(row.get("receipt")) for row in list(self.replies)) >= 20,
+                   seconds=5)
+        self.pause_production()
+        post = {event_id for event_id in self.sent if event_id > after}
+        self.wait_receipts(post)
+        status = self.gateway_continuity(gateway)
+        self.busy_checks["gateway_continuity"] = status["unknown_responses"] > 0
+        # HTTP evidence is collected on a different pipe: await it explicitly.
+        eventually(lambda: post.issubset({row["id"] for row in list(self.observations)
+                                         if row["kind"] == "effect"}), seconds=3)
+        subsequent = metrics({key: self.sent[key] for key in post},
+                             [row for row in self.observations if row["id"] in post],
+                             [row for row in self.replies if row["id"] in post])
+        self.busy_checks["subsequent_traffic"] = len(post) >= 20 and all(
+            subsequent[key] == 0 for key in ("missing_effects", "failed_effects", "duplicate_effects",
+                                            "missing_results", "failed_results", "duplicate_results",
+                                            "interaction_missing_ack", "interaction_over_3s"))
+        self.busy_checks["http_gate_completed"] = not any(
+            row["kind"] == "gate_timeout" for row in self.observations)
 
     def scenarios(self):
         gateway = self.gateways[0]
@@ -549,7 +674,14 @@ class Run:
                 self.discover_relays()
                 self.changes.append({"kind": "legacy_worker_pool", "revision": index + 1,
                                      "start_ns": started, "end_ns": time.monotonic_ns(), "events_during": len(self.sent) - before})
+        elif self.busy:
+            self.busy_old_core(gateway)
         else:
+            quiescent = self.options.case == "crash_old_core"
+            if quiescent:
+                self.pause_production()
+                self.wait_receipts(set(self.sent))
+                self.gateway_continuity(gateway)
             before = len(self.sent)
             started = time.monotonic_ns()
             old = gateway.status["workers"][0]["pid"]
@@ -577,8 +709,17 @@ class Run:
                                     "stage": "before_restore_reply" if mode == "crash-restore" else "after_handler_before_result", "restores": len(restored)})
             eventually(lambda: status.exists() and status.read_text() == str(path))
             self.changes.append({"kind": "legacy_worker_pool", "revision": 1,
-                                 "start_ns": started, "end_ns": time.monotonic_ns(), "events_during": len(self.sent) - before})
+                                 "start_ns": started, "end_ns": time.monotonic_ns(),
+                                 "events_during": len(self.sent) - before, "quiescent": quiescent})
+            if quiescent:
+                assert len(self.sent) == before, "production crossed the quiescent boundary"
+                self.gateway_continuity(gateway)
+                self.production_enabled.set()
         time.sleep(1)
+        if self.options.case == "crash_old_core":
+            self.pause_production()
+            self.wait_receipts(set(self.sent))
+            self.gateway_continuity(gateway)
 
     def shutdown(self):
         self.stop.set()
@@ -602,7 +743,18 @@ class Run:
         try:
             if self.port:
                 self.stage = "stop"
-                self.finish_operation(self.begin("stop"))
+                operation = self.begin("stop")
+                if self.busy:
+                    stopped = eventually(lambda: self.operation_done(operation), seconds=5)
+                    # This expected rejection proves we did not resolve the unknown receipt
+                    # merely to keep ingress alive. Other management failures still fail.
+                    rejected = eventually(lambda: any(
+                        "unresolved response outcomes prevent graceful shutdown"
+                        in path.read_text(encoding="utf-8", errors="replace")
+                        for path in self.root.rglob("gateway.log")), seconds=3)
+                    self.busy_checks["shutdown_rejected"] = stopped["state"] == "failed" and rejected
+                else:
+                    self.finish_operation(operation)
         except OperationFailed:
             pass
         except Exception as error:
@@ -668,12 +820,13 @@ class Run:
                     kill_owned(pid)
             except OSError:
                 pass
-        (self.root / "watchdog.json").write_text(json.dumps({"failure": "75s_harness_deadline"}))
+        (self.root / "watchdog.json").write_text(
+            json.dumps({"failure": f"{self.deadline_seconds}s_harness_deadline"}))
         os._exit(2)
 
     def execute(self):
         started = time.monotonic()
-        watchdog = threading.Timer(75, self.watchdog)
+        watchdog = threading.Timer(self.deadline_seconds, self.watchdog)
         watchdog.daemon = True
         watchdog.start()
         assert live(os.getpid()), "PID probe positive control"
@@ -692,7 +845,7 @@ class Run:
         result = metrics(self.sent, self.observations, self.replies)
         result.update(case=self.options.case, rate_hz=self.options.rate,
                       elapsed_s=round(time.monotonic() - started, 3), changes=self.changes,
-                      faults=self.faults, active_samples=self.active_samples,
+                       faults=self.faults, active_samples=self.active_samples, busy_checks=self.busy_checks,
                       double_active_samples=self.double_active, orphans=None if remaining is None else len(remaining),
                       send_errors=self.send_errors, harness_errors=len(self.errors) + self.background_errors,
                       operation_failures=len(self.operation_failures), management_failures=self.operation_failures,
@@ -708,7 +861,8 @@ class Run:
             result["violations"].append("worker_switch_count")
         if self.options.case.startswith("crash_") and not self.faults:
             result["violations"].append("fault_not_observed")
-        if any(change["events_during"] == 0 for change in self.changes):
+        if any(change["events_during"] == 0 and not change.get("quiescent", False)
+               for change in self.changes):
             result["violations"].append("no_load_during_change")
         result["environment"] = {"platform": platform.platform(), "python": platform.python_version()}
         result["active_observation_scope"] = "routed_slots_and_acknowledged_gateway_transitions" if self.rolling else "routed_worker_slots_only"
@@ -729,13 +883,14 @@ class Run:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--http-fixture", action="store_true")
+    parser.add_argument("--http-gate", type=Path)
     parser.add_argument("--case", choices=CASES)
     for name in ("botd", "gateway", "relay", "output"):
         parser.add_argument("--" + name, type=Path)
     parser.add_argument("--rate", type=float, default=40)
     options = parser.parse_args()
     if options.http_fixture:
-        http_fixture()
+        http_fixture(options.http_gate)
         return 0
     if not options.case or any(getattr(options, key) is None for key in ("botd", "gateway", "relay", "output")):
         parser.error("case, botd, gateway, relay and output are required")

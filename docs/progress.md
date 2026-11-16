@@ -457,3 +457,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 - 発見：`botctl gateway-update` の待ちが 30 秒で、2 シャードの更新（約 31 秒）では `operation wait timed out; operation may continue` と `ok:false`、終了コード 1 を返した。操作は継続して `succeeded`。操作 ID で照会すれば成功と分かる。**改善案（未実装）**：待ち時間をシャード数に応じて延ばす（例：30 秒 ×シャード数）。
 - 未確認：更新中の Core 障害を 2 シャードで、botd の `kill -9`、`systemctl stop`、3 シャード以上、長時間。`update-check.sh` は 1 シャード前提で、2 シャードでは使っていない（手動で同等の確認をした）。
+
+### 2026-11-16 夜：`crash_old_core` の修正の検証（Astra が実装、私が検証）
+
+- Astra の実行は途中で `code-mode host closed its stdout` のエラーで止まった（最終報告なし）。ディスクの差分を私が確認して引き継いだ（`update_load.py`・`update_load.rs`・`main.rs` のモック経路・docs）。
+- 検証（WSL）：clippy 警告なし、`update_load` 3 件成功。`crash_old_core` は静止状態（送信を止め、全結果と受領を待ってから旧 Worker を落とす）に変更。新ケース `crash_old_core_busy`（処理中に落とす）は 3 回成功（各約 5.5 秒、欠落 0、重複 0、`failed_results` 1＝結果不明を明示、Gateway は継続）。`#[ignore]` を外し、CI での安定を観察する。不安定なら `#[ignore]` に戻す。
+- モックの経路は、ACK の失敗を 1 件ごとの「結果不明」にして取り込みループを止めない。`Manager::shutdown` の安全装置は変えていない。本番（live）経路と separate モードは変更なし。
+- 未確認：CI での連続した成功。

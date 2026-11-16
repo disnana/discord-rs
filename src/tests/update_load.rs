@@ -167,6 +167,8 @@ async fn reserved_delivery_survives_shutdown_admission_barrier() {
         .unwrap();
 }
 
+/// crash_old_core pauses ingress and drains receipts before the injected kill;
+/// the other cases retain continuous load during their transitions.
 #[test]
 fn continuous_events_during_updates_and_core_crashes() {
     run_load_cases(&[
@@ -175,6 +177,14 @@ fn continuous_events_during_updates_and_core_crashes() {
         "crash_old_core",
         "crash_new_core",
     ]);
+}
+
+/// Gate an old Core's HTTP reply before its ApiResult receipt, then prove that
+/// uncertainty does not end ingress or permit duplicate replay. The fixture has
+/// a 25-second watchdog. Stable 3/3 on WSL (about 5.5 s); CI stability is being observed.
+#[test]
+fn old_core_receipt_failure_keeps_gateway_running() {
+    run_load_cases(&["crash_old_core_busy"]);
 }
 
 /// After handler execution and before result delivery, the outcome must be
