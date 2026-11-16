@@ -1616,7 +1616,8 @@ impl ResponseGuard {
     }
 }
 
-/// How long `!workers` waits for a Core to answer its pre-reply Health probe.
+/// How long `!workers` waits to ACQUIRE a Core connection for its pre-reply Health probe
+/// (not how long the exchange itself may take: that is never cancelled).
 const WORKERS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn should_reply_to_workers(stopping: bool, connected: Option<bool>) -> bool {
@@ -1672,18 +1673,26 @@ impl Manager {
             return should_reply_to_workers(false, None);
         }
         for worker in &self.workers {
-            let probe = async {
-                let generation = worker.read().await.clone();
-                let mut process = generation.process.lock().await;
-                process.request(&Request::Health).await
+            // Bound only the ACQUISITION of the generation and of the connection lock. A busy
+            // connection (for example a stuck handler holding it) is not evidence of fencing, and
+            // a diagnostic command must not hang on the fault it diagnoses: keep today's
+            // behaviour and answer. Once the Health exchange has started it is never cancelled
+            // from here (cancelling it would mark the connection broken and force a reconnect
+            // while an HTTP result's Core receipt may be outstanding); it runs to completion
+            // under the connection's own IPC deadline.
+            let Ok(generation) = tokio::time::timeout(WORKERS_PROBE_TIMEOUT, worker.read()).await
+            else {
+                continue;
             };
-            match tokio::time::timeout(WORKERS_PROBE_TIMEOUT, probe).await {
-                // A busy connection (for example a stuck handler holding it) is not evidence of
-                // fencing, and a diagnostic command must not hang on the fault it diagnoses:
-                // keep today's behaviour and answer.
-                Err(_) => continue,
-                Ok(Ok(Response::Ready { .. })) => {}
-                Ok(_) => return should_reply_to_workers(stopping(), Some(false)),
+            let generation = generation.clone();
+            let Ok(mut process) =
+                tokio::time::timeout(WORKERS_PROBE_TIMEOUT, generation.process.lock()).await
+            else {
+                continue;
+            };
+            match process.request(&Request::Health).await {
+                Ok(Response::Ready { .. }) => {}
+                _ => return should_reply_to_workers(stopping(), Some(false)),
             }
         }
         should_reply_to_workers(stopping(), Some(true))

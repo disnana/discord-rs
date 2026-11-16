@@ -563,7 +563,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `update-check.sh`：空・数字でない・重複の `--shard` を終了コード 2 で拒否（以前は空だと全シャードの更新になった）。ローカルのシャード（`inspect` の processes）を基準に検証し、他のホストが持つシャードに引きずられない。WSL（実サービス）で、拒否の 3 種、範囲外（FAIL）、`--shard 0`（全 PASS）を確認。
 - 文書：「行単位で混ざる」の保証を削除（書式付きの出力は複数回の書き込みになり得る）。「2 シャードは実 Discord で未検証」と読める記述を、記録（WSL の実 Discord で 1 回確認、長時間・繰り返し・3 シャード以上は未検証）に合わせて訂正（known-limitations、operator-guide、handoff、real-separate-verification、next-steps、soak-test）。`~/soak.log`・相対パスの記述を `/home/ubuntu/soak.log` に。Haiku の洗い出し 10 件のうち、9 件は正しく反映し、1 件（`--all --yes` の Oracle での成功を WSL と取り違えたもの）は事実と合わないため反映しなかった。
 - 並行の作業（別 worktree、未統合）：`work/flake`（botctl 系テストの stdin の BrokenPipe の許容。WSL で 12 回成功。CI の確率的な失敗への効果は未確認）、`work/workers`（`!workers` を返す前に Core 接続を確認し、fence 済みの旧 Gateway は返信しない。Core が 2 秒で応答しないときは従来どおり返信。実 Discord での確認は未実施）。
-### 2026-11-16: `!workers` ? fence ??????
+### 2026-11-16 夜：`!workers` を、fence 済みの旧 Gateway が返信しないようにする小さい代案（work/next）
 
-- ? Core ????? Health ??????????????? `!workers` ??????????????? fence ?????????????? fence ????????
-- ?????????? epoch ?????????????????Cargo ??????????????????? Discord ?????????
+- `!workers` に返信する前に、各 Core 接続へ `Health` を送り、`Ready` なら返信、エラーなら返信しない（fence・切断・通常の障害を区別しない）。ロックの取得に 2 秒の期限があり、取れなければ従来どおり返信する。取得後の交換はキャンセルしない（Astra 第 17 回の指摘 1：期限内の途中キャンセルは接続を壊す）。停止中は返信しない、embedded は従来どおり。
+- **保証ではない**：fence 前の二重返信、確認と HTTP 送信の間の競合、Core の通常の障害中の無返信、タイムアウト時の返信は残る。exactly-once ではない。単体テストと `core_attach` の統合テストのみで、実 Discord での更新中の確認は未実施。
+- 経緯：この節と `docs/design-workers-dedupe.md` の追記は、Codex（Terra）が日本語を `?` に化かしていたため、私が書き直した（第 17 回の指摘 2。`grep '????'` の検査範囲に別 worktree の文書が入っていなかった見落とし）。
