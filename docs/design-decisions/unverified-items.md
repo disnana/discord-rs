@@ -34,7 +34,7 @@
 |---|---|---|
 | Discord の Identify の制限 | 「1 日 1000 回程度」「シャードごとに 5 秒に 1 回程度」 | Discord の公式ドキュメント（Gateway の Session Start Limit） |
 | discord.py の再試行の挙動 | 「429 は待って再試行、5xx と一部の接続切れは数回（5 回程度）再試行」 | discord.py の `http.py` を読む |
-| Discord の nonce と enforce_nonce | 「同じ印のメッセージは 1 通だけ作られる」 | Discord の公式ドキュメント（Create Message）と、使用している twilight の対応状況 |
+| Discord の nonce と enforce_nonce | 「同じ印のメッセージは 1 通だけ作られる」 | **twilight-http 0.18 には `enforce_nonce` がなく、`payload_json` で補える（ソースで確認済み）**。Discord が実際に重複を除くかは、公式ドキュメントまたは実機（2 回投稿して見る。投稿先と許可が要る）で確認 |
 | Reconnect の要求（op 7）が定期的に来る | Oracle の 1 件で確認。頻度の傾向は不明 | 放置の記録を増やす |
 
 ## 「不明」の設計上の論点（調べ・決めるもの）
