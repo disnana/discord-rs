@@ -4249,9 +4249,11 @@ impl<C: Clock> Daemon<C> {
             }
         }
         // The standby writes to the same `gateway.log` as every other Gateway of this shard
-        // (append mode, so the old and the new Gateway only interleave whole lines during the
-        // short overlap). One file means an operator reading `gateway.log` always sees the
-        // current Gateway; a separate candidate file left the live Gateway's output elsewhere.
+        // (append mode: each write lands whole at the end, but formatted output can take several
+        // writes, so during the short overlap the old and the new Gateway can interleave inside
+        // a line; no line-level guarantee is made). One file means an operator reading
+        // `gateway.log` always sees the current Gateway; a separate candidate file left the live
+        // Gateway's output elsewhere.
         let log = spec.management_path.parent().and_then(|dir| {
             let path = dir.join("gateway.log");
             crate::core_units::open_append_private(&path).ok()

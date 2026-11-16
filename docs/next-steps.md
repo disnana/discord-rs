@@ -71,7 +71,7 @@
 **実装済み（main e61d8d4 以降。実機の確認は `docs/progress.md` 2026-11-16 夜）**：
 - `botctl start|stop|restart|gateway-update BOT --shard N [--shard M ...]`（対象シャードの指定。認可も対象シャード単位）。
 - `--guild ID`（`(ギルド ID >> 22) % total_shards` で換算。`--shard` と併用で和集合。換算結果は `resolved_guilds`）。
-- `--all (--yes | --dry-run)`（全 Bot を 1 つずつ順に、最初の失敗で止まる。ローカルにシャードがない Bot は `skipped`）。`--yes` が必須。
+- `--all (--yes | --dry-run)`（全 Bot を 1 つずつ順に、最初の失敗で止まる。ローカルにシャードがない Bot は `skipped`）。`--yes` は実行のときに必須で（`--dry-run` と同時には使えない。対象の一覧だけを見るときは `--dry-run` のみ）。
 - `gateway-update` の既定の待ちは 300 秒。更新後のログは `gateway.log` に統一（work/next）。
 
 **未実装**：全体の進行の表示（Bot をまたぐ進み具合）、監査へのシャード指定の記録、スコープ付きの管理者の `--all`（`ps` が拒否されるため、いまは変更前に失敗する）、時間帯を決めた定期更新（スケジュール。別設計が必要）。ユーザーは「自動で順次」を、(a) 1 回の指示で全部を順に、と決定した（スケジュールは今回は含めない）。
