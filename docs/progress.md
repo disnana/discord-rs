@@ -464,3 +464,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 検証（WSL）：clippy 警告なし、`update_load` 3 件成功。`crash_old_core` は静止状態（送信を止め、全結果と受領を待ってから旧 Worker を落とす）に変更。新ケース `crash_old_core_busy`（処理中に落とす）は 3 回成功（各約 5.5 秒、欠落 0、重複 0、`failed_results` 1＝結果不明を明示、Gateway は継続）。`#[ignore]` を外し、CI での安定を観察する。不安定なら `#[ignore]` に戻す。
 - モックの経路は、ACK の失敗を 1 件ごとの「結果不明」にして取り込みループを止めない。`Manager::shutdown` の安全装置は変えていない。本番（live）経路と separate モードは変更なし。
 - 未確認：CI での連続した成功。
+
+### 追記（2026-11-16 夜）：2 シャードの残りの項目（WSL、実 Discord、別の Bot）
+
+- 更新中に Core を落とす：`gateway-update` の約 12 秒後にシャード 1 の Core を `kill -9`。更新は成功（約 31 秒、監査 requested→succeeded）、両 Gateway が入れ替わり、落とした Core だけが再起動、ほかの Core は不変、余分なプロセスなし、警告なし。
+- botd `kill -9`：systemd が約 5 秒で再起動。Core 4 本・Gateway 2 本が入れ替わり、両シャードの古い予約を整理。**再起動後の `!count` の継続は、Discord では確認していない**（続けて停止したため。プロセス面のみ確認）。
+- `systemctl stop`：0 秒、`Result=success`、残りプロセス 0、ipc に sock・secret なし、`core-state.json`（0600）は両シャードで残る。
+- 試験後、WSL の botd は停止（複数シャード用の設定のまま。`/etc/systemd/system/botd.service.d/zz-separate.conf` が `bots-multi.toml` を指す。旧 1 シャード用は `/root/zz-separate.conf.single-bak`）。
