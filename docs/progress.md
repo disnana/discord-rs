@@ -535,3 +535,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 ### 追記（2026-11-16 夜）：cron の記録の場所の取り違え（解決）
 
 - cron（`/etc/cron.d/soak-hourly`）は動いていた（journal に 09:00・10:00・11:00 UTC の `soak-report` の実行）。毎時の記録は `/home/ubuntu/soak.log` に溜まっていた。ユーザーが `sudo su` の root で `~/soak.log` を読んだため `/root/soak.log`（手動の記録だけ）を見ていた。私の案内が `~` を使っていたのが原因。手順書（`docs/soak-test.md`）と `deploy/dev/soak-diff.sh` の既定を、絶対パス `/home/ubuntu/soak.log` に直した。
+
+### 追記（2026-11-16 夜）：Oracle 放置（162112b、約 3 時間）の毎時の記録
+
+`/home/ubuntu/soak.log` の 09:00・10:00・11:00 UTC（botd 起動 08:05:43 UTC からの 54 分／1 時間 54 分／2 時間 54 分）。出典：ユーザーが貼った記録。
+- RSS（KiB）：botd 8,176→8,220→8,228、Core 6,248→6,252→6,252／6,232 のまま、Gateway 10,796→11,136→11,208。fd は botd 16・Core 各 11・Gateway 12 で不変。再起動 0、警告 0、`worker_unavailable` 0。Gateway は最初の 1 時間で約 400 KiB 増え、その後は小さい増加（傾向は 3 点のみで判断できない）。
+- `closes` は 10→11（09:53Z の Reconnect 要求＋Resume 成功の 1 件）。
+- 11:45Z に botd を最新版（e61d8d4）へ入れ替えたため、この記録は旧世代（162112b）の分。最新版の放置は 11:46:55Z（`--all` の更新）から。
