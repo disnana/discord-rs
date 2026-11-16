@@ -595,6 +595,17 @@ async fn gateway_update_can_be_restricted_to_one_shard() {
         "bot total_shards changed; resolve guilds again before retrying"
     );
     assert!(stale.get("operation").is_none());
+    let changed_identity = control(
+        fixture.port,
+        json!({"command":"gateway-update","bot":"101","operation_id":"00000000000000000000000000000006","shards":[1],"expect_bot_id":"removed-bot"}),
+    )
+    .await;
+    assert_eq!(changed_identity["ok"], false, "{changed_identity}");
+    assert_eq!(
+        changed_identity["error"],
+        "bot identity changed; refresh the bot list before retrying"
+    );
+    assert!(changed_identity.get("operation").is_none());
     // Empty and duplicate filters are invalid requests.
     for bad in [json!([]), json!([1, 1])] {
         let refused = control_or_closed(
@@ -630,7 +641,7 @@ async fn gateway_update_can_be_restricted_to_one_shard() {
     let id = "1111111111111111aaaaaaaaaaaaaaaa";
     let admitted = control(
         fixture.port,
-        json!({"command":"gateway-update","bot":"101","operation_id":id,"shards":[1],"expect_total_shards":2}),
+        json!({"command":"gateway-update","bot":"101","operation_id":id,"shards":[1],"expect_total_shards":2,"expect_bot_id":"101"}),
     )
     .await;
     assert_eq!(admitted["ok"], true, "{admitted}");

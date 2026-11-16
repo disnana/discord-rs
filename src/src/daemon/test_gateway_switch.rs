@@ -2167,6 +2167,12 @@ impl Runtime {
     }
 
     pub fn request(&self, request: &CommandRequest) -> Value {
+        if request.shards.is_some()
+            || request.expect_total_shards.is_some()
+            || request.expect_bot_id.is_some()
+        {
+            return json!({"ok":false,"error":"shard filters and target preconditions are unsupported in mock rolling mode"});
+        }
         let mut shared = self.shared.lock().unwrap();
         if matches!(
             request.command.as_str(),
@@ -2688,6 +2694,31 @@ mod update_tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         assert!(runtime.shared.lock().unwrap().operations.is_empty());
+    }
+
+    #[test]
+    fn legacy_commands_refuse_shard_filters_and_target_preconditions() {
+        let (runtime, mut receivers, _) = fixture();
+        for field in ["shards", "expect_total_shards", "expect_bot_id"] {
+            let mut value = json!({"command":"stop","bot":"101/0",
+                "operation_id":"0123456789abcdef0123456789abcdef"});
+            value[field] = match field {
+                "shards" => json!([1]),
+                "expect_total_shards" => json!(2),
+                _ => json!("101"),
+            };
+            let request: CommandRequest = serde_json::from_value(value).unwrap();
+            assert!(request.valid());
+            assert_eq!(
+                runtime.request(&request)["error"],
+                "shard filters and target preconditions are unsupported in mock rolling mode"
+            );
+            assert!(runtime.shared.lock().unwrap().operations.is_empty());
+            assert!(receivers.iter_mut().all(|receiver| matches!(
+                receiver.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            )));
+        }
     }
 
     #[test]

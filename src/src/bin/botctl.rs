@@ -43,6 +43,8 @@ struct Options {
     /// stopping at the first failure. Needs `--yes` (or `--dry-run` to only list the targets).
     all: bool,
     all_dry_run: bool,
+    /// Only populated from the `--all` snapshot, never a fuzzy identity.
+    expect_bot_id: Option<String>,
 }
 
 fn valid_operation_id(value: &str) -> bool {
@@ -290,6 +292,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             guilds: Vec::new(),
             all: false,
             all_dry_run: false,
+            expect_bot_id: None,
         });
     }
     if out.is_some() {
@@ -405,6 +408,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         guilds,
         all,
         all_dry_run: all && dry_run,
+        expect_bot_id: None,
     })
 }
 
@@ -430,6 +434,8 @@ struct Request<'a> {
     shards: Option<&'a [u32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     expect_total_shards: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expect_bot_id: Option<&'a str>,
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(
@@ -722,28 +728,54 @@ async fn run(options: Options) -> Value {
 struct AllTarget {
     bot_id: String,
     name: String,
+    selector: String,
 }
 
 /// Split the daemon's Bot list into the Bots that have local Shards (the targets, in listing
 /// order) and the ones that do not (reported as skipped, never silently dropped).
-fn plan_all(bots: &[Value]) -> (Vec<AllTarget>, Vec<Value>) {
+fn plan_all(bots: &[Value]) -> Result<(Vec<AllTarget>, Vec<Value>), String> {
+    // Resolve against the complete listing, including non-local Bots, exactly as
+    // botref::resolve does: name equality OR ID prefix, with no exact-match priority.
+    // Finish planning every target before sending the first mutation.
+    if bots.iter().any(|bot| {
+        bot["bot_id"].as_str().is_none_or(|id| id.is_empty())
+            || bot["name"].as_str().is_none_or(|name| name.is_empty())
+    }) {
+        return Err("invalid bot list; nothing was changed".into());
+    }
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
-    for bot in bots {
-        let (Some(bot_id), name) = (bot["bot_id"].as_str(), bot["name"].as_str().unwrap_or(""))
-        else {
-            continue;
-        };
+    for (index, bot) in bots.iter().enumerate() {
+        let bot_id = bot["bot_id"].as_str().expect("validated Bot ID");
+        let name = bot["name"].as_str().expect("validated Bot name");
         if bot["status"].as_str() == Some("not_local") {
             skipped.push(json!({"bot_id": bot_id, "name": name, "reason": "not_local"}));
         } else {
+            let selector = [name, bot_id]
+                .into_iter()
+                .find(|query| {
+                    let mut matches = bots.iter().enumerate().filter(|(_, candidate)| {
+                        candidate["name"].as_str() == Some(*query)
+                            || candidate["bot_id"]
+                                .as_str()
+                                .is_some_and(|id| id.starts_with(*query))
+                    });
+                    matches.next().is_some_and(|(matched, _)| matched == index)
+                        && matches.next().is_none()
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "no unambiguous selector for Bot {name} ({bot_id}); give Bots unique names that do not collide with ID prefixes; nothing was changed"
+                    )
+                })?;
             targets.push(AllTarget {
                 bot_id: bot_id.to_owned(),
                 name: name.to_owned(),
+                selector: selector.to_owned(),
             });
         }
     }
-    (targets, skipped)
+    Ok((targets, skipped))
 }
 
 /// Run `run_one` for each target in order and stop at the first failure. A Bot is finished
@@ -814,6 +846,7 @@ async fn run_all_loaded(
         yes: false,
         shards: None,
         expect_total_shards: None,
+        expect_bot_id: None,
     };
     let response = match timeout_at(list_deadline, exchange(bootstrap, &listing)).await {
         Ok(Ok(response)) => response,
@@ -830,7 +863,10 @@ async fn run_all_loaded(
             None,
         );
     };
-    let (targets, skipped) = plan_all(bots);
+    let (targets, skipped) = match plan_all(bots) {
+        Ok(plan) => plan,
+        Err(error) => return failure(&error, None, None),
+    };
     let listed: Vec<Value> = targets
         .iter()
         .map(|target| json!({"bot_id": target.bot_id, "name": target.name}))
@@ -849,7 +885,8 @@ async fn run_all_loaded(
         let mut one = options.clone();
         one.all = false;
         one.all_dry_run = false;
-        one.bot = Some(target.bot_id);
+        one.bot = Some(target.selector);
+        one.expect_bot_id = Some(target.bot_id);
         // `--yes` here confirmed `--all` itself; a Bot only receives it for a forced stop.
         one.yes = one.force;
         one.operation_id = None;
@@ -934,6 +971,7 @@ async fn run_live_inner(
             yes: false,
             shards: None,
             expect_total_shards: None,
+            expect_bot_id: None,
         };
         let response = match timeout_at(deadline, exchange(bootstrap, &inspect)).await {
             Ok(Ok(response)) => response,
@@ -981,6 +1019,7 @@ async fn run_live_inner(
             yes: false,
             shards: None,
             expect_total_shards: None,
+            expect_bot_id: None,
         };
         let response = match timeout_at(deadline, exchange(bootstrap, &inspect)).await {
             Ok(Ok(response)) => response,
@@ -1020,6 +1059,7 @@ async fn run_live_inner(
         yes: options.yes,
         shards: (!options.shards.is_empty()).then_some(options.shards.as_slice()),
         expect_total_shards,
+        expect_bot_id: options.expect_bot_id.as_deref(),
     };
     let mut last = None;
     let mut send_update = update.is_some();
@@ -1105,6 +1145,7 @@ async fn run_live_inner(
             request.yes = false;
             request.shards = None;
             request.expect_total_shards = None;
+            request.expect_bot_id = None;
             send_update = false;
         } else {
             let valid = match options.command {
@@ -1368,9 +1409,8 @@ mod default_wait_tests {
             json!({"bot_id": "1", "name": "a", "status": "running"}),
             json!({"bot_id": "2", "name": "b", "status": "not_local"}),
             json!({"bot_id": "3", "name": "c", "status": "degraded"}),
-            json!({"name": "no-id"}),
         ];
-        let (targets, skipped) = plan_all(&bots);
+        let (targets, skipped) = plan_all(&bots).unwrap();
         assert_eq!(
             targets
                 .iter()
@@ -1390,6 +1430,7 @@ mod default_wait_tests {
             .map(|id| AllTarget {
                 bot_id: (*id).into(),
                 name: format!("bot{id}"),
+                selector: format!("bot{id}"),
             })
             .collect();
         let seen = std::sync::Mutex::new(Vec::new());
@@ -1448,6 +1489,42 @@ mod default_wait_tests {
         assert_eq!((results.len(), stopped), (3, None));
     }
 
+    #[test]
+    fn all_plans_unambiguous_names_before_id_prefixes() {
+        let bots = vec![
+            json!({"bot_id": "101", "name": "alpha"}),
+            json!({"bot_id": "1010", "name": "beta"}),
+        ];
+        let (targets, _) = plan_all(&bots).unwrap();
+        assert_eq!(targets[0].selector, "alpha");
+        assert_eq!(targets[1].selector, "beta");
+        assert_eq!(targets[0].bot_id, "101");
+        assert_eq!(targets[1].bot_id, "1010");
+
+        // A name may collide with another Bot's ID prefix; try the full ID next.
+        let bots = vec![
+            json!({"bot_id": "1010", "name": "101"}),
+            json!({"bot_id": "101", "name": "beta"}),
+        ];
+        let (targets, _) = plan_all(&bots).unwrap();
+        assert_eq!(targets[0].selector, "1010");
+        assert_eq!(targets[1].selector, "beta");
+    }
+
+    #[test]
+    fn all_refuses_the_entire_plan_when_a_later_target_has_no_safe_selector() {
+        let bots = vec![
+            json!({"bot_id": "9", "name": "safe"}),
+            json!({"bot_id": "101", "name": "101"}),
+            // Even skipped Bots participate in the daemon's selector resolution.
+            json!({"bot_id": "1010", "name": "remote", "status": "not_local"}),
+        ];
+        let error = plan_all(&bots).unwrap_err();
+        assert!(error.contains("Bot 101 (101)"));
+        assert!(error.contains("nothing was changed"));
+        assert!(plan_all(&[json!({"name": "no-id"})]).is_err());
+    }
+
     #[tokio::test]
     async fn all_reuses_preloaded_bootstrap_for_every_bot() {
         for (command, force) in [("start", false), ("stop", true)] {
@@ -1461,28 +1538,41 @@ mod default_wait_tests {
             let deadline = Instant::now() + Duration::from_secs(3);
             let server = tokio::spawn(async move {
                 let mut ids = Vec::new();
-                for index in 0..3 {
+                for index in 0..5 {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
                     let request: Value = serde_json::from_slice(&frame).unwrap();
                     assert_eq!(request["secret"], json!(vec![7_u8; 32]));
                     let reply = if index == 0 {
                         assert_eq!(request["command"], "ps");
+                        assert!(request.get("expect_bot_id").is_none());
                         json!({"ok": true, "bots": [
-                            {"bot_id": "1", "name": "one", "status": "stopped"},
-                            {"bot_id": "2", "name": "two", "status": "stopped"}
+                            {"bot_id": "101", "name": "one", "status": "stopped"},
+                            {"bot_id": "1010", "name": "two", "status": "stopped"}
                         ]})
                     } else {
-                        assert_eq!(request["command"], command);
-                        assert_eq!(request["bot"], index.to_string());
-                        assert_eq!(request["force"], force);
-                        assert_eq!(request["yes"], force);
+                        let first_bot = index <= 2;
+                        let bot_id = if first_bot { "101" } else { "1010" };
                         let id = request["operation_id"].as_str().unwrap().to_owned();
                         assert!(valid_operation_id(&id));
-                        ids.push(id.clone());
+                        let state = if index % 2 == 1 {
+                            assert_eq!(request["command"], command);
+                            assert_eq!(request["bot"], if first_bot { "one" } else { "two" });
+                            assert_eq!(request["expect_bot_id"], bot_id);
+                            assert_eq!(request["force"], force);
+                            assert_eq!(request["yes"], force);
+                            ids.push(id.clone());
+                            "running"
+                        } else {
+                            assert_eq!(request["command"], "operation");
+                            assert!(request.get("bot").is_none());
+                            assert!(request.get("expect_bot_id").is_none());
+                            assert_eq!(ids.last(), Some(&id));
+                            "succeeded"
+                        };
                         json!({"ok": true, "operation": {
-                            "operation_id": id, "command": command, "bot_id": index.to_string(),
-                            "state": "succeeded", "elapsed_ms": 0, "shards": [], "failed_shards": []
+                            "operation_id": id, "command": command, "bot_id": bot_id,
+                            "state": state, "elapsed_ms": 0, "shards": [], "failed_shards": []
                         }})
                     };
                     let mut frame = serde_json::to_vec(&reply).unwrap();

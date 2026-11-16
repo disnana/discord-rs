@@ -826,6 +826,9 @@ pub mod control {
         /// Refuse stale client-side guild routing before admitting any mutation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expect_total_shards: Option<u32>,
+        /// Pin a selector resolved from a prior Bot listing to its exact identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expect_bot_id: Option<String>,
     }
 
     impl CommandRequest {
@@ -885,6 +888,16 @@ pub mod control {
                 _ => false,
             };
             base && self.shards_valid()
+                && self.expect_bot_id.as_ref().is_none_or(|bot_id| {
+                    !bot_id.is_empty()
+                        && bot_id.len() <= 64
+                        && bot_id.trim() == bot_id.as_str()
+                        && !bot_id.chars().any(char::is_control)
+                        && matches!(
+                            self.command.as_str(),
+                            "start" | "stop" | "restart" | "gateway-update"
+                        )
+                })
                 && self.expect_total_shards.is_none_or(|total| {
                     total > 0
                         && matches!(
@@ -1535,6 +1548,11 @@ pub mod control {
                 },
                 None => None,
             };
+            if let Some(expected) = request.expect_bot_id.as_ref()
+                && selected.as_ref().is_none_or(|bot| &bot.bot_id != expected)
+            {
+                return Self::error("bot identity changed; refresh the bot list before retrying");
+            }
             if let Some(expected) = request.expect_total_shards
                 && selected.as_ref().is_none_or(|bot| {
                     bot.total_shards != crate::placement::ShardCount::Fixed(expected)
@@ -2220,6 +2238,72 @@ pub mod control {
             stop.force = true;
             stop.yes = true;
             stop.expect_total_shards = Some(1);
+            assert_eq!(plane.request(&stop)["ok"], false);
+            assert_eq!(plane.operations.len(), 1);
+            assert_eq!(plane.request(&query(1))["operation"]["state"], "running");
+        }
+
+        #[test]
+        fn bot_identity_precondition_is_only_valid_for_lifecycle_mutations() {
+            for command in ["start", "stop", "restart", "gateway-update"] {
+                let mut command = request(command, 0, 1);
+                command.expect_bot_id = Some("id-0".into());
+                assert!(command.valid());
+                for invalid in ["".to_owned(), " id-0".into(), "x\n".into(), "x".repeat(65)] {
+                    command.expect_bot_id = Some(invalid);
+                    assert!(!command.valid());
+                }
+            }
+            for name in [
+                "ps",
+                "status",
+                "inspect",
+                "shards",
+                "operation",
+                "gateway-prepare",
+            ] {
+                let mut command = match name {
+                    "operation" => query(1),
+                    "gateway-prepare" => request(name, 0, 1),
+                    _ => CommandRequest {
+                        command: name.into(),
+                        bot: matches!(name, "inspect" | "shards").then(|| "bot0".into()),
+                        ..Default::default()
+                    },
+                };
+                assert!(command.valid());
+                command.expect_bot_id = Some("id-0".into());
+                assert!(!command.valid());
+            }
+        }
+
+        #[test]
+        fn changed_bot_identity_is_refused_before_supersession_or_restart_holds() {
+            let mut plane = plane(1, 2);
+            let before = plane.daemon.snapshots();
+            let mut restart = request("restart", 0, 1);
+            // The selector still resolves, but now to a different identity from the listing.
+            restart.expect_bot_id = Some("removed-bot".into());
+            assert_eq!(
+                plane.request(&restart)["error"],
+                "bot identity changed; refresh the bot list before retrying"
+            );
+            assert!(plane.operations.is_empty());
+            assert_eq!(plane.daemon.snapshots(), before);
+            assert!(
+                plane
+                    .daemon
+                    .entries
+                    .values()
+                    .all(|entry| !entry.restart_held)
+            );
+
+            restart.expect_bot_id = Some("id-0".into());
+            assert_eq!(plane.request(&restart)["ok"], true);
+            let mut stop = request("stop", 0, 2);
+            stop.force = true;
+            stop.yes = true;
+            stop.expect_bot_id = Some("removed-bot".into());
             assert_eq!(plane.request(&stop)["ok"], false);
             assert_eq!(plane.operations.len(), 1);
             assert_eq!(plane.request(&query(1))["operation"]["state"], "running");
