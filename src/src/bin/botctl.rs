@@ -16,10 +16,11 @@ use tokio::{
 
 const REQUEST_LIMIT: usize = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
-const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl start|stop|restart|gateway-update BOT [--shard N]... [--guild ID]...; botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
+const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl start|stop|restart|gateway-update BOT [--shard N]... [--guild ID]...; botctl start|stop|restart|gateway-update --all (--yes | --dry-run); botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
 const OFFLINE_NOTE: &str =
     "オフライン設定検証のみ。daemon・実稼働状態・認証・quorum/leaseは検証していません。";
 
+#[derive(Clone)]
 struct Options {
     command: &'static str,
     bot: Option<String>,
@@ -38,6 +39,10 @@ struct Options {
     /// `--guild ID` (repeatable): act on the Shard that serves each guild
     /// (`(guild_id >> 22) % total_shards`, resolved from the daemon's `inspect` before any mutation).
     guilds: Vec<u64>,
+    /// `--all`: run the command for every Bot that has local Shards, one Bot at a time,
+    /// stopping at the first failure. Needs `--yes` (or `--dry-run` to only list the targets).
+    all: bool,
+    all_dry_run: bool,
 }
 
 fn valid_operation_id(value: &str) -> bool {
@@ -80,6 +85,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     let mut operation_id = None;
     let mut shards: Vec<u32> = Vec::new();
     let mut guilds: Vec<u64> = Vec::new();
+    let mut all = false;
     let mut force = false;
     let mut yes = false;
     let mut plan = None;
@@ -166,6 +172,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
                 }
                 shards.push(number);
             }
+            Some("--all") if !all => all = true,
             Some("--guild") => {
                 let value = args
                     .next()
@@ -210,6 +217,10 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         }
     }
     let (command, bot) = match words.as_slice() {
+        ["start"] if all => ("start", None),
+        ["stop" | "shutdown"] if all => ("stop", None),
+        ["restart" | "reboot"] if all => ("restart", None),
+        ["gateway-update"] if all => ("gateway-update", None),
         ["config", "validate"] => ("config", None),
         ["secret", "generate"] => ("secret", None),
         ["ps"] => ("ps", None),
@@ -258,6 +269,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             || rolling
             || !shards.is_empty()
             || !guilds.is_empty()
+            || all
         {
             return Err("secret generate is offline and accepts only --out and --json");
         }
@@ -276,6 +288,8 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             out,
             shards: Vec::new(),
             guilds: Vec::new(),
+            all: false,
+            all_dry_run: false,
         });
     }
     if out.is_some() {
@@ -295,11 +309,30 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     if shards.len() > 64 || guilds.len() > 64 {
         return Err("--shard and --guild may each be given at most 64 times");
     }
+    if all {
+        if bot.is_some() {
+            return Err("--all cannot be combined with a Bot name");
+        }
+        if !matches!(command, "start" | "stop" | "restart" | "gateway-update") {
+            return Err("--all is supported only for start, stop, restart and gateway-update");
+        }
+        if !shards.is_empty() || !guilds.is_empty() || operation_id.is_some() {
+            return Err("--all cannot be combined with --shard, --guild or --operation-id");
+        }
+        if dry_run && yes {
+            return Err("--dry-run and --yes are mutually exclusive");
+        }
+        if !dry_run && !yes {
+            return Err(
+                "--all changes every Bot; add --yes to confirm (or --dry-run to list the targets)",
+            );
+        }
+    }
     if force && !yes {
         return Err("force stop requires explicit --yes confirmation");
     }
     let update = matches!(command, "update" | "rollback");
-    if yes && !force && !update {
+    if yes && !force && !update && !all {
         return Err("--yes requires --force stop");
     }
     if operation_id.is_some()
@@ -310,7 +343,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     {
         return Err("--operation-id requires a mutation or operation query");
     }
-    if !update && (plan.is_some() || component.is_some() || dry_run || rolling) {
+    if !update && (plan.is_some() || component.is_some() || (dry_run && !all) || rolling) {
         return Err("update planning options require update or rollback");
     }
     if update {
@@ -371,6 +404,8 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         out,
         shards,
         guilds,
+        all,
+        all_dry_run: all && dry_run,
     })
 }
 
@@ -674,8 +709,143 @@ async fn run(options: Options) -> Value {
     if matches!(options.command, "update" | "rollback") {
         return run_update(options).await;
     }
+    if options.all {
+        return run_all(options).await;
+    }
     let deadline = Instant::now() + options.timeout;
     run_live(options, None, deadline).await
+}
+
+/// One Bot of an `--all` run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AllTarget {
+    bot_id: String,
+    name: String,
+}
+
+/// Split the daemon's Bot list into the Bots that have local Shards (the targets, in listing
+/// order) and the ones that do not (reported as skipped, never silently dropped).
+fn plan_all(bots: &[Value]) -> (Vec<AllTarget>, Vec<Value>) {
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    for bot in bots {
+        let (Some(bot_id), name) = (bot["bot_id"].as_str(), bot["name"].as_str().unwrap_or(""))
+        else {
+            continue;
+        };
+        if bot["status"].as_str() == Some("not_local") {
+            skipped.push(json!({"bot_id": bot_id, "name": name, "reason": "not_local"}));
+        } else {
+            targets.push(AllTarget {
+                bot_id: bot_id.to_owned(),
+                name: name.to_owned(),
+            });
+        }
+    }
+    (targets, skipped)
+}
+
+/// Run `run_one` for each target in order and stop at the first failure. A Bot is finished
+/// (its operation reached a terminal state) before the next one starts, so the Identify
+/// budget and the per-Bot restart holds are never overlapped across Bots.
+async fn drive_all<F, Fut>(targets: &[AllTarget], mut run_one: F) -> (Vec<Value>, Option<String>)
+where
+    F: FnMut(AllTarget) -> Fut,
+    Fut: std::future::Future<Output = Value>,
+{
+    let mut results = Vec::new();
+    let mut stopped_at = None;
+    for target in targets {
+        let response = run_one(target.clone()).await;
+        let state = response["operation"]["state"].as_str();
+        let ok = response["ok"] == true && state.is_none_or(|state| state == "succeeded");
+        results.push(json!({
+            "bot_id": target.bot_id,
+            "name": target.name,
+            "ok": ok,
+            "state": state,
+            "operation_id": response["operation"]["operation_id"]
+                .as_str()
+                .or_else(|| response["operation_id"].as_str()),
+            "error": response["error"],
+        }));
+        if !ok {
+            stopped_at = Some(target.bot_id.clone());
+            break;
+        }
+    }
+    (results, stopped_at)
+}
+
+async fn run_all(options: Options) -> Value {
+    let started = Instant::now();
+    let list_deadline = Instant::now() + Duration::from_secs(30);
+    let bootstrap = match timeout_at(
+        list_deadline,
+        load_bootstrap(options.secret_file.as_deref(), options.port),
+    )
+    .await
+    {
+        Ok(Ok(bootstrap)) => bootstrap,
+        Ok(Err(error)) => return failure(error, None, None),
+        Err(_) => return failure("control bootstrap timed out; no request sent", None, None),
+    };
+    let listing = Request {
+        secret: &bootstrap.secret,
+        command: "ps",
+        bot: None,
+        operation_id: None,
+        force: false,
+        yes: false,
+        shards: None,
+    };
+    let response = match timeout_at(list_deadline, exchange(&bootstrap, &listing)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return failure(error, None, None),
+        Err(_) => return failure("bot listing timed out; nothing was changed", None, None),
+    };
+    let Some(bots) = response["bots"]
+        .as_array()
+        .filter(|_| response["ok"] == true)
+    else {
+        return failure(
+            "daemon did not return a bot list; nothing was changed",
+            None,
+            None,
+        );
+    };
+    let (targets, skipped) = plan_all(bots);
+    let listed: Vec<Value> = targets
+        .iter()
+        .map(|target| json!({"bot_id": target.bot_id, "name": target.name}))
+        .collect();
+    if options.all_dry_run {
+        return json!({"ok": true, "offline": false, "all": true, "dry_run": true,
+            "command": options.command, "targets": listed, "skipped": skipped});
+    }
+    if targets.is_empty() {
+        let mut value = failure("no bot has local shards; nothing was changed", None, None);
+        value["all"] = json!(true);
+        value["skipped"] = json!(skipped);
+        return value;
+    }
+    let (results, stopped_at) = drive_all(&targets, |target| {
+        let mut one = options.clone();
+        one.all = false;
+        one.all_dry_run = false;
+        one.bot = Some(target.bot_id);
+        // `--yes` here confirmed `--all` itself; a Bot only receives it for a forced stop.
+        one.yes = one.force;
+        one.operation_id = None;
+        let deadline = Instant::now() + one.timeout;
+        async move { run_live(one, None, deadline).await }
+    })
+    .await;
+    let completed = results.iter().filter(|result| result["ok"] == true).count();
+    json!({"ok": stopped_at.is_none(), "offline": false, "all": true,
+        "command": options.command, "total": targets.len(), "completed": completed,
+        "stopped_at": stopped_at, "results": results, "skipped": skipped,
+        "elapsed_ms": started.elapsed().as_millis() as u64})
 }
 
 /// The Shard that Discord routes a guild's events to.
@@ -1114,6 +1284,108 @@ mod default_wait_tests {
         ] {
             assert!(with(&bad).is_err(), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn all_flag_needs_confirmation_and_excludes_per_bot_targeting() {
+        let base = ["--secret-file", "/tmp/s", "--port", "1"];
+        let with = |extra: &[&str]| -> Result<Options, &'static str> {
+            let args: Vec<OsString> = [extra, &base[..]]
+                .concat()
+                .iter()
+                .map(OsString::from)
+                .collect();
+            parse_options(&args)
+        };
+        let run = with(&["gateway-update", "--all", "--yes"]).unwrap();
+        assert!(run.all && !run.all_dry_run && run.bot.is_none());
+        assert_eq!(run.timeout, Duration::from_secs(300));
+        let dry = with(&["restart", "--all", "--dry-run"]).unwrap();
+        assert!(dry.all && dry.all_dry_run);
+        assert!(with(&["stop", "--all", "--force", "--yes"]).unwrap().force);
+        for bad in [
+            vec!["restart", "--all"],
+            vec!["restart", "--all", "--yes", "--dry-run"],
+            vec!["restart", "bot", "--all", "--yes"],
+            vec!["gateway-update", "--all", "--yes", "--shard", "0"],
+            vec!["gateway-update", "--all", "--yes", "--guild", "5"],
+            vec![
+                "gateway-update",
+                "--all",
+                "--yes",
+                "--operation-id",
+                "00000000000000000000000000000001",
+            ],
+            vec!["status", "--all", "--yes"],
+            vec!["restart", "--yes"],
+            vec!["restart"],
+        ] {
+            assert!(with(&bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn all_targets_skip_bots_without_local_shards_and_say_so() {
+        let bots = vec![
+            json!({"bot_id": "1", "name": "a", "status": "running"}),
+            json!({"bot_id": "2", "name": "b", "status": "not_local"}),
+            json!({"bot_id": "3", "name": "c", "status": "degraded"}),
+            json!({"name": "no-id"}),
+        ];
+        let (targets, skipped) = plan_all(&bots);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.bot_id.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "3"]
+        );
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["bot_id"], "2");
+        assert_eq!(skipped[0]["reason"], "not_local");
+    }
+
+    #[tokio::test]
+    async fn all_runs_bots_in_order_and_stops_at_the_first_failure() {
+        let targets: Vec<AllTarget> = ["1", "2", "3"]
+            .iter()
+            .map(|id| AllTarget {
+                bot_id: (*id).into(),
+                name: format!("bot{id}"),
+            })
+            .collect();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let (results, stopped) = drive_all(&targets, |target| {
+            seen.lock().unwrap().push(target.bot_id.clone());
+            async move {
+                if target.bot_id == "2" {
+                    json!({"ok": false, "error": "boom", "operation_id": "x"})
+                } else {
+                    json!({"ok": true, "operation": {"state": "succeeded", "operation_id": "y"}})
+                }
+            }
+        })
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["1", "2"], "bot 3 must never start");
+        assert_eq!(stopped.as_deref(), Some("2"));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[1]["ok"], false);
+        assert_eq!(results[1]["error"], "boom");
+
+        // A response that says ok but whose operation did not succeed also stops the run.
+        let (results, stopped) = drive_all(&targets, |_| async {
+            json!({"ok": true, "operation": {"state": "failed", "operation_id": "z"}})
+        })
+        .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(stopped.as_deref(), Some("1"));
+        // All succeed: everything ran, nothing stopped.
+        let (results, stopped) = drive_all(&targets, |_| async {
+            json!({"ok": true, "operation": {"state": "succeeded", "operation_id": "z"}})
+        })
+        .await;
+        assert_eq!((results.len(), stopped), (3, None));
     }
 
     #[test]

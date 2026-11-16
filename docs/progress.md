@@ -489,3 +489,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 試験：単体テスト（換算の値、不正な指定の拒否）、clippy 警告なし。WSL の実機（2 シャード、実 Discord）：`--guild 1533441257798369401` はシャード 0 だけを更新、`--guild 1569994280854884364 --shard 0` は両シャードを更新。`!count` の継続はユーザー確認待ち。
 - WSL 固有の既存の失敗：`botctl_update_daemon` の 4 件が、今回の変更を入れる前の main（7a5bdcb）でも WSL で失敗する（CI では成功）。`botctl_update_control` の 1 件と同種（監査ファイルを開く処理）と見られるが、原因は未調査。
 - 未実装：`all`（全 Bot の順次実行）、全体の進行の表示、監査へのシャード指定の記録。
+
+### 追記（2026-11-16 夜）：`--all`（全 Bot の順次実行）
+
+- 実装：`botctl start|stop|restart|gateway-update --all (--yes | --dry-run)`（`--all` は旗で、Bot 名とは別。名前が `all` の Bot と衝突しない）。`--all` は影響が大きいので `--yes`（確認）が必須で、`--dry-run` は対象の Bot 一覧だけを出して何も変更しない。`--shard`・`--guild`・`--operation-id` とは併用不可。daemon の `ps` から Bot の一覧を得て、ローカルにシャードがない Bot（`not_local`）は飛ばし、`skipped` に理由つきで出す。Bot を **1 つずつ順に**（前の Bot の操作が終わってから次へ）実行し、**最初の失敗で止める**（`stopped_at`）。Bot ごとの操作 ID と状態を `results` に出す。`--yes` は `--all` の確認にのみ使い、各 Bot へは強制停止のときだけ転送する。daemon の変更はなく、認可は各 Bot の要求ごとに daemon が評価する（見えない Bot は一覧に出ない）。
+- 試験：botctl の単体テスト（引数の検証、対象の選別、順序と最初の失敗での停止、失敗した操作状態の扱い）。WSL の実機（2 シャード、実 Discord）：`--yes` なしは拒否、`--dry-run` は対象を表示、`--all --yes` は 34 秒で成功。複数 Bot の実機での順次実行は、Bot が 1 つの環境のため未確認（順序と停止は単体テストのみ）。
