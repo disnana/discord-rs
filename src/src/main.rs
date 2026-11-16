@@ -1162,9 +1162,11 @@ async fn live_events(
 ) -> Result<(), AppError> {
     let capacity = Arc::new(Semaphore::new(64));
     let mut requests = JoinSet::new();
+    let mut replay_error = None;
     tokio::pin!(shutdown);
     println!("Botを起動しています...");
     'events: loop {
+        while requests.try_join_next().is_some() {}
         // Events a standby Gateway held back come first, in the order they arrived.
         let mut replaying = false;
         let result = if let Some(held) = backlog.pop_front() {
@@ -1200,8 +1202,8 @@ async fn live_events(
                         Some(event) if backlog.len() < 512 => backlog.push_back(event),
                         _ => {
                             eprintln!("Gateway replay backlog overflow or shard closed");
-                            manager.stop_reconnecting();
-                            return Err(StartupFailure::InvalidArguments.into());
+                            replay_error = Some(StartupFailure::InvalidArguments.into());
+                            break 'events;
                         }
                     }
                 }
@@ -1492,7 +1494,10 @@ async fn live_events(
     })
     .await
     .map_err(|_| StartupFailure::ShutdownFailed)?;
-    Ok(())
+    match replay_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

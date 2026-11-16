@@ -802,9 +802,9 @@ pub mod control {
     pub const OPERATION_LIMIT: usize = 1024;
     pub const OPERATION_SHARD_LIMIT: usize = 64;
     pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
-    /// A Gateway update waits for a standby Gateway to log in, per Shard of the Bot.
-    #[cfg(unix)]
-    const UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
+    fn update_timeout(shards: usize) -> Duration {
+        Duration::from_secs(120 + 45 * shards as u64)
+    }
 
     #[derive(Clone, Default, Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
@@ -908,6 +908,7 @@ pub mod control {
         phase: Phase,
         next: usize,
         started: Instant,
+        update_timeout: Duration,
         waiting: HashSet<ShardKey>,
         generations: BTreeMap<ShardKey, LaunchGeneration>,
         errors: BTreeMap<ShardKey, DaemonError>,
@@ -936,6 +937,7 @@ pub mod control {
     struct PendingAudit {
         bytes: Vec<u8>,
         written: bool,
+        written_file: Option<(u64, u64, u64)>,
     }
 
     impl ControlPlane {
@@ -979,6 +981,7 @@ pub mod control {
             Ok(PendingAudit {
                 bytes,
                 written: false,
+                written_file: None,
             })
         }
 
@@ -994,6 +997,19 @@ pub mod control {
                 .create(true)
                 .append(true)
                 .open(path)?;
+            #[cfg(unix)]
+            if record.written {
+                use std::os::unix::fs::MetadataExt;
+                let matches = file.metadata().ok().is_some_and(|meta| {
+                    record.written_file.is_some_and(|(dev, ino, len)| {
+                        meta.dev() == dev && meta.ino() == ino && meta.len() >= len
+                    })
+                });
+                if !matches {
+                    record.written = false;
+                    record.written_file = None;
+                }
+            }
             if !record.written {
                 // Read separately: the private append handle is write-only.
                 let mut reader = std::fs::File::open(path)?;
@@ -1011,11 +1027,37 @@ pub mod control {
                     let mut last = [0];
                     reader.read_exact(&mut last)?;
                     if last[0] != b'\n' {
-                        file.write_all(b"\n")?;
+                        reader.seek(SeekFrom::Start(0))?;
+                        let mut data = Vec::new();
+                        reader.read_to_end(&mut data)?;
+                        let boundary = data
+                            .iter()
+                            .rposition(|&byte| byte == b'\n')
+                            .map_or(0, |pos| pos + 1);
+                        let mut corrupt_path = path.as_os_str().to_os_string();
+                        corrupt_path.push(".corrupt");
+                        #[cfg(unix)]
+                        let mut corrupt = crate::core_units::open_append_private(
+                            std::path::Path::new(&corrupt_path),
+                        )?;
+                        #[cfg(not(unix))]
+                        let mut corrupt = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&corrupt_path)?;
+                        corrupt.write_all(&data[boundary..])?;
+                        corrupt.sync_data()?;
+                        file.set_len(boundary as u64)?;
                     }
                 }
                 file.write_all(&record.bytes)?;
                 record.written = true;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let meta = file.metadata()?;
+                    record.written_file = Some((meta.dev(), meta.ino(), meta.len()));
+                }
             }
             file.sync_data()
         }
@@ -1416,6 +1458,7 @@ pub mod control {
                 command: request.command.clone(),
                 bot_id,
                 force: request.force,
+                update_timeout: update_timeout(targets.len()),
                 targets,
                 phase: if request.command == "start" {
                     Phase::Starting
@@ -1520,7 +1563,8 @@ pub mod control {
             // The whole operation has one deadline. A confirmation already asked for
             // (`Activating`) is allowed to conclude on its own shorter limit; nothing new
             // starts after the deadline, for this Shard or the next ones.
-            if op.started.elapsed() >= UPDATE_TIMEOUT && op.update_stage != UpdateStage::Activating
+            if op.started.elapsed() >= op.update_timeout
+                && op.update_stage != UpdateStage::Activating
             {
                 self.daemon.cancel_gateway_update(&key);
                 op.errors.insert(key, DaemonError::StopTimedOut);
@@ -1538,7 +1582,7 @@ pub mod control {
                 },
                 UpdateStage::Warming => match self.daemon.gateway_update_progress(&key) {
                     UpdateProgress::Warming => {
-                        if op.started.elapsed() >= UPDATE_TIMEOUT {
+                        if op.started.elapsed() >= op.update_timeout {
                             self.daemon.cancel_gateway_update(&key);
                             op.errors.insert(key, DaemonError::StopTimedOut);
                             self.finish(op);
@@ -1562,6 +1606,7 @@ pub mod control {
                     UpdateProgress::Warming => {}
                     UpdateProgress::Ready => match self.daemon.commit_gateway_update(&key).await {
                         Ok(()) => {
+                            self.daemon.hold_restart(&key, false);
                             op.next += 1;
                             op.update_stage = UpdateStage::Begin;
                             if op.next >= op.targets.len() {
@@ -2173,9 +2218,40 @@ pub mod control {
             plane.retry_pending_audit();
             assert!(plane.pending_audit.is_empty());
             let data = std::fs::read(&path).unwrap();
-            assert_eq!(&data[..9], b"{partial\n");
-            assert_eq!(&data[9..], bytes.as_slice());
-            serde_json::from_slice::<Value>(&data[9..]).unwrap();
+            assert_eq!(data, bytes);
+            for line in data
+                .split(|&byte| byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                serde_json::from_slice::<Value>(line).unwrap();
+            }
+            assert_eq!(
+                std::fs::read(dir.join("audit.jsonl.corrupt")).unwrap(),
+                b"{partial"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn update_timeout_scales_with_shards() {
+            assert_eq!(update_timeout(0), Duration::from_secs(120));
+            assert_eq!(update_timeout(7), Duration::from_secs(435));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn audit_sync_retry_reappends_after_truncation() {
+            let dir = log_dir("audit-truncated-retry");
+            let path = dir.join("audit.jsonl");
+            let mut plane = plane(1, 1);
+            plane.set_gateway_update_audit(path.clone());
+            let actor = ("subject".to_owned(), "admin".to_owned());
+            let mut record =
+                ControlPlane::audit_record("succeeded", "id", "bot", &actor, None).unwrap();
+            plane.write_audit(&mut record).unwrap();
+            std::fs::write(&path, b"").unwrap();
+            plane.write_audit(&mut record).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), record.bytes);
             let _ = std::fs::remove_dir_all(dir);
         }
 

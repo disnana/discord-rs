@@ -464,6 +464,63 @@ async fn writer_stamp_rejects_symlink_and_accepts_existing_public_mode() {
     );
     assert_eq!(
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-        0o644
+        0o600
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_writer_files_disable_persistence() {
+    let dir = Dir::new();
+    let path = dir.0.join("core-state.writer");
+    let target = dir.0.join("target");
+    std::fs::write(&target, "123").unwrap();
+    std::fs::hard_link(&target, &path).unwrap();
+    let (disabled, _) = Persister::open(dir.0.clone(), binding()).await;
+    disabled.observe(0, &count(1));
+    disabled.flush(true).await;
+    assert!(!dir.file().exists());
+    std::fs::remove_file(&path).unwrap();
+    if std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        let (disabled, _) = timeout(
+            Duration::from_secs(8),
+            Persister::open(dir.0.clone(), binding()),
+        )
+        .await
+        .expect("FIFO blocked");
+        disabled.observe(0, &count(1));
+        disabled.flush(true).await;
+        assert!(!dir.file().exists());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn locked_writer_times_out_and_preserves_loaded_state() {
+    let dir = Dir::new();
+    let states = vec![Some(count(9)), None];
+    core_state::store(&dir.0, &binding(), &states).unwrap();
+    let path = dir.0.join("core-state.writer");
+    std::fs::write(&path, "123").unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    lock.lock().unwrap();
+    let (disabled, loaded) = timeout(
+        Duration::from_secs(8),
+        Persister::open(dir.0.clone(), binding()),
+    )
+    .await
+    .expect("lock timeout");
+    assert_eq!(loaded, states);
+    disabled.observe(0, &count(10));
+    disabled.flush(true).await;
+    assert_eq!(core_state::load(&dir.0, &binding()), states);
+    lock.unlock().unwrap();
 }

@@ -9,7 +9,7 @@
 //! file-backed `StateStore`.
 //!
 //! Writes are atomic (private temporary file, fsync, rename, directory fsync)
-//! and mode 0600. Symbolic links are never followed when reading, and the
+//! and mode 0600. Reads check the path before opening, and the
 //! temporary file is created with `create_new`.
 
 use std::{
@@ -150,6 +150,7 @@ fn read_limited(path: &Path) -> io::Result<Vec<u8>> {
             "unexpected persisted state object",
         ));
     }
+    // A replacement between this check and the read-only open can still be followed or block.
     let mut bytes = Vec::new();
     fs::File::open(path)?
         .take(MAX_FILE_BYTES as u64 + 1)
@@ -266,36 +267,56 @@ fn remove_dead_temporaries(dir: &Path) {
 // Allocate under a cross-process lock. Invalid or incomplete metadata fails closed.
 #[cfg(unix)]
 fn allocate_stamp(dir: &Path) -> io::Result<u64> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
     let path = dir.join("core-state.writer");
-    match fs::symlink_metadata(&path) {
-        Ok(meta) if !meta.is_file() => return Err(io::Error::other("invalid writer file")),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    // Linux O_NOFOLLOW and O_NONBLOCK prevent following a replaced link or blocking on a FIFO.
     let mut options = fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(0o400000 | 0o4000);
-    let (mut file, created) = match options.create_new(true).open(&path) {
-        Ok(file) => (file, true),
+    options.read(true).write(true).mode(0o600);
+    let (mut file, created, before) = match options.create_new(true).open(&path) {
+        Ok(file) => (file, true, None),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            (options.create_new(false).open(&path)?, false)
+            let before = fs::symlink_metadata(&path)?;
+            if !before.is_file() {
+                return Err(io::Error::other("invalid writer file"));
+            }
+            (options.create_new(false).open(&path)?, false, Some(before))
         }
         Err(error) => return Err(error),
     };
     let meta = file.metadata()?;
-    if !meta.is_file() || meta.uid() != unsafe { geteuid() } {
-        return Err(io::Error::other("invalid writer file owner or type"));
+    if !meta.is_file()
+        || meta.uid() != unsafe { geteuid() }
+        || meta.nlink() != 1
+        || before
+            .as_ref()
+            .is_some_and(|old| old.dev() != meta.dev() || old.ino() != meta.ino())
+    {
+        return Err(io::Error::other("unsafe writer file"));
     }
-    file.lock()?;
+    if meta.mode() & 0o7777 != 0o600 {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "writer lock timed out",
+                ));
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
     let result = (|| {
         let mut text = String::new();
         (&mut file).take(21).read_to_string(&mut text)?;

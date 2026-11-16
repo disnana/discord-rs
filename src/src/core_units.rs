@@ -92,23 +92,27 @@ pub fn open_append_private(path: &Path) -> std::io::Result<std::fs::File> {
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if !meta.file_type().is_file() => {
-            return Err(std::io::Error::other("not a regular file"));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).mode(0o600);
+    let (file, before) = match options.create_new(true).open(path) {
+        Ok(file) => (file, None),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let before = std::fs::symlink_metadata(path)?;
+            if !before.is_file() {
+                return Err(std::io::Error::other("not a regular file"));
+            }
+            (options.create_new(false).open(path)?, Some(before))
         }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    // Linux O_NOFOLLOW closes the race between the path check and open.
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(0o400000)
-        .open(path)?;
+        Err(error) => return Err(error),
+    };
     let meta = file.metadata()?;
-    if !meta.is_file() || meta.uid() != unsafe { geteuid() } || meta.nlink() != 1 {
+    if !meta.is_file()
+        || meta.uid() != unsafe { geteuid() }
+        || meta.nlink() != 1
+        || before
+            .as_ref()
+            .is_some_and(|old| old.dev() != meta.dev() || old.ino() != meta.ino())
+    {
         return Err(std::io::Error::other("unsafe file"));
     }
     if meta.mode() & 0o7777 != 0o600 {
@@ -402,5 +406,28 @@ mod private_append_tests {
         std::fs::remove_file(link).unwrap();
         std::fs::remove_file(target).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+    #[test]
+    fn refuses_hardlink_and_fifo() {
+        let dir = std::env::temp_dir().join(format!(
+            "core-private-extra-{}-{}",
+            std::process::id(),
+            getrandom::u64().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("target");
+        let link = dir.join("hardlink");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::hard_link(&target, &link).unwrap();
+        assert!(open_append_private(&target).is_err());
+        let fifo = dir.join("fifo");
+        if std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            assert!(open_append_private(&fifo).is_err());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
