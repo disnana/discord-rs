@@ -428,3 +428,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 - fixture で結果受信と release の時刻を記録し、acceptance 失敗時に 250 ms ごとの送信・結果・ACK、障害時刻、Worker/Gateway の stderr 末尾を上限付きで表示する。relay の実 Worker stderr も証拠に保存する。
 - 原因は引き続き未確定。cargo と CI 上の実プロセス検証は未実施で、integrator が実行する。
+
+### 2026-11-16 夕：`update_load::crash_old_core` の失敗の証拠（診断出力 50dceed の初回採取、CI）
+
+- 結果と ACK は旧 Worker を `kill` した時刻（開始から 1933 ms）の直後にゼロになり、更新の完了（5030 ms）まで約 3 秒ゼロのまま。最初の欠落は ID 78、`errors` は空、`operation_failures` は 0。
+- `gateway.log`：`--- gateway generation 1 ---` の直後に `実行に失敗しました: unresolved response outcomes prevent graceful shutdown`、続いて `generation 2`。**Gateway が終了して再起動しており、その間のイベントが欠落**した、という流れ。
+- 解釈（証拠はこの 1 回の採取のみ。確定ではない）：旧 Worker を落とした時点で処理中だった応答が「結果不明」で残り、正常な終了ができないために Gateway が落ちた。結果不明を自動再実行しない既存の仕様（`docs/architecture.md` の「結果不明」）と整合する。`kill` の瞬間に処理中のイベントがあるかどうかのタイミングで再現が決まるため、WSL では再現しにくく、CI では出やすいと考えられる。
+- 未判断：Gateway が「結果不明の応答が残る」ことで落ちるのが、製品として許容される動作か（別ケース `crash_new_core_after_handler` は同じ制限として `#[ignore]` 済み）。許容なら、この試験の期待値（欠落 0）か、`kill` のタイミング（処理中のイベントがない時点で落とす）を直す。許容しないなら、Gateway が結果不明を抱えたまま継続する設計が要る。
