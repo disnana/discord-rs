@@ -1563,6 +1563,13 @@ pub mod control {
             if !active.is_empty() && !request.force {
                 return Self::error("bot already has an operation in progress");
             }
+            if request.command == "gateway-update"
+                && self.daemon.gateway_update_fallback_pending(&bot_id)
+            {
+                // Reject before installing any restart holds: the reserved recovery must
+                // be able to run before another update can start. Keep its reservation.
+                return Self::error("gateway fallback recovery pending; retry after recovery");
+            }
             // Explicit force stop supersedes an earlier drain/restart. The old
             // operation can never resume and launch a new generation afterwards.
             for id in active {
@@ -2584,6 +2591,65 @@ pub mod control {
                 "intact record was duplicated"
             );
             let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn update_admission_rejects_pending_fallback_without_holding_recovery() {
+            let mut plane = plane(2, 2);
+            let protected = ShardKey {
+                bot_id: "id-0".into(),
+                shard_id: 1,
+            };
+            plane
+                .daemon
+                .entries
+                .get_mut(&protected)
+                .unwrap()
+                .update_fallback_reserved = true;
+            // Model a finished update with shard 1 still awaiting fallback admission.
+            // Call ControlPlane admission directly; no separated Core or child is needed.
+            let retry = request("gateway-update", 0, 92);
+            for _ in 0..2 {
+                let response = plane.admit(&retry, "id-0".into());
+                assert_eq!(response["ok"], false);
+                assert_eq!(
+                    response["error"],
+                    "gateway fallback recovery pending; retry after recovery"
+                );
+                assert!(plane.operations.is_empty());
+                assert!(
+                    plane
+                        .daemon
+                        .entries
+                        .values()
+                        .all(|entry| !entry.restart_held)
+                );
+                assert!(plane.daemon.entries[&protected].update_fallback_reserved);
+            }
+            // A different Bot can proceed without holding the protected Bot's shards.
+            let other = plane.admit(&request("gateway-update", 1, 93), "id-1".into());
+            assert_eq!(other["ok"], true);
+            for entry in plane.daemon.entries.values() {
+                assert_eq!(entry.restart_held, entry.snapshot.key.bot_id == "id-1");
+            }
+            // Rejection did not consume the operation ID. Once recovery releases its
+            // reservation, the same request can be admitted and acquire the normal holds.
+            plane
+                .daemon
+                .entries
+                .get_mut(&protected)
+                .unwrap()
+                .update_fallback_reserved = false;
+            let admitted = plane.admit(&retry, "id-0".into());
+            assert_eq!(admitted["ok"], true);
+            assert_eq!(plane.operations.len(), 2);
+            assert!(
+                plane
+                    .daemon
+                    .entries
+                    .values()
+                    .all(|entry| entry.restart_held)
+            );
         }
 
         #[test]
@@ -3797,6 +3863,12 @@ impl<C: Clock> Daemon<C> {
         }
     }
 
+    fn gateway_update_fallback_pending(&self, bot_id: &str) -> bool {
+        self.entries
+            .values()
+            .any(|entry| entry.snapshot.key.bot_id == bot_id && entry.update_fallback_reserved)
+    }
+
     /// Starts a standby Gateway for `key` from the same program path (the operator has put
     /// the new build there). It logs in to Discord with its own session and holds events;
     /// it does not touch the Cores until `activate_gateway_update`.
@@ -3808,10 +3880,7 @@ impl<C: Clock> Daemon<C> {
     ) -> Result<bool, DaemonError> {
         tokio::runtime::Handle::try_current().map_err(|_| DaemonError::NoRuntime)?;
         // A prior failed update may still be waiting for its fallback Identify.
-        let fallback_pending = self
-            .entries
-            .values()
-            .any(|entry| entry.snapshot.key.bot_id == key.bot_id && entry.update_fallback_reserved);
+        let fallback_pending = self.gateway_update_fallback_pending(&key.bot_id);
         let sequence = self
             .sequence
             .checked_add(1)
