@@ -31,8 +31,9 @@ echo "sockets/secret in ipc dirs: $(find "$ROOT" \( -name '*.sock' -o -name 'cor
 echo "reservations: $(find "$ROOT" -name '*.botd-reservation' 2>/dev/null | wc -l)"
 
 echo "--- gateway.log signals (counts) ---"
-# After a Gateway update the active Gateway keeps writing gateway-candidate.log (the standby
-# it was started as), so both files are counted together.
+# Since 2026-11-16 a standby Gateway logs into the same gateway.log. Versions before that wrote
+# the active Gateway's output to gateway-candidate.log after an update; a leftover file of that
+# name is still counted together with gateway.log.
 for f in $(find "$ROOT" -name gateway.log 2>/dev/null); do
   d=$(dirname "$f"); logs="$f"; [ -f "$d/gateway-candidate.log" ] && logs="$f $d/gateway-candidate.log"
   echo "$(basename "$d"): generations=$(cat $logs | grep -c 'gateway generation')"        "login=$(cat $logs | grep -c 'ログイン成功') closes=$(cat $logs | grep -c 'Gateway 切断')"        "worker_unavailable=$(cat $logs | grep -c 'unavailable') rest_unknown=$(cat $logs | grep -c '結果不明')"

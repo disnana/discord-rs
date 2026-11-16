@@ -126,7 +126,7 @@ botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GAT
 
 ### separate での Gateway 無停止更新：gateway-update
 
-`botd --core-mode separate` では、`botctl gateway-update BOT` で Core を切らずに稼働中の Gateway を差し替えられます。WSL の実プロセス試験（`gateway_update_replaces_the_gateway_and_keeps_the_cores`、模擬 Discord）に加え、WSL と実 Discord で更新の成功、カウンタの継続、重複 5 件の破棄を 1 回確認しています（実 Discord 検証はユーザーが実施）。複数 Shard での運用、長時間稼働、Interaction の重複は未検証です。
+`botd --core-mode separate` では、`botctl gateway-update BOT` で Core を切らずに稼働中の Gateway を差し替えられます。WSL の実プロセス試験（模擬 Discord）に加え、WSL と実 Discord で更新の成功、カウンタの継続、重複 5 件の破棄を 1 回確認しています（実 Discord 検証はユーザーが実施）。2 Shard でも実 Discord で試験しましたが、長時間・繰り返しの複数 Shard 運用や Interaction の重複は未検証です。
 
 操作の前に、新しい `src` を稼働中の Gateway と同じプログラムパスへ配置してください。botd はそのパスから待機 Gateway を `--standby` 付きで起動します。
 
@@ -148,16 +148,16 @@ botd は Shard ごとに順番に次を行います。
 - 待機 Gateway の起動失敗、90 秒以内に ready にならない、activate の送信失敗では、その Shard の待機 Gateway を終了します。稼働中の Gateway は変更しません。
 - activate の後に `standby-active` が 20 秒以内に出ない、または待機 Gateway が終了した場合は操作が失敗します。このとき旧 Gateway はすでに Core から切り離されているため、botd は旧 Gateway を強制終了し、上げた epoch で起動し直します（Identify が 1 回余分に発生します）。待機 Gateway も終了します。
 - 先に完了した Shard の更新は残ります。全体の自動ロールバックはありません。
-- 操作全体は 180 秒で打ち切ります（確認待ちに入った段階は最大 20 秒でその段階を終えます。期限後に新しい段階には進みません）。
+- 操作全体のサーバー側期限は 120 秒 + 45 秒 × Shard 数です。確認待ちに入った段階は最大 20 秒でその段階を終えます。
 - activate の送信後に失敗した場合の実 Discord 上の Core と Gateway の挙動は未検証です。
 - botd が後で Gateway を起動し直すときは、現在の epoch を `--core-epoch` で渡します。古い epoch の Gateway は Core に拒否されます。
 - botd を停止すると、進行中の更新は中断されます。未 activate の待機 Gateway と、置き換え中の旧 Gateway は強制終了します。稼働中の Gateway は通常の停止手順で止まります。
 
-権限は、管理 secret に結び付いた role が `admin` で、scope が Bot の全 Shard を含む場合に限られます（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否され、副作用はありません。単体試験あり）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の要求と結果は `runtime-root/gateway-update-audit.jsonl` に 1 行ずつ追記されます（権限 0600）。event は `requested`・`rejected`・`succeeded`・`failed` のいずれかで、記録は subject、role、bot、operation ID と固定の失敗種別だけです。secret、パス、引数、エラー本文は含みません。要求を記録できない場合は、何も始めずに拒否されます（詳細と限界は[制約一覧](known-limitations.md)）。
+権限は管理 secret に結び付いた role が `admin` で、scope が選択された Shard を含む場合に限られます。対象を指定しない場合は Bot の全 Shard が対象です（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の要求と結果は `runtime-root/gateway-update-audit.jsonl` に 1 行ずつ追記されます（権限 0600）。event は `requested`・`rejected`・`succeeded`・`failed` のいずれかで、記録は subject、role、bot、operation ID と固定の失敗種別だけです。Shard 指定はまだ記録されません。secret、パス、引数、エラー本文は含みません。要求を記録できない場合は、何も始めずに拒否されます（詳細と限界は[制約一覧](known-limitations.md)）。
 
 ログは稼働中も大きさに上限があります。`gateway.log` と `gateway-candidate.log` は 8 MiB、`core-*.log` は 4 MiB を超えると、約 60 秒ごとに `.1` へ写してから空にします（既存の `.1` は置き換えます）。起動時は `gateway.log` が 1 MiB を超えていれば `.1` へ退避します。 常に書き続ける書き手でも回転が止まらないよう、増えた分を数回コピーしてから空にします。その代わり、コピーと空にする間に書かれた分は失われ得ます（量は保証しません。上限を優先）。ローテーション後は `.1` に直前の分だけが残るため、`soak-diff.sh` の「最初と最後の比較」では回転をまたぐと件数が減ることがあります。
 
-未検証：待機 Gateway の ready・activate・`standby-active` の往復、監査の記録、ログの回転は、自動プロセス試験のみで確認しています。実 Discord での確認はありません。
+待機 Gateway を同じ `gateway.log` に書く今回の変更は未検証です。ログの回転も実 Discord での確認はありません。
 
 ### Discordに接続しない模擬実行
 
@@ -182,6 +182,60 @@ cargo test --offline --test e2e_shard_runtime
 ```
 
 この試験は実Discordの登録・接続・REST、Bot全体のIdentify/REST予算、quorum/lease、Gateway新旧WebSocketのActive切替を検証するものではありません。別の `e2e_gateway_process_switch` は明示試験モードで実Gatewayプロセスの新旧切替を模擬Discord上で扱いますが、実WebSocket切替や本番安全性の証明ではありません。`--offline` だけでは実行プログラムのDiscord通信は無効にならず、模擬モードの明示が必要です。
+
+### Shard・ギルドを指定する
+
+`start|stop|restart|gateway-update BOT [--shard N]... [--guild ID]...` で対象を絞れます。以下は [Linux 配置例](linux-deployment.md) の secret とポートを使う例です。Bot 名、ID、パス、ポートは実環境に合わせます。
+
+```bash
+sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --shard 1 --secret-file /etc/discord-rs/botd.secret --port 47321 --json
+sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --guild 1533441257798369401 --secret-file /etc/discord-rs/botd.secret --port 47321 --json
+```
+
+成功時は操作の `state: "succeeded"` と Shard 別の結果を確認します。`--guild` は `inspect` の `total_shards` から `(guild_id >> 22) % total_shards` で換算し、応答の `resolved_guilds` に `guild_id` と `shard_id` を出します。両指定は繰り返せ、併用時は和集合です。換算できない場合や取得後に総 Shard 数が変わった場合は変更前に失敗します。存在しない Shard はエラーです。認可は選択した Shard だけで評価されます。古い daemon は未知の `shards` フィールドを拒否するため、指定を無視して全 Shard を操作しません。
+
+WSL・実 Discord の 2 Shard 試験では、Shard 1 のみの更新と存在しない Shard の拒否、ギルド指定と Shard 指定の併用を確認しました。`!count` の継続は確認待ちです。後続の総数の前提条件などの変更は静的確認のみです（[進捗](progress.md)）。
+
+### 全 Bot を順番に操作する：--all
+
+```bash
+sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update --all --dry-run --secret-file /etc/discord-rs/botd.secret --port 47321 --json
+sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update --all --yes --secret-file /etc/discord-rs/botd.secret --port 47321 --json
+```
+
+`start`・`stop`・`restart` でも同様に使えます。dry-run は変更せず `targets` と `skipped` を表示します。実行には `--yes` が必要で、`--dry-run` と併用できません。`--shard`・`--guild`・`--operation-id` も併用できません。ローカル Shard がない Bot は `skipped` に `reason: "not_local"` として記録されます。
+
+実行は 1 Bot の完了を待ってから次へ進み、最初の失敗で停止します。JSON の `ok`、対象数 `total`、成功数 `completed`、失敗した Bot ID の `stopped_at`（成功時は `null`）、Bot ごとの `results`（操作 ID・状態など）、`skipped` を確認します。完了済み Bot の自動巻き戻しはありません。範囲限定 principal は最初の一覧取得が拒否されるため現在 `--all` を使えません（[制約一覧](known-limitations.md)）。
+
+Oracle・実 Discord の 1 Bot で `--all --yes` の成功を確認しています。複数 Bot の順序と失敗時停止は単体試験・模擬サーバーでの確認で、複数 Bot の実機では未確認です。後続の変更は静的確認のみです。
+
+### 障害時の確認とバイナリの復旧
+
+次は [放置試験](soak-test.md) の配置例です。`OPERATION_ID` を出力された操作 ID、`SHARD_DIR` を対象 Shard のディレクトリ（例：`/var/lib/discord-rs/runtime/bot-<Bot IDの16進>/shard-0`）に置き換えます。
+
+```bash
+sudo -u discord-rs /opt/discord-rs/bin/botctl operation OPERATION_ID --secret-file /etc/discord-rs/botd.secret --port 47321 --json
+sudo tail -n 50 /var/lib/discord-rs/runtime/gateway-update-audit.jsonl
+sudo journalctl -u botd -n 100 --no-pager
+sudo sh -c 'cat SHARD_DIR/gateway*.log'
+sudo sh -c 'cat SHARD_DIR/ipc/core-*.log'
+sudo soak-report
+sudo cat /home/ubuntu/soak.log
+```
+
+操作状態が `running` なら完了待ち、`succeeded` なら成功、`failed` なら Shard 別結果と監査・ログを確認します。待機 Gateway は今回の変更で同じ `gateway.log` に書きます。旧版の `gateway-candidate.log` が残る場合があるため、上の `cat gateway*.log` で両方を確認します。回転済みの `.log.1` も必要に応じて確認します。
+
+Oracle の実 Discord では `Gateway 再接続の要求を受信`、close code 4000、`Gateway 再開（Resume 成功）` が続き、Discord の再接続要求から約 1 秒で Resume しました。この一連は失敗ではありません。4000 だけの古いログから同じ経過を推定することはできません。記録先は `/home/ubuntu/soak.log` です。root の `~` は `/root` なので絶対パスを使います。
+
+更新前に旧バイナリを退避し、復旧が必要なら以下で戻せます。復旧は botd を再起動するため Bot が一時停止します。実行前に影響を確認してください。
+
+```bash
+for f in botd botctl src; do sudo cp -p /opt/discord-rs/bin/$f /opt/discord-rs/bin/$f.prev; done
+# 復旧時（対応する .prev がすべてあることを先に確認）
+for f in botd botctl src; do sudo mv /opt/discord-rs/bin/$f.prev /opt/discord-rs/bin/$f; done
+sudo systemctl restart botd
+sudo systemctl status botd --no-pager
+```
 
 ### 状態表示と操作
 
@@ -220,7 +274,7 @@ botctl restart support --bootstrap-stdin --timeout 30s --json
 
 起動・停止・再起動には、CLIが送信前に生成した操作IDを付けます。`--operation-id ID` で32桁の小文字16進数を指定することもできます。結果にはID、操作対象、状態、所要時間、Shard別の結果・世代、失敗Shardを含みます。`--json` は成功・失敗とも機械可読なJSONをstdoutへ出し、失敗や完了未確認は非ゼロ終了コードで返します。`--json` なしの成功表示は整形JSON、失敗表示はstderrです。
 
-`--timeout` はbootstrap読取・接続・送受信・操作完了待ちを含むCLI全体の待機上限です。既定30秒、0より大きく3600秒以下を指定できます。単位なしと `s` は秒、`ms` はミリ秒で、小数も指定できます。待機timeoutや通信断でCLIが終了しても、受理済みのdaemon操作を取り消しません。新しいIDで同じ操作を送る前に、表示されたIDで結果を確認してください。
+`--timeout` はbootstrap読取・接続・送受信・操作完了待ちを含むCLIの待機上限です。既定は `gateway-update` が300秒、その他は30秒で、0より大きく3600秒以下を指定できます。単位なしと `s` は秒、`ms` はミリ秒で、小数も指定できます。300秒は更新完了の保証ではありません。待機timeoutや通信断でCLIが終了しても、受理済みのdaemon操作を取り消しません。timeoutは更新失敗を意味しないため、新しいIDで同じ操作を送る前に、表示されたIDで結果を確認してください。`--all` は一覧取得後、Bot ごとに待機上限を適用します。
 
 ```text
 botctl operation 0123456789abcdef0123456789abcdef --bootstrap-stdin --json

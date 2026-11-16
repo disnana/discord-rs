@@ -542,3 +542,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - RSS（KiB）：botd 8,176→8,220→8,228、Core 6,248→6,252→6,252／6,232 のまま、Gateway 10,796→11,136→11,208。fd は botd 16・Core 各 11・Gateway 12 で不変。再起動 0、警告 0、`worker_unavailable` 0。Gateway は最初の 1 時間で約 400 KiB 増え、その後は小さい増加（傾向は 3 点のみで判断できない）。
 - `closes` は 10→11（09:53Z の Reconnect 要求＋Resume 成功の 1 件）。
 - 11:45Z に botd を最新版（e61d8d4）へ入れ替えたため、この記録は旧世代（162112b）の分。最新版の放置は 11:46:55Z（`--all` の更新）から。
+
+### 2026-11-16 夜：更新後のログを 1 つの `gateway.log` に（work/next）
+
+- 変更：待機（候補）Gateway の出力先を `gateway-candidate.log` から、そのシャードの `gateway.log`（追記）に変更。旧 Gateway と新 Gateway は更新の重なりの短い間だけ、行単位で混ざる（出力に時刻が入る）。これで運用者が `gateway.log` を読めば、常に現在の Gateway の出力が見える。旧版が作った `gateway-candidate.log` は、残っていてもローテーション（8 MiB）の対象とし、`soak-report` も合算して読む。
+- 試験：統合テスト `gateway_update_replaces_the_gateway_and_keeps_the_cores` に「更新後に `gateway-candidate.log` が作られず、`gateway.log` が 1 つだけ」の確認を追加。**変更を外すとこのテストが失敗することを確認**（`a separate candidate log was created`）。WSL で clippy 警告なし、統合テスト 2 回成功、lib 223 件成功。実 Discord・Oracle での確認は未実施（次回の更新で確認）。
+- 運用者ガイド（`docs/operator-guide.md`）に、`--shard`／`--guild`／`--all`、既定のタイムアウト、障害時の確認先、バイナリの復旧を追加（Terra が作成、私が内容をコードと照合）。

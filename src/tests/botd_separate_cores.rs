@@ -360,6 +360,27 @@ async fn gateway_update_replaces_the_gateway_and_keeps_the_cores() {
     );
     assert!(!args(cores[1]).iter().any(|arg| arg == b"--epoch-floor"));
 
+    // The standby logs into the shard's one `gateway.log`; no separate candidate log appears.
+    fn named(dir: &std::path::Path, name: &str, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                named(&path, name, out);
+            } else if path.file_name().is_some_and(|n| n == name) {
+                out.push(path);
+            }
+        }
+    }
+    let mut candidate_logs = Vec::new();
+    named(&fixture.root, "gateway-candidate.log", &mut candidate_logs);
+    assert!(
+        candidate_logs.is_empty(),
+        "a separate candidate log was created: {candidate_logs:?}"
+    );
+    let mut gateway_logs = Vec::new();
+    named(&fixture.root, "gateway.log", &mut gateway_logs);
+    assert_eq!(gateway_logs.len(), 1, "{gateway_logs:?}");
+
     // The request and its outcome are on record, with who asked and nothing sensitive.
     let audit = std::fs::read_to_string(fixture.root.join("gateway-update-audit.jsonl"))
         .expect("gateway-update audit");

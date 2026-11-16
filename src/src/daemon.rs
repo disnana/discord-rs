@@ -4248,8 +4248,12 @@ impl<C: Clock> Daemon<C> {
                 Err(_) => return Err(DaemonError::ReservationIo),
             }
         }
+        // The standby writes to the same `gateway.log` as every other Gateway of this shard
+        // (append mode, so the old and the new Gateway only interleave whole lines during the
+        // short overlap). One file means an operator reading `gateway.log` always sees the
+        // current Gateway; a separate candidate file left the live Gateway's output elsewhere.
         let log = spec.management_path.parent().and_then(|dir| {
-            let path = dir.join("gateway-candidate.log");
+            let path = dir.join("gateway.log");
             crate::core_units::open_append_private(&path).ok()
         });
         let (out, err) = match log.and_then(|file| file.try_clone().ok().map(|c| (file, c))) {
@@ -4535,6 +4539,8 @@ impl<C: Clock> Daemon<C> {
         self.log_checked = Some(std::time::Instant::now());
         for entry in self.entries.values() {
             if let Some(dir) = entry.spec.gateway.management_path.parent() {
+                // `gateway-candidate.log` is the pre-2026-11-16 name; a leftover file is still
+                // kept within its size limit.
                 for name in ["gateway.log", "gateway-candidate.log"] {
                     let _ = crate::core_units::rotate_in_place(&dir.join(name), 8 * 1024 * 1024);
                 }
