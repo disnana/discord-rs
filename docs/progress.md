@@ -568,3 +568,11 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `!workers` に返信する前に、各 Core 接続へ `Health` を送り、`Ready` なら返信、エラーなら返信しない（fence・切断・通常の障害を区別しない）。ロックの取得に 2 秒の期限があり、取れなければ従来どおり返信する。取得後の交換はキャンセルしない（Astra 第 17 回の指摘 1：期限内の途中キャンセルは接続を壊す）。停止中は返信しない、embedded は従来どおり。
 - **保証ではない**：fence 前の二重返信、確認と HTTP 送信の間の競合、Core の通常の障害中の無返信、タイムアウト時の返信は残る。exactly-once ではない。単体テストと `core_attach` の統合テストのみで、実 Discord での更新中の確認は未実施。
 - 経緯：この節と `docs/design-workers-dedupe.md` の追記は、Codex（Terra）が日本語を `?` に化かしていたため、私が書き直した（第 17 回の指摘 2。`grep '????'` の検査範囲に別 worktree の文書が入っていなかった見落とし）。
+
+### 2026-11-16 22 時：main = 6b7c559（Astra 第 18 回で指摘なし、CI green）
+
+- 統合：更新後のログを `gateway.log` に統一／B3 の観測（30 秒以上の要求を警告。打ち切りなし）／`update-check.sh` の複数シャード・`--shard`・ローカルシャード対応／WSL 固有のテスト失敗の解消（`CARGO_TARGET_TMPDIR`）／botctl 系テストの stdin の BrokenPipe の許容／`!workers` を、fence 済みの旧 Gateway が返信しないようにする小さい代案（ロック取得のみ 2 秒の期限、交換は最後まで）／運用者ガイドと各文書の訂正。
+- 監査：第 15 回 6 件、第 16 回 2 件、第 17 回 2 件を修正し、第 18 回で指摘なし（静的な監査。実 Discord の更新中の `!workers` の確認は未実施）。
+- 検証：clippy 警告なし、lib 227 件、separate 5 件、2 シャード 3 件、`core_attach` 25 件、botctl 系 15 件（WSL、すべて成功）、Rust CI・systemd smoke green。
+- **Oracle は e61d8d4 のまま**（放置は 11:46:55Z＝20:46 JST から）。main の新しい変更（ログ統一、B3、`!workers`、スクリプト）は Oracle に入っていない。放置の結果を見てから更新する。
+- 未実施：新版（e61d8d4 以降）の 6 時間以上の放置結果、Oracle の OS 再起動後の自動起動、`!workers` の更新中の実機確認、Interaction の重複、複数 Bot の実機。
