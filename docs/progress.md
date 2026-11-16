@@ -511,3 +511,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 各 Bot の変更要求に `expect_bot_id` を付け、daemon は解決後の ID が違えば操作の開始・取り消し・restart hold の変更前に拒否する。照会にはこの前提条件を付けない。ID の接頭辞衝突、名前から完全 ID への代替、計画全体の拒否、ID 不一致時の無変更と既存操作の維持、wire での前提条件の転送を検査するテストを追加・拡張した。
 - 実験的な mock rolling 経路は `shards` と `expect_bot_id` も未対応として拒否する。既存の `expect_total_shards` と合わせ、botd の入口と Runtime の両方で拒否し、ジョブや操作が作られないことを検査する単体テストを追加した。
 - 今回は静的確認のみ。cargo・ビルド・テスト・ネットワーク接続は実行せず、コミット・push もしない。実行結果は統合担当の WSL 検証後に追記する。
+
+## 2026-11-16 夜（約 20:40 JST、概算）：Oracle を最新版（main e61d8d4）に更新し、放置をやり直す
+
+- 手順：`git pull`（162112b→e61d8d4）、`cargo build --release --locked -j 2`、旧バイナリを `/opt/discord-rs/bin/*.prev` に退避、`botd` `botctl` `src` と `soak-report` を入れ替え、`systemctl restart botd`（daemon が変わったため botd の再起動を伴う）。
+- 結果（ユーザー報告の出力）：botd は active、journal 警告 0、`restarts` 0、Core 2 本 `running`。`botctl gateway-update --all --dry-run` が `targets: [test]`、`skipped: []` で成功（新しい操作が本番側で使える）。ユーザーは「動作した」と報告。
+- 更新前の記録：旧版（162112b、約 3.5 時間）の `gateway.log` は、新版で時刻が付いた行が `ログイン成功 … (2026-11-16T08:05:44Z)` のみで、その間の新しい close code 4000 は表示された範囲になかった。`soak-report` の `closes=11`、`login=3` と、画面の行（切断 10、ログイン 2）が合わない（数える対象が `gateway.log` 以外のログにも及ぶ可能性。原因は未確認）。旧版（17 時間 42 分）の切断は約 1.8 時間に 1 回（10 回）。**切断の頻度が新版で変わったとは言えない**（観測が短い）。
+- 未確認：新版（e61d8d4）の長時間（6 時間以上）、`--all --yes` と `--shard`／`--guild` の本番側での実行、Oracle の OS 再起動後の自動起動、切断の原因（時刻付きログで操作の直後に偏るかの確認）。
