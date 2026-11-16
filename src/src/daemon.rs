@@ -2126,6 +2126,48 @@ pub mod control {
         }
 
         #[test]
+        fn gateway_update_terminal_audit_is_retried() {
+            let dir = log_dir("gateway-audit-retry");
+            let path = dir.join("audit.jsonl");
+            let mut plane = plane(1, 1);
+            plane.set_gateway_update_audit(path.clone());
+            let req = request("gateway-update", 0, 91);
+            let id = req.operation_id.clone().unwrap();
+            let actor = ("local-bootstrap".to_owned(), "admin".to_owned());
+            // Unit fixtures have no separated Core, so admit and finish directly.
+            plane
+                .audit_gateway_update("requested", &id, "id-0", &actor, None)
+                .unwrap();
+            assert_eq!(plane.admit(&req, "id-0".to_owned())["ok"], true);
+            plane.gateway_update_actors.insert(id.clone(), actor);
+            plane.set_gateway_update_audit(dir.clone());
+            let mut op = plane.operations.remove(&id).unwrap();
+            plane.finish(&mut op);
+            plane.operations.insert(id.clone(), op);
+            let status = plane.request(&CommandRequest {
+                command: "status".into(),
+                ..Default::default()
+            });
+            assert_eq!(status["status"]["gateway_update_audit"]["pending"], 1);
+            plane.set_gateway_update_audit(path.clone());
+            plane.retry_pending_audit();
+            let status = plane.request(&CommandRequest {
+                command: "status".into(),
+                ..Default::default()
+            });
+            assert_eq!(status["status"]["gateway_update_audit"]["pending"], 0);
+            let text = std::fs::read_to_string(path).unwrap();
+            let events: Vec<Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1]["event"], "succeeded");
+            assert_eq!(events[1]["operation_id"], id);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
         fn gateway_update_needs_an_admin_whose_scope_covers_the_bot() {
             use super::super::update_control::ControlAccess;
             let mut plane = plane(2, 1);

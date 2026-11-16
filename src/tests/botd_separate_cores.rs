@@ -334,6 +334,32 @@ async fn gateway_update_replaces_the_gateway_and_keeps_the_cores() {
     .await;
     assert_eq!(finished["operation"]["state"], "succeeded", "{finished}");
 
+    // A restarted Core must inherit the activated Gateway epoch; its sibling is unchanged.
+    signal(cores[0], "KILL");
+    let cores = bounded(async {
+        loop {
+            let now = worker_pids(&second.status().await);
+            if now.len() == 2 && now[0] != cores[0] && now[1] == cores[1] && alive(now[0]) {
+                return now;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    let args = |pid| {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .unwrap()
+            .split(|byte| *byte == 0)
+            .map(|arg| arg.to_vec())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        args(cores[0])
+            .windows(2)
+            .any(|pair| pair[0] == b"--epoch-floor" && pair[1] == b"1")
+    );
+    assert!(!args(cores[1]).iter().any(|arg| arg == b"--epoch-floor"));
+
     // The request and its outcome are on record, with who asked and nothing sensitive.
     let audit = std::fs::read_to_string(fixture.root.join("gateway-update-audit.jsonl"))
         .expect("gateway-update audit");
