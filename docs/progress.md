@@ -476,3 +476,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 - `botctl gateway-update` の既定の `--timeout` を 30 秒から 300 秒に変更（他のコマンドは 30 秒のまま、`--timeout` の明示が優先）。サーバー側の期限（120 秒 + 45 秒 × シャード数）に合わせ、4 シャードまで収まる。2 シャードの実機で、約 31 秒の更新が 30 秒の待ちで `operation wait timed out`、終了コード 1 になっていた件の対応。単体テスト追加（`default_wait_tests`）。
 - WSL（この開発機）で `botctl_update_control` の `mock_daemon_binds_server_roles_and_audits_update_and_rollback` が `tests/botctl_update_control.rs:425`（`AuditedExecutor::open(..).unwrap()`）で失敗する。**今回の変更を外した状態でも 3/3 で失敗**するため、変更とは無関係で、この WSL 環境でだけ起きる（CI では成功）。原因は未調査。
+
+### 2026-11-16 夜：`--shard N`（対象シャードの指定）の実装と検証
+
+- 実装：`botctl start|stop|restart|gateway-update BOT --shard N [--shard M ...]`。daemon の `CommandRequest` に任意の `shards`（空・重複・65 個以上・読み取りコマンド・update/rollback への指定は不正な要求として応答なしで拒否）。**認可（role・scope）は対象のシャードだけで評価**する（シャード限定の管理者は自分のシャードだけ操作できる）。存在しないシャードの指定は黙って飛ばさずエラー。同じ操作 ID で絞り込みが違う場合は衝突として拒否。古い daemon は未知のフィールド（`deny_unknown_fields`）で拒否するため、シャード指定が無視されて全シャードが更新される事故は起きない（安全側）。監査の記録には、まだシャード指定が入らない（未実装）。
+- 試験：botctl の引数の単体テスト、lib 216 件、2 シャードの統合テスト（`--shard 1` だけの更新でシャード 0 の Gateway と全 Core が不変、シャード 9 の拒否、無効な形は応答なし、同じ ID・別の絞り込みの衝突、同じ ID・同じ絞り込みの再実行）。WSL の実機（2 シャード、実 Discord）：`--shard 1` だけの更新が約 2 秒で成功し、シャード 1 の Gateway だけが入れ替わり、`--shard 9` は拒否。`!count` の継続はユーザー確認待ち。
+- 未実装：`--guild ID`（シャード番号への換算）、`all`（全 Bot の順次実行）、全体の進行の表示、監査へのシャード指定の記録。
