@@ -205,6 +205,34 @@ fn gateway_failure_code(kind: &twilight_gateway::error::ReceiveMessageErrorType)
 
 // External error text may contain short unlabelled credentials that heuristic
 // redaction cannot recognize. Never format unknown Display, Debug or sources.
+/// UTC time as `YYYY-MM-DDTHH:MM:SSZ` without a date-time dependency (civil-from-days).
+fn utc_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format_utc(secs)
+}
+
+fn format_utc(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
 fn failure_message(context: &'static str, error: &(dyn Error + 'static)) -> String {
     let diagnostic = if let Some(error) = error.downcast_ref::<StartupFailure>() {
         error.to_string()
@@ -1213,7 +1241,7 @@ async fn live_events(
         };
         match result {
             Ok(Event::Ready(ready)) => {
-                println!("ログイン成功: {}", ready.user.id);
+                println!("ログイン成功: {} ({})", ready.user.id, utc_stamp());
                 let Some(permit) = (if replaying {
                     replay_permit.take()
                 } else {
@@ -1477,9 +1505,20 @@ async fn live_events(
                 // Only the numeric close code: it is not a secret and tells the operator
                 // why Discord closed the connection (4004, 4014, 4000-series, ...).
                 match frame {
-                    Some(frame) => eprintln!("Gateway 切断: close code {}", frame.code),
-                    None => eprintln!("Gateway 切断: close code なし（接続の途絶）"),
+                    Some(frame) => {
+                        eprintln!("Gateway 切断: close code {} ({})", frame.code, utc_stamp())
+                    }
+                    None => eprintln!(
+                        "Gateway 切断: close code なし（接続の途絶） ({})",
+                        utc_stamp()
+                    ),
                 }
+            }
+            // Session recovery is visible in the log: a resume keeps the same session (no new
+            // Identify), a fresh `Ready` after a close means a new Identify was used.
+            Ok(Event::Resumed) => eprintln!("Gateway 再開（Resume 成功） ({})", utc_stamp()),
+            Ok(Event::GatewayReconnect) => {
+                eprintln!("Gateway 再接続の要求を受信 ({})", utc_stamp())
             }
             Err(error) => eprintln!("{}", failure_message("Gateway error", &error)),
             _ => {}
@@ -1503,6 +1542,15 @@ async fn live_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_stamp_formats_known_instants() {
+        assert_eq!(format_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(format_utc(1_794_812_232), "2026-11-16T06:57:12Z");
+        assert_eq!(format_utc(4_102_444_799), "2099-12-31T23:59:59Z");
+        assert_eq!(utc_stamp().len(), 20);
+    }
 
     #[test]
     fn clamp_reply_limits_to_2000_characters_and_never_leaves_empty() {
