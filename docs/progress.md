@@ -482,3 +482,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 実装：`botctl start|stop|restart|gateway-update BOT --shard N [--shard M ...]`。daemon の `CommandRequest` に任意の `shards`（空・重複・65 個以上・読み取りコマンド・update/rollback への指定は不正な要求として応答なしで拒否）。**認可（role・scope）は対象のシャードだけで評価**する（シャード限定の管理者は自分のシャードだけ操作できる）。存在しないシャードの指定は黙って飛ばさずエラー。同じ操作 ID で絞り込みが違う場合は衝突として拒否。古い daemon は未知のフィールド（`deny_unknown_fields`）で拒否するため、シャード指定が無視されて全シャードが更新される事故は起きない（安全側）。監査の記録には、まだシャード指定が入らない（未実装）。
 - 試験：botctl の引数の単体テスト、lib 216 件、2 シャードの統合テスト（`--shard 1` だけの更新でシャード 0 の Gateway と全 Core が不変、シャード 9 の拒否、無効な形は応答なし、同じ ID・別の絞り込みの衝突、同じ ID・同じ絞り込みの再実行）。WSL の実機（2 シャード、実 Discord）：`--shard 1` だけの更新が約 2 秒で成功し、シャード 1 の Gateway だけが入れ替わり、`--shard 9` は拒否。`!count` の継続はユーザー確認待ち。
 - 未実装：`--guild ID`（シャード番号への換算）、`all`（全 Bot の順次実行）、全体の進行の表示、監査へのシャード指定の記録。
+
+### 追記（2026-11-16 夜）：`--guild ID`（ギルドからシャードへの換算）
+
+- 実装：`botctl start|stop|restart|gateway-update BOT --guild ID [--guild ...]`。`botctl` が daemon の `inspect` から `total_shards` を読み、`(guild_id >> 22) % total_shards` でシャード番号に換算してから、`--shard` と同じ経路（`shards` の指定）で要求する。換算の結果は応答の `resolved_guilds`（`guild_id` と `shard_id`）に出る。`--shard` と併用すると和集合。換算に失敗（`inspect` 失敗や `total_shards` なし）したら、変更を送らずに失敗する。daemon の変更はない。
+- 試験：単体テスト（換算の値、不正な指定の拒否）、clippy 警告なし。WSL の実機（2 シャード、実 Discord）：`--guild 1533441257798369401` はシャード 0 だけを更新、`--guild 1569994280854884364 --shard 0` は両シャードを更新。`!count` の継続はユーザー確認待ち。
+- WSL 固有の既存の失敗：`botctl_update_daemon` の 4 件が、今回の変更を入れる前の main（7a5bdcb）でも WSL で失敗する（CI では成功）。`botctl_update_control` の 1 件と同種（監査ファイルを開く処理）と見られるが、原因は未調査。
+- 未実装：`all`（全 Bot の順次実行）、全体の進行の表示、監査へのシャード指定の記録。

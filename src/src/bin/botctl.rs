@@ -16,7 +16,7 @@ use tokio::{
 
 const REQUEST_LIMIT: usize = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
-const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl start|stop|restart|gateway-update BOT [--shard N]... ...; botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
+const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl start|stop|restart|gateway-update BOT [--shard N]... [--guild ID]...; botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
 const OFFLINE_NOTE: &str =
     "オフライン設定検証のみ。daemon・実稼働状態・認証・quorum/leaseは検証していません。";
 
@@ -35,6 +35,9 @@ struct Options {
     out: Option<PathBuf>,
     /// `--shard N` (repeatable): act on these local Shards of the Bot only.
     shards: Vec<u32>,
+    /// `--guild ID` (repeatable): act on the Shard that serves each guild
+    /// (`(guild_id >> 22) % total_shards`, resolved from the daemon's `inspect` before any mutation).
+    guilds: Vec<u64>,
 }
 
 fn valid_operation_id(value: &str) -> bool {
@@ -76,6 +79,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     let mut timeout = None;
     let mut operation_id = None;
     let mut shards: Vec<u32> = Vec::new();
+    let mut guilds: Vec<u64> = Vec::new();
     let mut force = false;
     let mut yes = false;
     let mut plan = None;
@@ -162,6 +166,25 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
                 }
                 shards.push(number);
             }
+            Some("--guild") => {
+                let value = args
+                    .next()
+                    .and_then(|value| value.to_str().map(str::to_owned))
+                    .ok_or("--guild requires a guild ID")?;
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err("--guild requires a numeric guild ID");
+                }
+                let id = value
+                    .parse::<u64>()
+                    .map_err(|_| "--guild ID is too large")?;
+                if id == 0 {
+                    return Err("--guild ID must not be zero");
+                }
+                if guilds.contains(&id) {
+                    return Err("--guild was given twice for the same guild");
+                }
+                guilds.push(id);
+            }
             Some("--timeout") if timeout.is_none() => {
                 timeout = Some(parse_timeout(
                     args.next()
@@ -234,6 +257,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             || dry_run
             || rolling
             || !shards.is_empty()
+            || !guilds.is_empty()
         {
             return Err("secret generate is offline and accepts only --out and --json");
         }
@@ -251,6 +275,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             port,
             out,
             shards: Vec::new(),
+            guilds: Vec::new(),
         });
     }
     if out.is_some() {
@@ -260,11 +285,15 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     if force && command != "stop" {
         return Err("--force is supported only for stop");
     }
-    if !shards.is_empty() && !matches!(command, "start" | "stop" | "restart" | "gateway-update") {
-        return Err("--shard is supported only for start, stop, restart and gateway-update");
+    if (!shards.is_empty() || !guilds.is_empty())
+        && !matches!(command, "start" | "stop" | "restart" | "gateway-update")
+    {
+        return Err(
+            "--shard and --guild are supported only for start, stop, restart and gateway-update",
+        );
     }
-    if shards.len() > 64 {
-        return Err("--shard may be given at most 64 times");
+    if shards.len() > 64 || guilds.len() > 64 {
+        return Err("--shard and --guild may each be given at most 64 times");
     }
     if force && !yes {
         return Err("force stop requires explicit --yes confirmation");
@@ -341,6 +370,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         port,
         out,
         shards,
+        guilds,
     })
 }
 
@@ -648,10 +678,33 @@ async fn run(options: Options) -> Value {
     run_live(options, None, deadline).await
 }
 
+/// The Shard that Discord routes a guild's events to.
+fn shard_for_guild(guild_id: u64, total_shards: u64) -> u32 {
+    // `total_shards` is at least 1 and a u32 in every validated configuration.
+    ((guild_id >> 22) % total_shards.max(1)) as u32
+}
+
 async fn run_live(
+    options: Options,
+    update: Option<UpdateControlRequest>,
+    deadline: Instant,
+) -> Value {
+    let mut resolved: Vec<(u64, u32)> = Vec::new();
+    let mut value = run_live_inner(options, update, deadline, &mut resolved).await;
+    if !resolved.is_empty() {
+        value["resolved_guilds"] = resolved
+            .iter()
+            .map(|(guild, shard)| json!({"guild_id": guild.to_string(), "shard_id": shard}))
+            .collect();
+    }
+    value
+}
+
+async fn run_live_inner(
     mut options: Options,
     update: Option<UpdateControlRequest>,
     deadline: Instant,
+    resolved: &mut Vec<(u64, u32)>,
 ) -> Value {
     let mutation = matches!(
         options.command,
@@ -674,6 +727,43 @@ async fn run_live(
         Ok(Err(error)) => return failure(error, id, None),
         Err(_) => return failure("control bootstrap timed out; no request sent", id, None),
     };
+    if !options.guilds.is_empty() {
+        // Resolve guilds to Shards from the daemon's own total before anything is mutated.
+        let inspect = Request {
+            secret: &bootstrap.secret,
+            command: "inspect",
+            bot: options.bot.as_deref(),
+            operation_id: None,
+            force: false,
+            yes: false,
+            shards: None,
+        };
+        let response = match timeout_at(deadline, exchange(&bootstrap, &inspect)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return failure(error, id, None),
+            Err(_) => {
+                return failure("guild resolution timed out; no mutation sent", id, None);
+            }
+        };
+        let Some(total) = response["bot"]["total_shards"]
+            .as_u64()
+            .filter(|total| *total > 0)
+        else {
+            return failure(
+                "daemon did not report total shards; no mutation sent",
+                id,
+                None,
+            );
+        };
+        for guild in options.guilds.clone() {
+            let shard = shard_for_guild(guild, total);
+            resolved.push((guild, shard));
+            if !options.shards.contains(&shard) {
+                options.shards.push(shard);
+            }
+        }
+    }
+    let id = options.operation_id.as_deref();
     if let Some(update) = &update {
         // Check the entire authenticated payload before even a read-only query.
         if let Err(error) = encode_request(&DaemonControlEnvelope {
@@ -986,6 +1076,41 @@ mod default_wait_tests {
             vec!["gateway-update", "bot", "--shard", "1", "--shard", "1"],
             vec!["status", "bot", "--shard", "1"],
             vec!["ps", "--shard", "1"],
+        ] {
+            assert!(with(&bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn guild_ids_resolve_to_discord_shards_and_are_validated() {
+        // The two guilds used in the real two-shard check: one per Shard for 2 shards.
+        assert_eq!(shard_for_guild(1_533_441_257_798_369_401, 2), 0);
+        assert_eq!(shard_for_guild(1_569_994_280_854_884_364, 2), 1);
+        assert_eq!(shard_for_guild(1_569_994_280_854_884_364, 4), 3);
+        assert_eq!(shard_for_guild(1_569_994_280_854_884_364, 1), 0);
+        let base = ["--secret-file", "/tmp/s", "--port", "1"];
+        let with = |extra: &[&str]| -> Result<Options, &'static str> {
+            let args: Vec<OsString> = [extra, &base[..]]
+                .concat()
+                .iter()
+                .map(OsString::from)
+                .collect();
+            parse_options(&args)
+        };
+        let ok = with(&["gateway-update", "bot", "--guild", "1533441257798369401"]).unwrap();
+        assert_eq!(ok.guilds, vec![1_533_441_257_798_369_401]);
+        for bad in [
+            vec!["gateway-update", "bot", "--guild"],
+            vec!["gateway-update", "bot", "--guild", "abc"],
+            vec!["gateway-update", "bot", "--guild", "0"],
+            vec![
+                "gateway-update",
+                "bot",
+                "--guild",
+                "99999999999999999999999",
+            ],
+            vec!["gateway-update", "bot", "--guild", "5", "--guild", "5"],
+            vec!["status", "bot", "--guild", "5"],
         ] {
             assert!(with(&bad).is_err(), "{bad:?} must be rejected");
         }
