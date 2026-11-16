@@ -413,3 +413,13 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 試験後、WSL の botd は停止・無効のまま（Oracle で再開するため）。
 
 次：Oracle で新版を入れ替え（`docs/soak-test.md` §5）、新版の放置（6 時間以上）。
+
+## 2026-11-16 17:05 JST（08:05 UTC）：Oracle で新版（main 162112b）の放置を開始
+
+- 入れ替えは Git で行った（初回：`git clone https://github.com/tp-li-dev/discord-rs`、旧 zip の `src/target` を再利用、`cargo build --release --locked -j 2`、旧バイナリは `/opt/discord-rs/bin/*.prev` に退避）。以降の更新は `git pull`。
+- 起動：08:05:43 UTC。再起動 0、journal 警告 0。RSS：botd 7.5 MB、Core 各 6.1 MB、Gateway 10.2 MB、fd 16／11／11／13。
+- `update-check.sh test`（1 回）：全 PASS（Core 不変、Gateway 143125→143979、旧 Gateway 消滅、IPC・マーカー・監査 requested→succeeded）。ユーザーの `!count` の確認は未記入。
+- 追加の変更点（162112b）：`gateway.log` の切断・再開・再接続要求の行に UTC 時刻を付けた（`Gateway 切断: close code 4000 (2026-…Z)`）。放置中にユーザーがコマンドを送った時刻を控え、切断時刻と比べる（「操作の直後に切れる」仮説の確認）。`Resume 成功` の行が出れば、同じセッションで復帰している。
+- サーバーに「System restart required」（カーネル更新）が出ている。再起動は放置試験の後に行い、そのときに OS 再起動後の自動起動（実機）も確認できる。
+- 未確認：新版の長時間（6 時間以上）、切断の原因、複数 Shard、`!workers` の重複。
+- CI：`update_load::crash_old_core` が不安定（162112b は新しい実行で成功、再実行で 3 回失敗。380ca6f は別の既知の不安定な `botctl_update_control` で失敗）。`src/src` の変更とは無関係（出力文言を読むコードはない）。原因は未確定。
