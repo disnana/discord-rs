@@ -576,3 +576,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 検証：clippy 警告なし、lib 227 件、separate 5 件、2 シャード 3 件、`core_attach` 25 件、botctl 系 15 件（WSL、すべて成功）、Rust CI・systemd smoke green。
 - **Oracle は e61d8d4 のまま**（放置は 11:46:55Z＝20:46 JST から）。main の新しい変更（ログ統一、B3、`!workers`、スクリプト）は Oracle に入っていない。放置の結果を見てから更新する。
 - 未実施：新版（e61d8d4 以降）の 6 時間以上の放置結果、Oracle の OS 再起動後の自動起動、`!workers` の更新中の実機確認、Interaction の重複、複数 Bot の実機。
+
+### 2026-11-16 夜（最後）：設計判断のフォルダ `docs/design-decisions/` を作成
+
+- 構成：`README.md`（索引）、`decisions-needed.md`（ユーザーの判断が必要なもの D1〜D8 と私の推奨）、`unverified-items.md`（未確認・不明のもの、確認方法、担当）、テーマ別の設計・対応案 `01`〜`08`（止まったハンドラ、コピーで作業してコミットする案、Core の無停止差し替え、複数ホストの準備、Identify と Resume、botd の死亡と再採用、状態の保存、結果不明の外部操作）。
+- 「確認済み」（コード・実機・テストの記録に出典あり）と、「私の記憶・一般知識で公式の仕様や実装で未確認」（Discord の Identify の制限、discord.py の再試行、nonce と enforce_nonce）を分けて書いた。すべて未実装・未検証の案であり、実装済みのもの（B3 の観測など）は、そう明記した。
