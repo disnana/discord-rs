@@ -242,6 +242,73 @@ def violations(result):
     return failures
 
 
+def print_failure_diagnostics(root, result, sent, observations, replies):
+    """Print bounded, allowlisted evidence after acceptance failure only."""
+    lines = ["failure diagnostics: " + result["case"]]
+    lines.append(json.dumps({key: result.get(key) for key in
+                             ("faults", "changes", "errors", "violations")}, ensure_ascii=True))
+    start = min((row["ns"] for row in sent.values()), default=None)
+    if start is None:
+        lines.append("timeline unavailable: no events sent")
+    else:
+        result_rows = [row for row in replies if row.get("type") == "result" and "ns" in row]
+        result_ids = {row["id"] for row in result_rows}
+        missing = sorted(set(sent) - result_ids)
+        last = max((row["ns"] for row in result_rows), default=None)
+        lines.append(f"start=first send; first_missing_id={missing[0] if missing else None}; "
+                     f"last_result_ms={round((last - start) / 1e6, 3) if last is not None else None}")
+        for fault in result.get("faults", []):
+            for key in ("ns", "release_ns"):
+                if key in fault:
+                    lines.append(f"{fault.get('target')} {key} relative_ms={(fault[key] - start) / 1e6:.3f}")
+        for change in result.get("changes", []):
+            for key in ("start_ns", "end_ns"):
+                if key in change:
+                    lines.append(f"{change.get('kind')} {key} relative_ms={(change[key] - start) / 1e6:.3f}")
+        buckets = {}
+        for rows, column in ((sent.values(), 0), (result_rows, 1),
+                             ((row for row in observations if row.get("kind") == "ack"), 2)):
+            for row in rows:
+                bucket = (row["ns"] - start) // 250_000_000
+                buckets.setdefault(bucket, [0, 0, 0])[column] += 1
+        lines.append("250ms bucket from first send: sent results ACKs")
+        if buckets:
+            last_bucket = max(buckets)
+            indices = list(range(min(last_bucket + 1, 60)))
+            if last_bucket >= 60:
+                indices += [None] + list(range(max(60, last_bucket - 19), last_bucket + 1))
+            for index in indices:
+                lines.append("... intermediate buckets omitted ..." if index is None else
+                             f"{index * 250:>6}ms: " + " ".join(map(str, buckets.get(index, [0, 0, 0]))))
+    logs = sorted(path for path in root.rglob("*.log*") if path.is_file() and
+                  ("gateway" in path.name.lower() or "worker" in path.name.lower() or
+                   path.name.startswith("core-")))
+    if not logs:
+        lines.append("Worker/Gateway stderr logs: none found (some processes discard stderr)")
+    for path in logs:
+        lines.append(f"stderr {path.relative_to(root)} (last 40 lines):")
+        try:
+            with path.open("rb") as stream:
+                stream.seek(0, 2)
+                stream.seek(max(0, stream.tell() - 65536))
+                tail = stream.read().decode("utf-8", errors="replace").splitlines()[-40:]
+            lines.extend(tail or ["(empty)"])
+        except OSError as error:
+            lines.append(f"(unreadable: {type(error).__name__})")
+    # Reserve space for an explicit truncation marker; limit bytes as well as lines.
+    output, size = [], 0
+    for line in lines:
+        if len(line.encode("utf-8")) > 1024:
+            line = line.encode("utf-8")[:1000].decode("utf-8", errors="ignore") + " ... [line truncated]"
+        encoded = (line + "\n").encode("utf-8")
+        if len(output) >= 199 or size + len(encoded) > 32720:
+            output.append("... diagnostics truncated ...\n")
+            break
+        output.append(line + "\n")
+        size += len(encoded)
+    print("".join(output), end="", flush=True)
+
+
 class Gateway:
     def __init__(self, owner, stream):
         self.owner, self.stream = owner, stream
@@ -281,6 +348,7 @@ class Gateway:
                     slots = [worker["index"] for worker in row["workers"]]
                     self.owner.double_active += len(slots) - len(set(slots))
                 elif row["type"] == "result":
+                    row["ns"] = time.monotonic_ns()
                     receipt = row.get("receipt")
                     if receipt:
                         self.owner.pids.add(receipt["pid"])
@@ -499,6 +567,7 @@ class Run:
                 self.faults.append({"target": "old_worker", "pid": old, "ns": time.monotonic_ns(),
                                     "stage": "candidate_restore_before_commit"})
                 Path(str(path) + ".release").touch()
+                self.faults[-1]["release_ns"] = time.monotonic_ns()
             else:
                 if mode != "crash-restore":
                     crashed = eventually(lambda: list(self.root.glob(path.name + ".*.crashed")))
@@ -648,9 +717,11 @@ class Run:
         # Persist allowlisted evidence, not raw frames, management requests or env.
         (self.root / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         evidence = {"sent": self.sent, "http": self.observations,
-                    "results": [{key: row.get(key) for key in ("type", "id", "outcome")} for row in self.replies]}
+                    "results": [{key: row.get(key) for key in ("type", "id", "outcome", "ns")} for row in self.replies]}
         (self.root / "events.json").write_text(json.dumps(evidence), encoding="utf-8")
         emit(result)
+        if result["violations"]:
+            print_failure_diagnostics(self.root, result, self.sent, self.observations, self.replies)
         watchdog.cancel()
         return int(bool(result["violations"]))
 

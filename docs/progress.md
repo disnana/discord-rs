@@ -423,3 +423,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - サーバーに「System restart required」（カーネル更新）が出ている。再起動は放置試験の後に行い、そのときに OS 再起動後の自動起動（実機）も確認できる。
 - 未確認：新版の長時間（6 時間以上）、切断の原因、複数 Shard、`!workers` の重複。
 - CI：`update_load::crash_old_core` が不安定（162112b は新しい実行で成功、再実行で 3 回失敗。380ca6f は別の既知の不安定な `botctl_update_control` で失敗）。`src/src` の変更とは無関係（出力文言を読むコードはない）。原因は未確定。
+
+## 2026-11-16：負荷試験失敗時の診断
+
+- fixture で結果受信と release の時刻を記録し、acceptance 失敗時に 250 ms ごとの送信・結果・ACK、障害時刻、Worker/Gateway の stderr 末尾を上限付きで表示する。relay の実 Worker stderr も証拠に保存する。
+- 原因は引き続き未確定。cargo と CI 上の実プロセス検証は未実施で、integrator が実行する。

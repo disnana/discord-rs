@@ -77,13 +77,17 @@ struct Relay {
 impl Relay {
     fn start(executable: &Path) -> Result<Self> {
         let program = fs::read_to_string(sidecar(executable, ".real"))?;
+        let stderr = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(sidecar(executable, &format!(".worker-{}.log", std::process::id())))?;
         // The owning Manager has already cleared credentials and supplied only
         // Worker identity. Preserve that isolated launch environment unchanged.
         let mut child = Command::new(program.trim())
             .arg("--worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()?;
         let input = child.stdin.take().ok_or("missing Worker input")?;
         let output = BufReader::new(child.stdout.take().ok_or("missing Worker output")?);
