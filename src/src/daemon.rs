@@ -823,6 +823,9 @@ pub mod control {
         /// can act on its own Shards only. An old daemon rejects the unknown field (fail closed).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub shards: Option<Vec<u32>>,
+        /// Refuse stale client-side guild routing before admitting any mutation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expect_total_shards: Option<u32>,
     }
 
     impl CommandRequest {
@@ -882,6 +885,13 @@ pub mod control {
                 _ => false,
             };
             base && self.shards_valid()
+                && self.expect_total_shards.is_none_or(|total| {
+                    total > 0
+                        && matches!(
+                            self.command.as_str(),
+                            "start" | "stop" | "restart" | "gateway-update"
+                        )
+                })
         }
     }
 
@@ -1273,7 +1283,14 @@ pub mod control {
                 request.command.as_str(),
                 "ps" | "status" | "inspect" | "shards" | "operation"
             );
-            let keys: Vec<_> = if request.command == "shards" {
+            let keys: Vec<_> = if request.command == "operation" {
+                request
+                    .operation_id
+                    .as_ref()
+                    .and_then(|id| self.operations.get(id))
+                    .map(|op| op.targets.clone())
+                    .unwrap_or_default()
+            } else if request.command == "shards" {
                 self.config
                     .bots
                     .iter()
@@ -1518,6 +1535,15 @@ pub mod control {
                 },
                 None => None,
             };
+            if let Some(expected) = request.expect_total_shards
+                && selected.as_ref().is_none_or(|bot| {
+                    bot.total_shards != crate::placement::ShardCount::Fixed(expected)
+                })
+            {
+                return Self::error(
+                    "bot total_shards changed; resolve guilds again before retrying",
+                );
+            }
             match request.command.as_str() {
                 "ps" | "status" | "inspect" => {
                     let processes: Vec<_> = self
@@ -1614,6 +1640,19 @@ pub mod control {
                 .collect();
             if !active.is_empty() && !request.force {
                 return Self::error("bot already has an operation in progress");
+            }
+            // Superseding an operation also changes its other shards' restart holds and
+            // candidate lifetimes. A filtered force stop must authorize that entire effect.
+            // Refuse before finishing anything or installing new holds.
+            if request.shards.is_some()
+                && active.iter().any(|id| {
+                    self.operations[id]
+                        .targets
+                        .iter()
+                        .any(|key| !targets.contains(key))
+                })
+            {
+                return Self::error("another operation is running on other shards of this bot");
             }
             if request.command == "gateway-update"
                 && self.daemon.gateway_update_fallback_pending(&bot_id)
@@ -2048,6 +2087,142 @@ pub mod control {
 
         fn no_credentials(_: &str) -> Option<OsString> {
             panic!("read credentials without a launch");
+        }
+
+        #[test]
+        fn filtered_force_stop_preserves_another_shards_restart() {
+            let mut plane = plane(1, 2);
+            let mut restart = request("restart", 0, 1);
+            restart.shards = Some(vec![1]);
+            assert_eq!(plane.request(&restart)["operation"]["state"], "running");
+            let before = serde_json::to_value(plane.daemon.snapshots()).unwrap();
+            let key = |shard_id| ShardKey {
+                bot_id: "id-0".into(),
+                shard_id,
+            };
+            assert!(plane.daemon.entries[&key(1)].restart_held);
+            assert!(!plane.daemon.entries[&key(0)].restart_held);
+
+            let mut stop = request("stop", 0, 2);
+            stop.shards = Some(vec![0]);
+            stop.force = true;
+            stop.yes = true;
+            let refused = plane.request(&stop);
+            assert_eq!(refused["ok"], false);
+            assert_eq!(
+                refused["error"],
+                "another operation is running on other shards of this bot"
+            );
+            assert_eq!(plane.request(&query(1))["operation"]["state"], "running");
+            assert_eq!(plane.operations.len(), 1);
+            assert!(plane.daemon.entries[&key(1)].restart_held);
+            assert!(!plane.daemon.entries[&key(0)].restart_held);
+            assert_eq!(
+                serde_json::to_value(plane.daemon.snapshots()).unwrap(),
+                before
+            );
+
+            // Whole-Bot force stop retains its existing supersession behavior.
+            stop.shards = None;
+            assert_eq!(plane.request(&stop)["ok"], true);
+            assert_eq!(plane.request(&query(1))["operation"]["state"], "failed");
+        }
+
+        #[test]
+        fn scoped_operation_queries_use_the_operations_targets() {
+            use super::super::update_control::ControlAccess;
+            let mut plane = plane(1, 2);
+            let access = |shard_id| ControlAccess {
+                subject: "scoped-admin".into(),
+                role: "admin".into(),
+                scope: Some(vec![ShardKey {
+                    bot_id: "id-0".into(),
+                    shard_id,
+                }]),
+            };
+            let mut restart = request("restart", 0, 1);
+            restart.shards = Some(vec![1]);
+            assert_eq!(plane.request_as(&restart, &access(1))["ok"], true);
+            let own = plane.request_as(&query(1), &access(1));
+            assert_eq!(own["ok"], true);
+            assert_eq!(own["operation"]["shards"].as_array().unwrap().len(), 1);
+            assert_eq!(plane.request_as(&query(1), &access(0))["ok"], false);
+
+            // A matching shard is insufficient if the operation also covers another shard.
+            let mut whole = request("stop", 0, 2);
+            whole.force = true;
+            whole.yes = true;
+            assert_eq!(plane.request(&whole)["ok"], true);
+            assert_eq!(plane.request_as(&query(2), &access(1))["ok"], false);
+            // Completed operation snapshots retain their original authorization scope.
+            assert_eq!(
+                plane.request_as(&query(1), &access(1))["operation"]["state"],
+                "failed"
+            );
+        }
+
+        #[test]
+        fn shard_count_precondition_is_only_valid_for_lifecycle_mutations() {
+            for command in ["start", "stop", "restart", "gateway-update"] {
+                let mut command = request(command, 0, 1);
+                command.expect_total_shards = Some(2);
+                assert!(command.valid());
+                command.expect_total_shards = Some(0);
+                assert!(!command.valid());
+            }
+            for command in [
+                "ps",
+                "status",
+                "inspect",
+                "shards",
+                "operation",
+                "gateway-prepare",
+            ] {
+                let mut command = match command {
+                    "operation" => query(1),
+                    "gateway-prepare" => request(command, 0, 1),
+                    _ => CommandRequest {
+                        command: command.into(),
+                        bot: matches!(command, "inspect" | "shards").then(|| "bot0".into()),
+                        ..Default::default()
+                    },
+                };
+                assert!(command.valid());
+                command.expect_total_shards = Some(2);
+                assert!(!command.valid());
+            }
+        }
+
+        #[test]
+        fn stale_shard_count_is_refused_before_supersession_or_restart_holds() {
+            let mut plane = plane(1, 2);
+            let mut restart = request("restart", 0, 1);
+            restart.shards = Some(vec![1]);
+            restart.expect_total_shards = Some(1);
+            let refused = plane.request(&restart);
+            assert_eq!(refused["ok"], false);
+            assert_eq!(
+                refused["error"],
+                "bot total_shards changed; resolve guilds again before retrying"
+            );
+            assert!(plane.operations.is_empty());
+            assert!(
+                plane
+                    .daemon
+                    .entries
+                    .values()
+                    .all(|entry| !entry.restart_held)
+            );
+            restart.expect_total_shards = Some(2);
+            assert_eq!(plane.request(&restart)["ok"], true);
+
+            let mut stop = request("stop", 0, 2);
+            stop.force = true;
+            stop.yes = true;
+            stop.expect_total_shards = Some(1);
+            assert_eq!(plane.request(&stop)["ok"], false);
+            assert_eq!(plane.operations.len(), 1);
+            assert_eq!(plane.request(&query(1))["operation"]["state"], "running");
         }
 
         #[test]

@@ -474,7 +474,7 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 ### 追記（2026-11-16 夜）：`botctl gateway-update` の既定の待ち時間と、WSL 固有の既存の失敗
 
-- `botctl gateway-update` の既定の `--timeout` を 30 秒から 300 秒に変更（他のコマンドは 30 秒のまま、`--timeout` の明示が優先）。サーバー側の期限（120 秒 + 45 秒 × シャード数）に合わせ、4 シャードまで収まる。2 シャードの実機で、約 31 秒の更新が 30 秒の待ちで `operation wait timed out`、終了コード 1 になっていた件の対応。単体テスト追加（`default_wait_tests`）。
+- `botctl gateway-update` の既定の `--timeout` を 30 秒から 300 秒に変更（他のコマンドは 30 秒のまま、`--timeout` の明示が優先）。300 秒は待ち時間の既定値で、4 シャードの完了保証ではない。サーバー側の期限（120 秒 + 45 秒 × シャード数）を過ぎても有効化の確認に最大 20 秒を使い得るほか、接続・ポーリングの時間も必要になる。長い更新には `--timeout` を明示して延長する。2 シャードの実機で、約 31 秒の更新が 30 秒の待ちで `operation wait timed out`、終了コード 1 になっていた件の対応。単体テスト追加（`default_wait_tests`）。
 - WSL（この開発機）で `botctl_update_control` の `mock_daemon_binds_server_roles_and_audits_update_and_rollback` が `tests/botctl_update_control.rs:425`（`AuditedExecutor::open(..).unwrap()`）で失敗する。**今回の変更を外した状態でも 3/3 で失敗**するため、変更とは無関係で、この WSL 環境でだけ起きる（CI では成功）。原因は未調査。
 
 ### 2026-11-16 夜：`--shard N`（対象シャードの指定）の実装と検証
@@ -492,5 +492,15 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 ### 追記（2026-11-16 夜）：`--all`（全 Bot の順次実行）
 
-- 実装：`botctl start|stop|restart|gateway-update --all (--yes | --dry-run)`（`--all` は旗で、Bot 名とは別。名前が `all` の Bot と衝突しない）。`--all` は影響が大きいので `--yes`（確認）が必須で、`--dry-run` は対象の Bot 一覧だけを出して何も変更しない。`--shard`・`--guild`・`--operation-id` とは併用不可。daemon の `ps` から Bot の一覧を得て、ローカルにシャードがない Bot（`not_local`）は飛ばし、`skipped` に理由つきで出す。Bot を **1 つずつ順に**（前の Bot の操作が終わってから次へ）実行し、**最初の失敗で止める**（`stopped_at`）。Bot ごとの操作 ID と状態を `results` に出す。`--yes` は `--all` の確認にのみ使い、各 Bot へは強制停止のときだけ転送する。daemon の変更はなく、認可は各 Bot の要求ごとに daemon が評価する（見えない Bot は一覧に出ない）。
+- 実装：`botctl start|stop|restart|gateway-update --all (--yes | --dry-run)`（`--all` は旗で、Bot 名とは別。名前が `all` の Bot と衝突しない）。`--all` は影響が大きいので `--yes`（確認）が必須で、`--dry-run` は対象の Bot 一覧だけを出して何も変更しない。`--shard`・`--guild`・`--operation-id` とは併用不可。daemon の `ps` から Bot の一覧を得て、ローカルにシャードがない Bot（`not_local`）は飛ばし、`skipped` に理由つきで出す。Bot を **1 つずつ順に**（前の Bot の操作が終わってから次へ）実行し、**最初の失敗で止める**（`stopped_at`）。Bot ごとの操作 ID と状態を `results` に出す。`--yes` は `--all` の確認にのみ使い、各 Bot へは強制停止のときだけ転送する。認可は各 Bot の要求ごとに daemon が評価する。ただし範囲限定の principal には対象なしの `ps` 自体が拒否されるため、範囲限定の `--all` は変更を送る前に失敗する。許可された Bot だけの一覧へ自動で絞る機能はない。
 - 試験：botctl の単体テスト（引数の検証、対象の選別、順序と最初の失敗での停止、失敗した操作状態の扱い）。WSL の実機（2 シャード、実 Discord）：`--yes` なしは拒否、`--dry-run` は対象を表示、`--all --yes` は 34 秒で成功。複数 Bot の実機での順次実行は、Bot が 1 つの環境のため未確認（順序と停止は単体テストのみ）。
+
+### 2026-11-16：第12回監査の8件に対応（WSL での検証待ち）
+
+- シャードを指定した強制停止は、選択外のシャードを含む進行中の操作があれば、取り消しや restart hold の変更より前に拒否する。Bot 全体の強制停止は従来どおり。別シャードの再起動が取り消されず、hold も漏れないことを確認する単体テストを追加。
+- `operation` の認可は保存された操作の対象シャードで判定する。自分のシャードの操作を照会でき、範囲外や一部しか許可されていない操作は照会できないことを単体テストへ追加。
+- `--all` は bootstrap を一度だけ読み、各 Bot の処理へ渡す。結果には操作スナップショットと `shards`／`failed_shards` を残す。2 Bot の模擬制御サーバーを使うテストを追加し、再読込防止、操作 ID の分離、強制停止だけへの `yes` 転送を検査する。部分失敗の診断保持も単体テストへ追加。
+- `--guild` で取得したシャード総数を `expect_total_shards` として送る。daemon は現在値と違えば操作を開始せず拒否する。読み取り命令や総数 0 への指定は不正。古い daemon は未知のフィールドとして拒否する。模擬 rolling 専用経路も、この前提条件を無視せず未対応として拒否する。妥当性・不一致時の無変更を単体テストへ追加し、2 シャードの統合テストにも wire 経由の不一致拒否と一致時の更新を追加。
+- 範囲限定の `--all` が一覧取得の時点で拒否されることを上記と known-limitations に明記。`stop --all --force --dry-run` は `--yes` なしで許可するが、実行時の確認と `--dry-run`／`--yes` の排他は維持する。
+- 300 秒は既定の待ち時間であり、4 シャードの完了保証ではない。最大 20 秒の有効化確認とポーリング等の余裕を考慮し、必要に応じて `--timeout` で延長する。
+- 今回はコードと追加テストの静的確認のみ。cargo・ビルド・テスト・実 Discord 接続は実行せず、コミット・push もしない。実行結果は統合担当の WSL 検証後に追記する。

@@ -52,9 +52,9 @@ fn valid_operation_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Default `--timeout` in seconds. `gateway-update` waits for the daemon's own per-operation
-/// deadline (120 s + 45 s per shard; 300 s covers up to four shards), so a normal multi-shard
-/// update is not reported as "wait timed out" while it is still succeeding.
+/// Default client wait, not a completion guarantee. The daemon's 120 s + 45 s per shard
+/// deadline can be followed by up to 20 s of activation, plus polling/transport overhead.
+/// Operators can extend this wait with --timeout.
 fn default_wait_seconds(command: &str) -> u64 {
     if command == "gateway-update" { 300 } else { 30 }
 }
@@ -328,7 +328,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             );
         }
     }
-    if force && !yes {
+    if force && !yes && !(all && dry_run) {
         return Err("force stop requires explicit --yes confirmation");
     }
     let update = matches!(command, "update" | "rollback");
@@ -391,8 +391,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         bot,
         file,
         operation_id,
-        // A Gateway rolling update takes 120 s + 45 s per shard on the daemon side (it waits for
-        // the 30 s Identify spacing between shards), so the default wait must outlast that.
+        // Gateway updates get a longer default, not a bound on server completion.
         // Other commands keep 30 s. An explicit --timeout always wins.
         timeout: timeout.unwrap_or_else(|| Duration::from_secs(default_wait_seconds(command))),
         force,
@@ -429,6 +428,8 @@ struct Request<'a> {
     yes: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     shards: Option<&'a [u32]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expect_total_shards: Option<u32>,
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(
@@ -713,7 +714,7 @@ async fn run(options: Options) -> Value {
         return run_all(options).await;
     }
     let deadline = Instant::now() + options.timeout;
-    run_live(options, None, deadline).await
+    run_live(options, None, deadline, None).await
 }
 
 /// One Bot of an `--all` run.
@@ -768,6 +769,9 @@ where
                 .as_str()
                 .or_else(|| response["operation_id"].as_str()),
             "error": response["error"],
+            "operation": response["operation"],
+            "shards": response["operation"]["shards"],
+            "failed_shards": response["operation"]["failed_shards"],
         }));
         if !ok {
             stopped_at = Some(target.bot_id.clone());
@@ -790,6 +794,17 @@ async fn run_all(options: Options) -> Value {
         Ok(Err(error)) => return failure(error, None, None),
         Err(_) => return failure("control bootstrap timed out; no request sent", None, None),
     };
+    run_all_loaded(options, &bootstrap, started, list_deadline).await
+}
+
+// Keep the one-shot stdin capability alive for the complete batch; per-Bot calls
+// must neither reread stdin nor silently switch credentials between targets.
+async fn run_all_loaded(
+    options: Options,
+    bootstrap: &Bootstrap,
+    started: Instant,
+    list_deadline: Instant,
+) -> Value {
     let listing = Request {
         secret: &bootstrap.secret,
         command: "ps",
@@ -798,8 +813,9 @@ async fn run_all(options: Options) -> Value {
         force: false,
         yes: false,
         shards: None,
+        expect_total_shards: None,
     };
-    let response = match timeout_at(list_deadline, exchange(&bootstrap, &listing)).await {
+    let response = match timeout_at(list_deadline, exchange(bootstrap, &listing)).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => return failure(error, None, None),
         Err(_) => return failure("bot listing timed out; nothing was changed", None, None),
@@ -838,7 +854,7 @@ async fn run_all(options: Options) -> Value {
         one.yes = one.force;
         one.operation_id = None;
         let deadline = Instant::now() + one.timeout;
-        async move { run_live(one, None, deadline).await }
+        async move { run_live(one, None, deadline, Some(bootstrap)).await }
     })
     .await;
     let completed = results.iter().filter(|result| result["ok"] == true).count();
@@ -858,9 +874,10 @@ async fn run_live(
     options: Options,
     update: Option<UpdateControlRequest>,
     deadline: Instant,
+    bootstrap: Option<&Bootstrap>,
 ) -> Value {
     let mut resolved: Vec<(u64, u32)> = Vec::new();
-    let mut value = run_live_inner(options, update, deadline, &mut resolved).await;
+    let mut value = run_live_inner(options, update, deadline, &mut resolved, bootstrap).await;
     if !resolved.is_empty() {
         value["resolved_guilds"] = resolved
             .iter()
@@ -875,6 +892,7 @@ async fn run_live_inner(
     update: Option<UpdateControlRequest>,
     deadline: Instant,
     resolved: &mut Vec<(u64, u32)>,
+    preloaded: Option<&Bootstrap>,
 ) -> Value {
     let mutation = matches!(
         options.command,
@@ -887,16 +905,24 @@ async fn run_live_inner(
         };
     }
     let id = options.operation_id.as_deref();
-    let bootstrap = match timeout_at(
-        deadline,
-        load_bootstrap(options.secret_file.as_deref(), options.port),
-    )
-    .await
-    {
-        Ok(Ok(bootstrap)) => bootstrap,
-        Ok(Err(error)) => return failure(error, id, None),
-        Err(_) => return failure("control bootstrap timed out; no request sent", id, None),
+    let loaded;
+    let bootstrap = match preloaded {
+        Some(bootstrap) => bootstrap,
+        None => {
+            loaded = match timeout_at(
+                deadline,
+                load_bootstrap(options.secret_file.as_deref(), options.port),
+            )
+            .await
+            {
+                Ok(Ok(bootstrap)) => bootstrap,
+                Ok(Err(error)) => return failure(error, id, None),
+                Err(_) => return failure("control bootstrap timed out; no request sent", id, None),
+            };
+            &loaded
+        }
     };
+    let mut expect_total_shards = None;
     if !options.guilds.is_empty() {
         // Resolve guilds to Shards from the daemon's own total before anything is mutated.
         let inspect = Request {
@@ -907,8 +933,9 @@ async fn run_live_inner(
             force: false,
             yes: false,
             shards: None,
+            expect_total_shards: None,
         };
-        let response = match timeout_at(deadline, exchange(&bootstrap, &inspect)).await {
+        let response = match timeout_at(deadline, exchange(bootstrap, &inspect)).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return failure(error, id, None),
             Err(_) => {
@@ -917,6 +944,8 @@ async fn run_live_inner(
         };
         let Some(total) = response["bot"]["total_shards"]
             .as_u64()
+            .filter(|_| response["ok"] == true)
+            .and_then(|total| u32::try_from(total).ok())
             .filter(|total| *total > 0)
         else {
             return failure(
@@ -925,8 +954,9 @@ async fn run_live_inner(
                 None,
             );
         };
+        expect_total_shards = Some(total);
         for guild in options.guilds.clone() {
-            let shard = shard_for_guild(guild, total);
+            let shard = shard_for_guild(guild, u64::from(total));
             resolved.push((guild, shard));
             if !options.shards.contains(&shard) {
                 options.shards.push(shard);
@@ -950,8 +980,9 @@ async fn run_live_inner(
             force: false,
             yes: false,
             shards: None,
+            expect_total_shards: None,
         };
-        let response = match timeout_at(deadline, exchange(&bootstrap, &inspect)).await {
+        let response = match timeout_at(deadline, exchange(bootstrap, &inspect)).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return failure(error, id, None),
             Err(_) => {
@@ -988,6 +1019,7 @@ async fn run_live_inner(
         force: options.force,
         yes: options.yes,
         shards: (!options.shards.is_empty()).then_some(options.shards.as_slice()),
+        expect_total_shards,
     };
     let mut last = None;
     let mut send_update = update.is_some();
@@ -995,7 +1027,7 @@ async fn run_live_inner(
         let exchange_result = timeout_at(deadline, async {
             if send_update {
                 exchange(
-                    &bootstrap,
+                    bootstrap,
                     &DaemonControlEnvelope {
                         secret: bootstrap.secret,
                         request: update.as_ref().expect("update payload"),
@@ -1003,7 +1035,7 @@ async fn run_live_inner(
                 )
                 .await
             } else {
-                exchange(&bootstrap, &request).await
+                exchange(bootstrap, &request).await
             }
         })
         .await;
@@ -1072,6 +1104,7 @@ async fn run_live_inner(
             request.force = false;
             request.yes = false;
             request.shards = None;
+            request.expect_total_shards = None;
             send_update = false;
         } else {
             let valid = match options.command {
@@ -1190,7 +1223,7 @@ async fn run_update(mut options: Options) -> Value {
         return failure(error, Some(&id), None);
     }
     options.operation_id = Some(id);
-    run_live(options, Some(update), deadline).await
+    run_live(options, Some(update), deadline, None).await
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -1303,7 +1336,12 @@ mod default_wait_tests {
         let dry = with(&["restart", "--all", "--dry-run"]).unwrap();
         assert!(dry.all && dry.all_dry_run);
         assert!(with(&["stop", "--all", "--force", "--yes"]).unwrap().force);
+        let preview = with(&["stop", "--all", "--force", "--dry-run"]).unwrap();
+        assert!(preview.all_dry_run && preview.force && !preview.yes);
         for bad in [
+            vec!["stop", "--all", "--force"],
+            vec!["stop", "bot", "--force", "--dry-run"],
+            vec!["stop", "--all", "--force", "--dry-run", "--yes"],
             vec!["restart", "--all"],
             vec!["restart", "--all", "--yes", "--dry-run"],
             vec!["restart", "bot", "--all", "--yes"],
@@ -1359,7 +1397,13 @@ mod default_wait_tests {
             seen.lock().unwrap().push(target.bot_id.clone());
             async move {
                 if target.bot_id == "2" {
-                    json!({"ok": false, "error": "boom", "operation_id": "x"})
+                    // Real daemon failures carry their diagnosis inside the operation.
+                    json!({"ok": false, "operation": {
+                        "state": "failed", "operation_id": "x",
+                        "shards": [{"process": {"key": {"bot_id": "2", "shard_id": 0}}, "error": null},
+                            {"process": {"key": {"bot_id": "2", "shard_id": 1}}, "error": "StopTimedOut"}],
+                        "failed_shards": [{"bot_id": "2", "shard_id": 1}]
+                    }})
                 } else {
                     json!({"ok": true, "operation": {"state": "succeeded", "operation_id": "y"}})
                 }
@@ -1371,7 +1415,23 @@ mod default_wait_tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["ok"], true);
         assert_eq!(results[1]["ok"], false);
-        assert_eq!(results[1]["error"], "boom");
+        assert_eq!(results[1]["operation_id"], "x");
+        assert_eq!(results[1]["shards"][0]["error"], Value::Null);
+        assert_eq!(results[1]["shards"][1]["error"], "StopTimedOut");
+        assert_eq!(
+            results[1]["failed_shards"],
+            json!([{"bot_id": "2", "shard_id": 1}])
+        );
+        assert_eq!(results[1]["operation"]["shards"], results[1]["shards"]);
+
+        // Admission failures have no operation snapshot; keep their original error too.
+        let (results, stopped) = drive_all(&targets, |_| async {
+            json!({"ok": false, "error": "boom", "operation_id": "x"})
+        })
+        .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(stopped.as_deref(), Some("1"));
+        assert_eq!(results[0]["error"], "boom");
 
         // A response that says ok but whose operation did not succeed also stops the run.
         let (results, stopped) = drive_all(&targets, |_| async {
@@ -1388,8 +1448,150 @@ mod default_wait_tests {
         assert_eq!((results.len(), stopped), (3, None));
     }
 
+    #[tokio::test]
+    async fn all_reuses_preloaded_bootstrap_for_every_bot() {
+        for (command, force) in [("start", false), ("stop", true)] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let bootstrap = Bootstrap {
+                port: listener.local_addr().unwrap().port(),
+                secret: [7; 32],
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let server = tokio::spawn(async move {
+                let mut ids = Vec::new();
+                for index in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
+                    let request: Value = serde_json::from_slice(&frame).unwrap();
+                    assert_eq!(request["secret"], json!(vec![7_u8; 32]));
+                    let reply = if index == 0 {
+                        assert_eq!(request["command"], "ps");
+                        json!({"ok": true, "bots": [
+                            {"bot_id": "1", "name": "one", "status": "stopped"},
+                            {"bot_id": "2", "name": "two", "status": "stopped"}
+                        ]})
+                    } else {
+                        assert_eq!(request["command"], command);
+                        assert_eq!(request["bot"], index.to_string());
+                        assert_eq!(request["force"], force);
+                        assert_eq!(request["yes"], force);
+                        let id = request["operation_id"].as_str().unwrap().to_owned();
+                        assert!(valid_operation_id(&id));
+                        ids.push(id.clone());
+                        json!({"ok": true, "operation": {
+                            "operation_id": id, "command": command, "bot_id": index.to_string(),
+                            "state": "succeeded", "elapsed_ms": 0, "shards": [], "failed_shards": []
+                        }})
+                    };
+                    let mut frame = serde_json::to_vec(&reply).unwrap();
+                    frame.push(b'\n');
+                    stream.write_all(&frame).await.unwrap();
+                }
+                assert_ne!(ids[0], ids[1]);
+            });
+            let mut args = vec![command, "--all", "--yes", "--bootstrap-stdin"];
+            if force {
+                args.push("--force");
+            }
+            let result = timeout_at(
+                deadline,
+                run_all_loaded(
+                    preloaded_options(&args, bootstrap.port),
+                    &bootstrap,
+                    Instant::now(),
+                    deadline,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(result["completed"], 2);
+            timeout_at(deadline, server).await.unwrap().unwrap();
+        }
+    }
+
+    fn preloaded_options(args: &[&str], port: u16) -> Options {
+        let mut options = options(args);
+        // An accidental reload must fail on a missing file rather than block stdin.
+        // The injected Bootstrap is the only usable credential source in these tests.
+        options.secret_file = Some(std::env::temp_dir().join(format!(
+            "missing-botctl-bootstrap-{}",
+            new_operation_id().unwrap()
+        )));
+        options.port = Some(port);
+        options
+    }
+
+    #[tokio::test]
+    async fn guild_resolution_sends_precondition_only_on_the_mutation() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let bootstrap = Bootstrap {
+            port: listener.local_addr().unwrap().port(),
+            secret: [8; 32],
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let server = tokio::spawn(async move {
+            let mut operation_id = String::new();
+            for command in ["inspect", "restart", "operation"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
+                let request: Value = serde_json::from_slice(&frame).unwrap();
+                assert_eq!(request["command"], command);
+                let reply = if command == "inspect" {
+                    assert!(request.get("expect_total_shards").is_none());
+                    json!({"ok": true, "bot": {"bot_id": "1", "total_shards": 2}})
+                } else {
+                    if command == "restart" {
+                        assert_eq!(request["expect_total_shards"], 2);
+                        assert_eq!(request["shards"], json!([1]));
+                        operation_id = request["operation_id"].as_str().unwrap().to_owned();
+                    } else {
+                        assert!(request.get("expect_total_shards").is_none());
+                        assert!(request.get("shards").is_none());
+                        assert_eq!(request["operation_id"], operation_id);
+                    }
+                    json!({"ok": true, "operation": {
+                        "operation_id": operation_id, "command": "restart", "bot_id": "1",
+                        "state": if command == "restart" {"running"} else {"succeeded"},
+                        "elapsed_ms": 0, "shards": [], "failed_shards": []
+                    }})
+                };
+                let mut frame = serde_json::to_vec(&reply).unwrap();
+                frame.push(b'\n');
+                stream.write_all(&frame).await.unwrap();
+            }
+        });
+        let result = timeout_at(
+            deadline,
+            run_live(
+                preloaded_options(
+                    &[
+                        "restart",
+                        "1",
+                        "--guild",
+                        "1569994280854884364",
+                        "--bootstrap-stdin",
+                    ],
+                    bootstrap.port,
+                ),
+                None,
+                deadline,
+                Some(&bootstrap),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["resolved_guilds"][0]["shard_id"], 1);
+        timeout_at(deadline, server).await.unwrap().unwrap();
+    }
+
     #[test]
-    fn gateway_update_waits_long_enough_for_a_multi_shard_rolling_update() {
+    fn gateway_update_default_wait_is_overridable() {
         let base = ["--secret-file", "/tmp/s", "--port", "1"];
         let update = options(&[&["gateway-update", "bot"][..], &base[..]].concat());
         assert_eq!(update.timeout, Duration::from_secs(300));

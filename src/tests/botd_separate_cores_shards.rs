@@ -583,6 +583,18 @@ async fn gateway_update_can_be_restricted_to_one_shard() {
     )
     .await;
     assert_eq!(unknown["ok"], false, "{unknown}");
+    // A stale guild resolution must fail on the wire before starting a candidate.
+    let stale = control(
+        fixture.port,
+        json!({"command":"gateway-update","bot":"101","operation_id":"00000000000000000000000000000007","shards":[1],"expect_total_shards":1}),
+    )
+    .await;
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert_eq!(
+        stale["error"],
+        "bot total_shards changed; resolve guilds again before retrying"
+    );
+    assert!(stale.get("operation").is_none());
     // Empty and duplicate filters are invalid requests.
     for bad in [json!([]), json!([1, 1])] {
         let refused = control_or_closed(
@@ -605,11 +617,20 @@ async fn gateway_update_can_be_restricted_to_one_shard() {
         read.is_none(),
         "read command with a filter must get no response: {read:?}"
     );
+    let read = control_or_closed(
+        fixture.port,
+        json!({"command":"status","bot":"101","expect_total_shards":2}),
+    )
+    .await;
+    assert!(
+        read.is_none(),
+        "read command must reject a mutation precondition"
+    );
 
     let id = "1111111111111111aaaaaaaaaaaaaaaa";
     let admitted = control(
         fixture.port,
-        json!({"command":"gateway-update","bot":"101","operation_id":id,"shards":[1]}),
+        json!({"command":"gateway-update","bot":"101","operation_id":id,"shards":[1],"expect_total_shards":2}),
     )
     .await;
     assert_eq!(admitted["ok"], true, "{admitted}");

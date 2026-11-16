@@ -327,6 +327,8 @@ struct StatusRequest {
     yes: bool,
     #[serde(default)]
     shards: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expect_total_shards: Option<u32>,
 }
 
 struct Envelope {
@@ -437,6 +439,7 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
                     force: false,
                     yes: wire.request.yes,
                     shards: None,
+                    expect_total_shards: None,
                 },
                 Some(wire.request),
             ),
@@ -448,6 +451,7 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
                     force: request.force,
                     yes: request.yes,
                     shards: request.shards,
+                    expect_total_shards: request.expect_total_shards,
                 },
                 None,
             ),
@@ -1180,7 +1184,9 @@ async fn run_test_gateway_switch(
                     let bot = selector.and_then(|s| src::botref::resolve(&config.bots,s.split('/').next().unwrap_or(s)).ok());
                     let keys: Vec<_> = local.iter().filter(|key| bot.is_none_or(|b| key.bot_id == b.bot_id)).cloned().collect();
                     let read = matches!(envelope.request.command.as_str(), "ps"|"status"|"inspect"|"shards"|"operation");
-                    if !envelope.access.allows_command(read, bot.map(|b| b.bot_id.as_str()), &keys) {
+                    if envelope.request.expect_total_shards.is_some() {
+                        json!({"ok":false,"error":"shard-count precondition is unsupported in mock rolling mode"})
+                    } else if !envelope.access.allows_command(read, bot.map(|b| b.bot_id.as_str()), &keys) {
                         json!({"ok":false,"error":"control permission or scope denied"})
                     } else if !read && (envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id)) || bot.is_some_and(|b| updates.busy(&b.bot_id))) {
                         json!({"ok":false,"error":"Bot or operation ID is already busy"})
@@ -1630,6 +1636,7 @@ mod tests {
             force: false,
             yes: false,
             shards: None,
+            expect_total_shards: None,
         })
         .unwrap();
         frame.push(b'\n');
@@ -1679,6 +1686,7 @@ mod tests {
             force: false,
             yes: false,
             shards: None,
+            expect_total_shards: None,
         })
         .unwrap();
         value["extra"] = json!(true);
