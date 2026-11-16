@@ -56,6 +56,21 @@ fn round_trip_preserves_count_and_job_state() {
     assert_eq!(core_state::load(&dir.0, &binding()), partial);
 }
 
+#[cfg(unix)]
+#[test]
+fn checkpoint_loading_keeps_read_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new();
+    let states = vec![Some(count(7)), Some(job())];
+    core_state::store(&dir.0, &binding(), &states).unwrap();
+    std::fs::set_permissions(dir.file(), std::fs::Permissions::from_mode(0o400)).unwrap();
+    assert_eq!(core_state::load(&dir.0, &binding()), states);
+    assert_eq!(
+        std::fs::metadata(dir.file()).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+}
+
 #[test]
 fn missing_corrupt_and_unreadable_files_load_as_empty() {
     let dir = Dir::new();

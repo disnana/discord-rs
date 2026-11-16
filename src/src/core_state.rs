@@ -150,10 +150,23 @@ fn read_limited(path: &Path) -> io::Result<Vec<u8>> {
             "unexpected persisted state object",
         ));
     }
-    // A replacement between this check and the read-only open can still be followed or block.
+    // Keep checkpoints read-only (including mode 0400). A FIFO substituted before open
+    // can still block the open itself; the descriptor checks below only protect reads
+    // after open returns. This narrow race requires write access to the state directory.
+    let file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() > MAX_FILE_BYTES as u64 {
+        return Err(io::Error::other("unexpected opened state object"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+            return Err(io::Error::other("persisted state changed during open"));
+        }
+    }
     let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(MAX_FILE_BYTES as u64 + 1)
+    file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_FILE_BYTES {
         return Err(io::Error::new(

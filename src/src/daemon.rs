@@ -932,11 +932,29 @@ pub mod control {
         /// Who asked, per operation, so the outcome can be recorded against them.
         gateway_update_actors: BTreeMap<String, (String, String)>,
         pending_audit: Vec<PendingAudit>,
+        audit_retry_at: Option<Instant>,
+        // Shared across records: a failed truncate must not quarantine the same tail again
+        // when a different request or pending record next tries to append.
+        audit_tail: std::sync::Mutex<Option<AuditTailRepair>>,
+    }
+
+    const AUDIT_SCAN_BYTES: usize = 8 * 1024;
+    const AUDIT_TAIL_LIMIT: u64 = 64 * 1024;
+    const AUDIT_CORRUPT_LIMIT: u64 = 1024 * 1024;
+    const AUDIT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+    struct AuditTailRepair {
+        // Source device, inode, last newline boundary, and measured end.
+        source: (u64, u64, u64, u64),
+        corrupt: Option<std::fs::File>,
+        limit: u64,
+        copied: u64,
     }
 
     struct PendingAudit {
         bytes: Vec<u8>,
         written: bool,
+        // Device, inode, and the offset of the serialized record (not the file length).
         written_file: Option<(u64, u64, u64)>,
     }
 
@@ -985,90 +1003,202 @@ pub mod control {
             })
         }
 
+        fn audit_file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = meta;
+                (0, 0) // Linux is the supported platform.
+            }
+        }
+
+        fn open_audit_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+            #[cfg(unix)]
+            {
+                crate::core_units::open_append_private(path)
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .create(true)
+                    .append(true)
+                    .open(path)
+            }
+        }
+
+        fn audit_tail_boundary(
+            file: &mut (impl std::io::Read + std::io::Seek),
+            mut end: u64,
+        ) -> std::io::Result<u64> {
+            use std::io::SeekFrom;
+            let mut buffer = [0; AUDIT_SCAN_BYTES];
+            while end > 0 {
+                let start = end.saturating_sub(buffer.len() as u64);
+                let count = (end - start) as usize;
+                file.seek(SeekFrom::Start(start))?;
+                file.read_exact(&mut buffer[..count])?;
+                if let Some(index) = buffer[..count].iter().rposition(|&b| b == b'\n') {
+                    return Ok(start + index as u64 + 1);
+                }
+                end = start;
+            }
+            Ok(0)
+        }
+
+        fn quarantine_audit_tail(
+            &self,
+            file: &mut std::fs::File,
+            path: &std::path::Path,
+            boundary: u64,
+            end: u64,
+        ) -> std::io::Result<()> {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let (dev, ino) = Self::audit_file_identity(&file.metadata()?);
+            let source = (dev, ino, boundary, end);
+            let mut saved = self
+                .audit_tail
+                .lock()
+                .map_err(|_| std::io::Error::other("audit repair state unavailable"))?;
+            if saved.as_ref().is_none_or(|repair| repair.source != source) {
+                *saved = Some(AuditTailRepair {
+                    source,
+                    corrupt: None,
+                    limit: 0,
+                    copied: 0,
+                });
+            }
+            let repair = saved.as_mut().expect("repair initialized");
+            if repair.corrupt.is_none() {
+                let mut corrupt_path = path.as_os_str().to_os_string();
+                corrupt_path.push(".corrupt");
+                let corrupt = Self::open_audit_file(std::path::Path::new(&corrupt_path))?;
+                repair.limit = (end - boundary)
+                    .min(AUDIT_TAIL_LIMIT)
+                    .min(AUDIT_CORRUPT_LIMIT.saturating_sub(corrupt.metadata()?.len()));
+                if repair.limit < end - boundary {
+                    eprintln!(
+                        "gateway update audit: corrupt tail quarantine capped; excess discarded"
+                    );
+                }
+                repair.corrupt = Some(corrupt);
+            }
+            let mut buffer = [0; AUDIT_SCAN_BYTES];
+            while repair.copied < repair.limit {
+                let count = (repair.limit - repair.copied).min(buffer.len() as u64) as usize;
+                file.seek(SeekFrom::Start(boundary + repair.copied))?;
+                file.read_exact(&mut buffer[..count])?;
+                let mut written = 0;
+                while written < count {
+                    // Remember each successful short write, including when a later write
+                    // fails. Retain the descriptor so a sync failure retries only the sync.
+                    let n = match repair
+                        .corrupt
+                        .as_mut()
+                        .expect("quarantine opened")
+                        .write(&buffer[written..count])
+                    {
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        result => result?,
+                    };
+                    if n == 0 {
+                        return Err(std::io::ErrorKind::WriteZero.into());
+                    }
+                    written += n;
+                    repair.copied += n as u64;
+                }
+            }
+            repair
+                .corrupt
+                .as_ref()
+                .expect("quarantine opened")
+                .sync_data()
+        }
+
+        fn audit_record_matches(
+            file: &mut std::fs::File,
+            record: &PendingAudit,
+        ) -> std::io::Result<bool> {
+            use std::io::{Read, Seek, SeekFrom};
+            let Some((dev, ino, offset)) = record.written_file else {
+                return Ok(false);
+            };
+            let meta = file.metadata()?;
+            if Self::audit_file_identity(&meta) != (dev, ino)
+                || offset
+                    .checked_add(record.bytes.len() as u64)
+                    .is_none_or(|end| end > meta.len())
+            {
+                return Ok(false);
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            let mut buffer = [0; AUDIT_SCAN_BYTES];
+            for expected in record.bytes.chunks(buffer.len()) {
+                match file.read_exact(&mut buffer[..expected.len()]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        return Ok(false);
+                    }
+                    result => result?,
+                }
+                if &buffer[..expected.len()] != expected {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+
         fn write_audit(&self, record: &mut PendingAudit) -> std::io::Result<()> {
             let Some(path) = &self.gateway_update_audit else {
                 return Ok(());
             };
-            use std::io::{Read, Seek, SeekFrom, Write};
-            #[cfg(unix)]
-            let mut file = crate::core_units::open_append_private(path)?;
-            #[cfg(not(unix))]
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
-            #[cfg(unix)]
-            if record.written {
-                use std::os::unix::fs::MetadataExt;
-                let matches = file.metadata().ok().is_some_and(|meta| {
-                    record.written_file.is_some_and(|(dev, ino, len)| {
-                        meta.dev() == dev && meta.ino() == ino && meta.len() >= len
-                    })
-                });
-                if !matches {
-                    record.written = false;
-                    record.written_file = None;
-                }
+            use std::io::{Seek, SeekFrom, Write};
+            // This verified descriptor is read/write + append. Never reopen the path for
+            // reading: a FIFO replacement could block that second open before validation.
+            let mut file = Self::open_audit_file(path)?;
+            if record.written && !Self::audit_record_matches(&mut file, record)? {
+                record.written = false;
+                record.written_file = None;
             }
             if !record.written {
-                // Read separately: the private append handle is write-only.
-                let mut reader = std::fs::File::open(path)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let opened = file.metadata()?;
-                    let read_meta = reader.metadata()?;
-                    if opened.dev() != read_meta.dev() || opened.ino() != read_meta.ino() {
-                        return Err(std::io::Error::other("audit file changed"));
-                    }
+                let end = file.metadata()?.len();
+                let boundary = Self::audit_tail_boundary(&mut file, end)?;
+                if boundary < end {
+                    self.quarantine_audit_tail(&mut file, path, boundary, end)?;
+                    // Keep repair progress on failure, including a failure of this truncate.
+                    file.set_len(boundary)?;
                 }
-                if reader.metadata()?.len() > 0 {
-                    reader.seek(SeekFrom::End(-1))?;
-                    let mut last = [0];
-                    reader.read_exact(&mut last)?;
-                    if last[0] != b'\n' {
-                        reader.seek(SeekFrom::Start(0))?;
-                        let mut data = Vec::new();
-                        reader.read_to_end(&mut data)?;
-                        let boundary = data
-                            .iter()
-                            .rposition(|&byte| byte == b'\n')
-                            .map_or(0, |pos| pos + 1);
-                        let mut corrupt_path = path.as_os_str().to_os_string();
-                        corrupt_path.push(".corrupt");
-                        #[cfg(unix)]
-                        let mut corrupt = crate::core_units::open_append_private(
-                            std::path::Path::new(&corrupt_path),
-                        )?;
-                        #[cfg(not(unix))]
-                        let mut corrupt = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&corrupt_path)?;
-                        corrupt.write_all(&data[boundary..])?;
-                        corrupt.sync_data()?;
-                        file.set_len(boundary as u64)?;
-                    }
-                }
+                *self
+                    .audit_tail
+                    .lock()
+                    .map_err(|_| std::io::Error::other("audit repair state unavailable"))? = None;
+                let (dev, ino) = Self::audit_file_identity(&file.metadata()?);
+                let offset = file.seek(SeekFrom::End(0))?;
                 file.write_all(&record.bytes)?;
                 record.written = true;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let meta = file.metadata()?;
-                    record.written_file = Some((meta.dev(), meta.ino(), meta.len()));
-                }
+                record.written_file = Some((dev, ino, offset));
             }
             file.sync_data()
         }
 
         fn retry_pending_audit(&mut self) {
+            if self.audit_retry_at.is_some_and(|at| Instant::now() < at) {
+                return;
+            }
             let pending = std::mem::take(&mut self.pending_audit);
             for mut record in pending {
                 if self.write_audit(&mut record).is_err() {
                     self.pending_audit.push(record);
                 }
             }
+            self.audit_retry_at = if self.pending_audit.is_empty() {
+                None
+            } else {
+                Some(Instant::now() + AUDIT_RETRY_INTERVAL)
+            };
         }
 
         pub fn recovery_events_dropped(&self) -> u64 {
@@ -1165,6 +1295,8 @@ pub mod control {
                 gateway_update_audit: None,
                 gateway_update_actors: BTreeMap::new(),
                 pending_audit: Vec::new(),
+                audit_retry_at: None,
+                audit_tail: std::sync::Mutex::new(None),
             }
         }
 
@@ -2255,6 +2387,273 @@ pub mod control {
             let _ = std::fs::remove_dir_all(dir);
         }
 
+        #[test]
+        fn audit_tail_scan_reads_bounded_chunks_from_the_end() {
+            struct Counted {
+                cursor: std::io::Cursor<Vec<u8>>,
+                read: usize,
+            }
+            impl std::io::Read for Counted {
+                fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                    assert!(buffer.len() <= AUDIT_SCAN_BYTES);
+                    let n = std::io::Read::read(&mut self.cursor, buffer)?;
+                    self.read += n;
+                    Ok(n)
+                }
+            }
+            impl std::io::Seek for Counted {
+                fn seek(&mut self, at: std::io::SeekFrom) -> std::io::Result<u64> {
+                    std::io::Seek::seek(&mut self.cursor, at)
+                }
+            }
+            let mut bytes = b"{}\n".repeat(1_000_000);
+            let boundary = bytes.len() as u64;
+            bytes.extend_from_slice(b"{partial");
+            let end = bytes.len() as u64;
+            let mut reader = Counted {
+                cursor: std::io::Cursor::new(bytes),
+                read: 0,
+            };
+            assert_eq!(
+                ControlPlane::audit_tail_boundary(&mut reader, end).unwrap(),
+                boundary
+            );
+            assert!(reader.read <= AUDIT_SCAN_BYTES, "valid history was scanned");
+            let mut reader = Counted {
+                cursor: std::io::Cursor::new(vec![b'x'; AUDIT_SCAN_BYTES * 3 + 1]),
+                read: 0,
+            };
+            assert_eq!(
+                ControlPlane::audit_tail_boundary(&mut reader, (AUDIT_SCAN_BYTES * 3 + 1) as u64)
+                    .unwrap(),
+                0
+            );
+        }
+
+        #[test]
+        fn audit_large_tail_is_capped_but_fully_removed() {
+            let dir = log_dir("audit-large-tail");
+            let path = dir.join("audit.jsonl");
+            let history = b"{}\n".repeat(100_000);
+            let mut data = history.clone();
+            data.extend(vec![b'x'; AUDIT_TAIL_LIMIT as usize * 2]);
+            std::fs::write(&path, data).unwrap();
+            let mut plane = plane(1, 1);
+            plane.set_gateway_update_audit(path.clone());
+            let mut record = ControlPlane::audit_record(
+                "succeeded",
+                "id",
+                "bot",
+                &("subject".into(), "admin".into()),
+                None,
+            )
+            .unwrap();
+            plane.write_audit(&mut record).unwrap();
+            let mut expected = history;
+            expected.extend_from_slice(&record.bytes);
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+            assert_eq!(
+                std::fs::read(dir.join("audit.jsonl.corrupt")).unwrap(),
+                vec![b'x'; AUDIT_TAIL_LIMIT as usize]
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn audit_quarantine_retry_is_idempotent_and_bounded() {
+            let dir = log_dir("audit-quarantine-retry");
+            let path = dir.join("audit.jsonl");
+            let corrupt = dir.join("audit.jsonl.corrupt");
+            std::fs::write(&path, b"{}\npartial").unwrap();
+            let mut plane = plane(1, 1);
+            plane.set_gateway_update_audit(path.clone());
+            let mut file = ControlPlane::open_audit_file(&path).unwrap();
+            // Model a failed truncate after successful quarantine. Retry through another
+            // descriptor and then another record, sharing the saved repair progress.
+            plane
+                .quarantine_audit_tail(&mut file, &path, 3, 10)
+                .unwrap();
+            drop(file);
+            let mut file = ControlPlane::open_audit_file(&path).unwrap();
+            plane
+                .quarantine_audit_tail(&mut file, &path, 3, 10)
+                .unwrap();
+            assert_eq!(std::fs::read(&corrupt).unwrap(), b"partial");
+            let mut record = ControlPlane::audit_record(
+                "succeeded",
+                "id",
+                "bot",
+                &("subject".into(), "admin".into()),
+                None,
+            )
+            .unwrap();
+            plane.write_audit(&mut record).unwrap();
+            assert_eq!(std::fs::read(&corrupt).unwrap(), b"partial");
+            let mut expected = b"{}\n".to_vec();
+            expected.extend_from_slice(&record.bytes);
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            // Leave three bytes of quarantine space, then test both near-full and full.
+            std::fs::write(&corrupt, vec![b'x'; AUDIT_CORRUPT_LIMIT as usize - 3]).unwrap();
+            std::fs::write(&path, b"next partial").unwrap();
+            record.written = false;
+            plane.write_audit(&mut record).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), record.bytes);
+            assert_eq!(
+                std::fs::metadata(&corrupt).unwrap().len(),
+                AUDIT_CORRUPT_LIMIT
+            );
+            let data = std::fs::read(&corrupt).unwrap();
+            assert_eq!(&data[data.len() - 3..], b"nex");
+            std::fs::write(&path, b"another partial").unwrap();
+            record.written = false;
+            plane.write_audit(&mut record).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), record.bytes);
+            assert_eq!(
+                std::fs::metadata(&corrupt).unwrap().len(),
+                AUDIT_CORRUPT_LIMIT
+            );
+            drop(file);
+            drop(plane);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn audit_retries_are_paced_after_a_failure() {
+            let dir = log_dir("audit-paced-retry");
+            let path = dir.join("audit.jsonl");
+            let mut plane = plane(1, 1);
+            plane.set_gateway_update_audit(dir.clone());
+            plane.pending_audit.push(
+                ControlPlane::audit_record(
+                    "failed",
+                    "id",
+                    "bot",
+                    &("subject".into(), "admin".into()),
+                    None,
+                )
+                .unwrap(),
+            );
+            plane.retry_pending_audit();
+            assert_eq!(plane.pending_audit.len(), 1);
+            assert!(plane.audit_retry_at.is_some());
+            plane.set_gateway_update_audit(path.clone());
+            // Inject the retry deadline instead of relying on wall-clock speed or sleeping.
+            plane.audit_retry_at = Some(Instant::now() + Duration::from_secs(3600));
+            plane.retry_pending_audit();
+            assert!(!path.exists());
+            plane.audit_retry_at = Some(Instant::now());
+            plane.retry_pending_audit();
+            assert!(plane.pending_audit.is_empty());
+            assert!(plane.audit_retry_at.is_none());
+            assert!(path.exists());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn audit_sync_retry_checks_bytes_after_regrowth_and_accepts_plain_append() {
+            use std::io::Write;
+            let dir = log_dir("audit-regrown-retry");
+            let path = dir.join("audit.jsonl");
+            let mut plane = plane(1, 1);
+            plane.set_gateway_update_audit(path.clone());
+            let mut record = ControlPlane::audit_record(
+                "succeeded",
+                "id",
+                "bot",
+                &("subject".into(), "admin".into()),
+                None,
+            )
+            .unwrap();
+            plane.write_audit(&mut record).unwrap();
+            // Same inode, regrown beyond the saved record: length is not proof of contents.
+            let replacement = b"{}\n".repeat(record.bytes.len());
+            std::fs::write(&path, &replacement).unwrap();
+            plane.write_audit(&mut record).unwrap();
+            let mut expected = replacement;
+            expected.extend_from_slice(&record.bytes);
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            ControlPlane::open_audit_file(&path)
+                .unwrap()
+                .write_all(b"{}\n")
+                .unwrap();
+            expected.extend_from_slice(b"{}\n");
+            plane.write_audit(&mut record).unwrap();
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                expected,
+                "intact record was duplicated"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn update_fallback_identify_defers_other_shards_without_spending_its_slot() {
+            use crate::local_identify::LocalIdentifyPolicy;
+            let mut plane = plane(2, 2);
+            let daemon = &mut plane.daemon;
+            let protected = ShardKey {
+                bot_id: "id-0".into(),
+                shard_id: 1,
+            };
+            let other = ShardKey {
+                bot_id: "id-0".into(),
+                shard_id: 0,
+            };
+            let independent = ShardKey {
+                bot_id: "id-1".into(),
+                shard_id: 0,
+            };
+            let owner_key = daemon.entries[&protected].recovery_key;
+            let other_key = daemon.entries[&other].recovery_key;
+            let independent_key = daemon.entries[&independent].recovery_key;
+            daemon
+                .entries
+                .get_mut(&protected)
+                .unwrap()
+                .update_fallback_reserved = true;
+            daemon.set_local_identify_policy(LocalIdentifyPolicy {
+                min_interval: Duration::from_secs(30),
+                window: Duration::from_secs(3600),
+                max_per_window: 10,
+            });
+            let at = Instant::now() - Duration::from_secs(60);
+            for _ in 0..9 {
+                daemon.local_identify.record("id-0", at);
+            }
+            let mut host = ProcessRecoveryHost {
+                entries: &mut daemon.entries,
+                credentials: &no_credentials,
+                instance: daemon.instance,
+                sequence: &mut daemon.sequence,
+                manual: Some(&other),
+                require_shared_admission: true,
+                local_identify: &mut daemon.local_identify,
+                errors: BTreeMap::new(),
+            };
+            assert_eq!(
+                host.try_acquire_identify(other_key),
+                IdentifyAdmission::Pending
+            );
+            host.manual = None;
+            assert_eq!(
+                host.try_acquire_identify(other_key),
+                IdentifyAdmission::Pending
+            );
+            assert_eq!(
+                host.try_acquire_identify(independent_key),
+                IdentifyAdmission::Granted
+            );
+            assert_eq!(
+                host.try_acquire_identify(owner_key),
+                IdentifyAdmission::Granted
+            );
+            assert!(!host.entries[&protected].update_fallback_reserved);
+            assert_eq!(
+                host.try_acquire_identify(other_key),
+                IdentifyAdmission::Unavailable
+            );
+        }
+
         #[cfg(unix)]
         #[test]
         fn update_identify_cooldown_and_exhaustion() {
@@ -2852,6 +3251,8 @@ struct Entry {
     started: bool,
     graceful_stop: Option<Result<(), DaemonError>>,
     restart_held: bool,
+    /// Protect the next real Identify for this update's fallback recovery.
+    update_fallback_reserved: bool,
     /// Only explicit local test configuration may select this. Never infer the
     /// mode from missing credentials, inherited environment, or child failure.
     mock_discord: Option<SocketAddr>,
@@ -2980,10 +3381,35 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         // every start is a fresh Identify). Automatic real-Discord recovery is
         // admitted only by the single-host, in-memory LocalIdentifyRegistry
         // (min interval + rolling-window cap); there is no cross-process or
-        // cross-host coordination. Initial and explicit operator starts are
-        // always granted but recorded, so a crash right after them is spaced.
+        // cross-host coordination. Outside an update reservation, initial and explicit
+        // operator starts are always granted but recorded, so a crash is spaced.
         // Explicit token-free simulation and trusted process-only callers keep
         // their existing lifecycle contract; neither is a Discord admission.
+        // A single local update owns the Bot's fallback opportunity until commit, a
+        // pre-activation abort, or its recovery's Identify grant. Defer OTHER starts
+        // (even manual ones) without consuming history. This deliberately serializes
+        // recovery with a candidate rather than inventing a second budget counter.
+        // The protected recovery still uses the normal spacing/window admission.
+        let blocked = self
+            .entries
+            .values()
+            .find(|entry| entry.recovery_key == key)
+            .is_some_and(|current| {
+                if current.mock_discord.is_some() {
+                    return false;
+                }
+                #[cfg(unix)]
+                if current.update_fallback_reserved && current.candidate.is_some() {
+                    // Do not spend the fallback on the old Gateway while its candidate
+                    // is still alive, even for callers outside ControlPlane's hold.
+                    return true;
+                }
+                self.entries.values().any(|entry| {
+                    entry.update_fallback_reserved
+                        && entry.recovery_key.bot_id == key.bot_id
+                        && entry.recovery_key != key
+                })
+            });
         let entry = self
             .entries
             .values_mut()
@@ -2994,11 +3420,16 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         let since = *entry
             .admission_since
             .get_or_insert_with(std::time::Instant::now);
+        if blocked {
+            return IdentifyAdmission::Pending;
+        }
         let mut admission = IdentifyAdmission::Granted;
         if entry.mock_discord.is_none() {
             let now = std::time::Instant::now();
             let bot = entry.snapshot.key.bot_id.as_str();
-            if self.require_shared_admission && self.manual != Some(&entry.snapshot.key) {
+            if entry.update_fallback_reserved
+                || (self.require_shared_admission && self.manual != Some(&entry.snapshot.key))
+            {
                 use crate::local_identify::LocalAdmission;
                 admission = match self.local_identify.try_acquire(bot, now) {
                     LocalAdmission::Granted => IdentifyAdmission::Granted,
@@ -3012,6 +3443,7 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         if admission != IdentifyAdmission::Granted {
             admission
         } else {
+            entry.update_fallback_reserved = false;
             entry.admission_since = None;
             if let Some(feed) = &entry.feed {
                 feed.observe(crate::metrics_feed::Observation::IdentifyWait(
@@ -3222,6 +3654,7 @@ impl<C: Clock> Daemon<C> {
                         started: false,
                         graceful_stop: None,
                         restart_held: false,
+                        update_fallback_reserved: false,
                         mock_discord: None,
                         feed,
                         admission_since: None,
@@ -3374,6 +3807,11 @@ impl<C: Clock> Daemon<C> {
         credentials: &impl CredentialSource,
     ) -> Result<bool, DaemonError> {
         tokio::runtime::Handle::try_current().map_err(|_| DaemonError::NoRuntime)?;
+        // A prior failed update may still be waiting for its fallback Identify.
+        let fallback_pending = self
+            .entries
+            .values()
+            .any(|entry| entry.snapshot.key.bot_id == key.bot_id && entry.update_fallback_reserved);
         let sequence = self
             .sequence
             .checked_add(1)
@@ -3388,6 +3826,9 @@ impl<C: Clock> Daemon<C> {
         };
         if !entry.started || !running || entry.candidate.is_some() || entry.retiring.is_some() {
             return Err(DaemonError::InvalidState);
+        }
+        if fallback_pending {
+            return Ok(false);
         }
         if entry.mock_discord.is_none() {
             use crate::local_identify::LocalAdmission;
@@ -3468,6 +3909,7 @@ impl<C: Clock> Daemon<C> {
                 entry.snapshot.key.bot_id.as_str(),
                 std::time::Instant::now(),
             );
+            entry.update_fallback_reserved = true;
         }
         self.sequence = sequence;
         entry.candidate = Some(Candidate {
@@ -3505,6 +3947,7 @@ impl<C: Clock> Daemon<C> {
                     let _ = candidate.child.start_kill();
                     let _ = std::fs::remove_file(&candidate.ready_marker);
                 }
+                entry.update_fallback_reserved = false;
                 UpdateProgress::Failed(error)
             }
         }
@@ -3516,6 +3959,9 @@ impl<C: Clock> Daemon<C> {
         if let Some(entry) = self.entries.get_mut(key)
             && let Some(mut candidate) = entry.candidate.take()
         {
+            if candidate.activated.is_none() {
+                entry.update_fallback_reserved = false;
+            }
             let _ = candidate.child.start_kill();
             let _ = std::fs::remove_file(&candidate.ready_marker);
             let _ = std::fs::remove_file(&candidate.active_marker);
@@ -3670,6 +4116,7 @@ impl<C: Clock> Daemon<C> {
                     };
                 }
                 entry.graceful_stop = None;
+                entry.update_fallback_reserved = false;
                 Ok(())
             }
             Err((_, mut child)) => {
@@ -3685,6 +4132,7 @@ impl<C: Clock> Daemon<C> {
     #[cfg(unix)]
     pub fn abandon_gateway_updates(&mut self) {
         for entry in self.entries.values_mut() {
+            entry.update_fallback_reserved = false;
             if let Some(mut candidate) = entry.candidate.take() {
                 let _ = candidate.child.start_kill();
                 let _ = std::fs::remove_file(&candidate.ready_marker);
@@ -4068,6 +4516,23 @@ impl<C: Clock> Daemon<C> {
         self.rotate_gateway_logs();
         #[cfg(unix)]
         for entry in self.entries.values_mut() {
+            // Preserve the reservation if the OLD Gateway stops while a candidate is
+            // warming. Once no candidate remains, an operator stop or a terminal recovery
+            // failure must not leave the rest of the Bot waiting forever.
+            if entry.candidate.is_none()
+                && (!entry.snapshot.desired_running
+                    || self
+                        .recovery
+                        .snapshot(entry.recovery_key)
+                        .is_ok_and(|state| {
+                            matches!(
+                                state.state,
+                                RecoveryState::Stopped | RecoveryState::Degraded(_)
+                            )
+                        }))
+            {
+                entry.update_fallback_reserved = false;
+            }
             let program = PathBuf::from(&entry.spec.gateway.program);
             let wanted = entry.snapshot.desired_running;
             if let Some(cores) = entry.cores.as_mut() {
