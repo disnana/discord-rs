@@ -471,3 +471,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - botd `kill -9`：systemd が約 5 秒で再起動。Core 4 本・Gateway 2 本が入れ替わり、両シャードの古い予約を整理。**再起動後の `!count` の継続は、Discord では確認していない**（続けて停止したため。プロセス面のみ確認）。
 - `systemctl stop`：0 秒、`Result=success`、残りプロセス 0、ipc に sock・secret なし、`core-state.json`（0600）は両シャードで残る。
 - 試験後、WSL の botd は停止（複数シャード用の設定のまま。`/etc/systemd/system/botd.service.d/zz-separate.conf` が `bots-multi.toml` を指す。旧 1 シャード用は `/root/zz-separate.conf.single-bak`）。
+
+### 追記（2026-11-16 夜）：`botctl gateway-update` の既定の待ち時間と、WSL 固有の既存の失敗
+
+- `botctl gateway-update` の既定の `--timeout` を 30 秒から 300 秒に変更（他のコマンドは 30 秒のまま、`--timeout` の明示が優先）。サーバー側の期限（120 秒 + 45 秒 × シャード数）に合わせ、4 シャードまで収まる。2 シャードの実機で、約 31 秒の更新が 30 秒の待ちで `operation wait timed out`、終了コード 1 になっていた件の対応。単体テスト追加（`default_wait_tests`）。
+- WSL（この開発機）で `botctl_update_control` の `mock_daemon_binds_server_roles_and_audits_update_and_rollback` が `tests/botctl_update_control.rs:425`（`AuditedExecutor::open(..).unwrap()`）で失敗する。**今回の変更を外した状態でも 3/3 で失敗**するため、変更とは無関係で、この WSL 環境でだけ起きる（CI では成功）。原因は未調査。

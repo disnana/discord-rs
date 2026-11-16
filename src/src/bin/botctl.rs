@@ -42,6 +42,13 @@ fn valid_operation_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Default `--timeout` in seconds. `gateway-update` waits for the daemon's own per-operation
+/// deadline (120 s + 45 s per shard; 300 s covers up to four shards), so a normal multi-shard
+/// update is not reported as "wait timed out" while it is still succeeding.
+fn default_wait_seconds(command: &str) -> u64 {
+    if command == "gateway-update" { 300 } else { 30 }
+}
+
 fn parse_timeout(value: &str) -> Result<Duration, &'static str> {
     let (number, scale) = if let Some(value) = value.strip_suffix("ms") {
         (value, 0.001)
@@ -295,7 +302,10 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         bot,
         file,
         operation_id,
-        timeout: timeout.unwrap_or(Duration::from_secs(30)),
+        // A Gateway rolling update takes 120 s + 45 s per shard on the daemon side (it waits for
+        // the 30 s Identify spacing between shards), so the default wait must outlast that.
+        // Other commands keep 30 s. An explicit --timeout always wins.
+        timeout: timeout.unwrap_or_else(|| Duration::from_secs(default_wait_seconds(command))),
         force,
         yes,
         plan,
@@ -908,4 +918,31 @@ async fn main() {
     // A timed-out Tokio stdin read can leave a blocking reader waiting for the
     // launcher. Exiting explicitly also bounds that case on both supported OSes.
     std::process::exit(if success { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod default_wait_tests {
+    use super::*;
+
+    fn options(args: &[&str]) -> Options {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        parse_options(&args).expect("valid arguments")
+    }
+
+    #[test]
+    fn gateway_update_waits_long_enough_for_a_multi_shard_rolling_update() {
+        let base = ["--secret-file", "/tmp/s", "--port", "1"];
+        let update = options(&[&["gateway-update", "bot"][..], &base[..]].concat());
+        assert_eq!(update.timeout, Duration::from_secs(300));
+        let restart = options(&[&["restart", "bot"][..], &base[..]].concat());
+        assert_eq!(restart.timeout, Duration::from_secs(30));
+        let explicit = options(
+            &[
+                &["gateway-update", "bot", "--timeout", "45s"][..],
+                &base[..],
+            ]
+            .concat(),
+        );
+        assert_eq!(explicit.timeout, Duration::from_secs(45));
+    }
 }
