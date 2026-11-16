@@ -435,3 +435,25 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `gateway.log`：`--- gateway generation 1 ---` の直後に `実行に失敗しました: unresolved response outcomes prevent graceful shutdown`、続いて `generation 2`。**Gateway が終了して再起動しており、その間のイベントが欠落**した、という流れ。
 - 解釈（証拠はこの 1 回の採取のみ。確定ではない）：旧 Worker を落とした時点で処理中だった応答が「結果不明」で残り、正常な終了ができないために Gateway が落ちた。結果不明を自動再実行しない既存の仕様（`docs/architecture.md` の「結果不明」）と整合する。`kill` の瞬間に処理中のイベントがあるかどうかのタイミングで再現が決まるため、WSL では再現しにくく、CI では出やすいと考えられる。
 - 未判断：Gateway が「結果不明の応答が残る」ことで落ちるのが、製品として許容される動作か（別ケース `crash_new_core_after_handler` は同じ制限として `#[ignore]` 済み）。許容なら、この試験の期待値（欠落 0）か、`kill` のタイミング（処理中のイベントがない時点で落とす）を直す。許容しないなら、Gateway が結果不明を抱えたまま継続する設計が要る。
+
+### 2026-11-16：第11回の提案を実装（実行確認は統合担当へ）
+
+- `crash_old_core` は、送信の停止を同期して確認し、送信済み全イベントの結果と Core の受領確認を待ってから候補を起動する。Restore 待機中に旧 Worker を落とし、候補を解放して更新完了を待ってから送信を再開する。欠落ゼロは維持し、Gateway の PID・世代 1・再起動 0 を前後で確認する。停止時間を送信の追い付きバーストに変えない。
+- 別ケース `crash_old_core_busy` を追加。模擬 HTTP の slot 0 向け応答を、ハンドラ処理後かつ Core への結果通知前に止め、旧 Worker を落とす。重複副作用ゼロ、不明結果の明示、Gateway の継続、切替後 20 件以上の通信成功、未解決結果による正常終了拒否を検査する。障害中の普遍的な欠落ゼロは要求せず、未解決の旧世代を抱えるためプール全体の更新成功とも扱わない。Python 側は 25 秒で打ち切る。総時間 30 秒未満と安定性は未計測のため、Rust の独立テストは `#[ignore]` として WSL／CI での確認を待つ。
+- mock の prefix／slash は受領確認失敗をイベント単位の `unknown` として返し、未解決の記録を残して受信を続ける。`Manager::shutdown` の保護と実 Discord の経路は変更しない。生のエラーや秘密情報は結果へ出さない。
+- cargo・ビルド・実プロセス試験は実行していない。差分、Python の構文、UTF-8 と文字化け候補を静的に確認する。コミット・push はしていない。
+
+## 2026-11-16 夜：2 シャードの実機試験（WSL、実 Discord、別の Bot、162112b のバイナリ）
+
+環境：WSL2、`botd --core-mode separate`、`bots-multi.toml`（`total_shards = 2`、シャード 0・1 とも同一ノード）、runtime-root は旧 Bot と別の `/var/lib/discord-rs/runtime-multi`。Bot は旧テスト Bot とは別（別 token。Oracle の放置とは衝突しない）。ユーザーが、シャード 0（サーバー 1533441257798369401）と シャード 1（1569994280854884364）の両方でコマンドを送って確認（シャード = `(ギルド ID >> 22) % 2`）。**1 回の実施で、長時間・繰り返しは未確認。**
+
+| 項目 | 結果 |
+|---|---|
+| 起動 | 両シャードでログイン成功。botd 1、Core 4（シャードごとに 2）、Gateway 2。`!ping`・`!count`・`!workers` が両サーバーで返信。カウントはシャードごとに別 |
+| `gateway-update`（2 シャード） | 成功（約 31 秒。シャード間の Identify 間隔 30 秒のため）。両 Gateway が入れ替わり、Core 4 本は不変、余分なプロセスなし、監査 requested→succeeded。`!count` はユーザー確認で継続 |
+| Gateway（シャード 0）`kill -9` | 約 10 秒で復旧。シャード 1 と全 Core は不変 |
+| Core 1 本（シャード 1）`kill -9` | その Core だけ再起動。Gateway 2 本とシャード 0 は不変 |
+| Core 2 本（シャード 0）`kill -9` | 両方再起動。シャード 1 と botd は不変 |
+
+- 発見：`botctl gateway-update` の待ちが 30 秒で、2 シャードの更新（約 31 秒）では `operation wait timed out; operation may continue` と `ok:false`、終了コード 1 を返した。操作は継続して `succeeded`。操作 ID で照会すれば成功と分かる。**改善案（未実装）**：待ち時間をシャード数に応じて延ばす（例：30 秒 ×シャード数）。
+- 未確認：更新中の Core 障害を 2 シャードで、botd の `kill -9`、`systemctl stop`、3 シャード以上、長時間。`update-check.sh` は 1 シャード前提で、2 シャードでは使っていない（手動で同等の確認をした）。
