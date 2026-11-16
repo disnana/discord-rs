@@ -372,3 +372,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 5. Interaction（スラッシュ）の重複。
 
 **次に優先する作業（`docs/next-steps.md` の見直しを反映）**：(a) 実機で新版の入れ替えと close code の確認、(b) CI の不安定なテストの原因調査、(c) `!workers` の重複排除と B3 の観測、(d) Core の無停止差し替え。(a) の結果で順序を変える。
+
+### 追記（2026-11-16、サーバーの実出力を確認）
+
+- **タイマー（解決）**：journal に `soak-3h`（19:08:20 UTC）と `soak-morning`（23:00:00 UTC）の起動・正常終了があり、`soak.log` に 19:08・21:54（手動）・23:00 の 3 件がある。11-15 夜に「16:14 などの定時が出ていない」としたのは、設定（開始 3 時間後と 23:00）と合わない私の読み違い。未解決の項目ではない。
+- **ユニット名**：`soak-report` の既定は `UNIT=botd`（`deploy/dev/soak-report.sh`）。`systemctl show discord-rs` が inactive/dead だったのは、存在しない名前を見たため。実際のサービスは `botd`（`NRestarts=0`、スナップショットで確認）。
+- **closes の意味**：`closes` は `gateway.log` 内の「Gateway 切断」を含む行の数（同スクリプト）。`gateway.log` は 9 時間 50 分で 324 バイト（5:58 で 228、8:44 で 292 バイト）しかなく、1 行は小さい。close code と再接続の結果は、この小さなファイルの中身で確認できる見込みだが、まだ貼られていない（今回の grep は存在しない `/var/log/discord-rs/` を見たため空）。**切断の原因は未確認のまま。**
+- 稼働中のプロセスは `ps` で PID 4147850／55／56／57、経過時間は 11-15 開始から継続（botd の引数に `--core-mode separate`）。
