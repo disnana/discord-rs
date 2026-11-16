@@ -16,7 +16,7 @@ use tokio::{
 
 const REQUEST_LIMIT: usize = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
-const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
+const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl start|stop|restart|gateway-update BOT [--shard N]... ...; botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
 const OFFLINE_NOTE: &str =
     "オフライン設定検証のみ。daemon・実稼働状態・認証・quorum/leaseは検証していません。";
 
@@ -33,6 +33,8 @@ struct Options {
     secret_file: Option<PathBuf>,
     port: Option<u16>,
     out: Option<PathBuf>,
+    /// `--shard N` (repeatable): act on these local Shards of the Bot only.
+    shards: Vec<u32>,
 }
 
 fn valid_operation_id(value: &str) -> bool {
@@ -73,6 +75,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     let mut json_seen = false;
     let mut timeout = None;
     let mut operation_id = None;
+    let mut shards: Vec<u32> = Vec::new();
     let mut force = false;
     let mut yes = false;
     let mut plan = None;
@@ -142,6 +145,22 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
                     return Err("--file requires a path");
                 }
                 file = Some(PathBuf::from(value));
+            }
+            Some("--shard") => {
+                let value = args
+                    .next()
+                    .and_then(|value| value.to_str().map(str::to_owned))
+                    .ok_or("--shard requires a shard number")?;
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err("--shard requires a non-negative shard number");
+                }
+                let number = value
+                    .parse::<u32>()
+                    .map_err(|_| "--shard number is too large")?;
+                if shards.contains(&number) {
+                    return Err("--shard was given twice for the same shard");
+                }
+                shards.push(number);
             }
             Some("--timeout") if timeout.is_none() => {
                 timeout = Some(parse_timeout(
@@ -214,6 +233,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             || component.is_some()
             || dry_run
             || rolling
+            || !shards.is_empty()
         {
             return Err("secret generate is offline and accepts only --out and --json");
         }
@@ -230,6 +250,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             secret_file,
             port,
             out,
+            shards: Vec::new(),
         });
     }
     if out.is_some() {
@@ -238,6 +259,12 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     let auth = bootstrap || secret_file.is_some();
     if force && command != "stop" {
         return Err("--force is supported only for stop");
+    }
+    if !shards.is_empty() && !matches!(command, "start" | "stop" | "restart" | "gateway-update") {
+        return Err("--shard is supported only for start, stop, restart and gateway-update");
+    }
+    if shards.len() > 64 {
+        return Err("--shard may be given at most 64 times");
     }
     if force && !yes {
         return Err("force stop requires explicit --yes confirmation");
@@ -313,6 +340,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         secret_file,
         port,
         out,
+        shards,
     })
 }
 
@@ -334,6 +362,8 @@ struct Request<'a> {
     operation_id: Option<&'a str>,
     force: bool,
     yes: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shards: Option<&'a [u32]>,
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(
@@ -659,6 +689,7 @@ async fn run_live(
             operation_id: None,
             force: false,
             yes: false,
+            shards: None,
         };
         let response = match timeout_at(deadline, exchange(&bootstrap, &inspect)).await {
             Ok(Ok(response)) => response,
@@ -696,6 +727,7 @@ async fn run_live(
         operation_id: id,
         force: options.force,
         yes: options.yes,
+        shards: (!options.shards.is_empty()).then_some(options.shards.as_slice()),
     };
     let mut last = None;
     let mut send_update = update.is_some();
@@ -779,6 +811,7 @@ async fn run_live(
             request.bot = None;
             request.force = false;
             request.yes = false;
+            request.shards = None;
             send_update = false;
         } else {
             let valid = match options.command {
@@ -927,6 +960,35 @@ mod default_wait_tests {
     fn options(args: &[&str]) -> Options {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         parse_options(&args).expect("valid arguments")
+    }
+
+    #[test]
+    fn shard_filter_is_parsed_validated_and_limited_to_lifecycle_commands() {
+        let base = ["--secret-file", "/tmp/s", "--port", "1"];
+        let with = |extra: &[&str]| -> Result<Options, &'static str> {
+            let args: Vec<OsString> = [extra, &base[..]]
+                .concat()
+                .iter()
+                .map(OsString::from)
+                .collect();
+            parse_options(&args)
+        };
+        let one = with(&["gateway-update", "bot", "--shard", "1"]).unwrap();
+        assert_eq!(one.shards, vec![1]);
+        let two = with(&["restart", "bot", "--shard", "2", "--shard", "0"]).unwrap();
+        assert_eq!(two.shards, vec![2, 0]);
+        assert!(with(&["gateway-update", "bot"]).unwrap().shards.is_empty());
+        for bad in [
+            vec!["gateway-update", "bot", "--shard"],
+            vec!["gateway-update", "bot", "--shard", "x"],
+            vec!["gateway-update", "bot", "--shard", "-1"],
+            vec!["gateway-update", "bot", "--shard", "99999999999"],
+            vec!["gateway-update", "bot", "--shard", "1", "--shard", "1"],
+            vec!["status", "bot", "--shard", "1"],
+            vec!["ps", "--shard", "1"],
+        ] {
+            assert!(with(&bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

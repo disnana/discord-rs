@@ -818,9 +818,38 @@ pub mod control {
         pub force: bool,
         #[serde(default)]
         pub yes: bool,
+        /// Restrict a lifecycle command to these local Shards of the Bot (`None` = all of them).
+        /// Authorization is evaluated on exactly these Shards, so a Shard-scoped administrator
+        /// can act on its own Shards only. An old daemon rejects the unknown field (fail closed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shards: Option<Vec<u32>>,
     }
 
     impl CommandRequest {
+        fn shards_valid(&self) -> bool {
+            match &self.shards {
+                None => true,
+                Some(list) => {
+                    matches!(
+                        self.command.as_str(),
+                        "start" | "stop" | "restart" | "gateway-update"
+                    ) && !list.is_empty()
+                        && list.len() <= 64
+                        && list.iter().collect::<std::collections::BTreeSet<_>>().len()
+                            == list.len()
+                }
+            }
+        }
+
+        /// Sorted Shard filter, or `None` for the whole Bot.
+        fn shard_filter(&self) -> Option<Vec<u32>> {
+            self.shards.as_ref().map(|list| {
+                let mut sorted = list.clone();
+                sorted.sort_unstable();
+                sorted
+            })
+        }
+
         pub fn valid(&self) -> bool {
             let selector = self
                 .bot
@@ -831,7 +860,7 @@ pub mod control {
                     && v.bytes()
                         .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
             });
-            match self.command.as_str() {
+            let base = match self.command.as_str() {
                 "ps" => {
                     self.bot.is_none() && self.operation_id.is_none() && !self.force && !self.yes
                 }
@@ -851,7 +880,8 @@ pub mod control {
                 // Missing confirmation is diagnosed by the authenticated handler.
                 "stop" => selector && id && (!self.yes || self.force),
                 _ => false,
-            }
+            };
+            base && self.shards_valid()
         }
     }
 
@@ -904,6 +934,8 @@ pub mod control {
         command: String,
         bot_id: String,
         force: bool,
+        /// The requested Shard filter (sorted), kept so a repeated ID can be checked for conflicts.
+        shards: Option<Vec<u32>>,
         targets: Vec<ShardKey>,
         phase: Phase,
         next: usize,
@@ -1261,6 +1293,14 @@ pub mod control {
                     .map(|s| s.key)
                     .collect()
             };
+            // Authorize exactly the Shards the command will touch.
+            let keys: Vec<_> = match (read, request.shard_filter()) {
+                (false, Some(wanted)) => keys
+                    .into_iter()
+                    .filter(|key| wanted.contains(&key.shard_id))
+                    .collect(),
+                _ => keys,
+            };
             if !access.allows_command(read, target.as_deref(), &keys) {
                 return Self::error("control permission or scope denied");
             }
@@ -1533,6 +1573,7 @@ pub mod control {
                 if old.command != request.command
                     || old.bot_id != bot_id
                     || old.force != request.force
+                    || old.shards != request.shard_filter()
                 {
                     return Self::error("operation ID conflicts with an earlier request");
                 }
@@ -1541,7 +1582,7 @@ pub mod control {
             if self.operations.len() >= OPERATION_LIMIT {
                 return Self::error("operation history is full");
             }
-            let targets: Vec<_> = self
+            let mut targets: Vec<_> = self
                 .daemon
                 .snapshots()
                 .into_iter()
@@ -1550,6 +1591,17 @@ pub mod control {
                 .collect();
             if targets.is_empty() {
                 return Self::error("bot has no local shards");
+            }
+            if let Some(wanted) = request.shard_filter() {
+                // A Shard that is not local is an error, never silently skipped: the operator
+                // asked for a specific Shard and must learn that nothing happened to it.
+                if wanted
+                    .iter()
+                    .any(|id| !targets.iter().any(|key| key.shard_id == *id))
+                {
+                    return Self::error("requested shard is not a local shard of the bot");
+                }
+                targets.retain(|key| wanted.contains(&key.shard_id));
             }
             if targets.len() > OPERATION_SHARD_LIMIT {
                 return Self::error("operation exceeds local shard limit (64)");
@@ -1597,6 +1649,7 @@ pub mod control {
                 command: request.command.clone(),
                 bot_id,
                 force: request.force,
+                shards: request.shard_filter(),
                 update_timeout: update_timeout(targets.len()),
                 targets,
                 phase: if request.command == "start" {

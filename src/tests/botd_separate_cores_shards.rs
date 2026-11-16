@@ -217,6 +217,21 @@ async fn control(port: u16, mut value: Value) -> Value {
     serde_json::from_slice(&reply).expect("daemon response")
 }
 
+/// Like `control`, but an invalid request (rejected before any handler runs) is answered by
+/// closing the connection without a response, which is returned as `None`.
+async fn control_or_closed(port: u16, mut value: Value) -> Option<Value> {
+    value["secret"] = json!(SECRET);
+    let mut stream = bounded(tokio::net::TcpStream::connect(("127.0.0.1", port)))
+        .await
+        .unwrap();
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    bounded(stream.write_all(&bytes)).await.unwrap();
+    let mut reply = Vec::new();
+    let _ = bounded(BufReader::new(stream).read_until(b'\n', &mut reply)).await;
+    serde_json::from_slice(&reply).ok()
+}
+
 #[tokio::test]
 async fn each_shard_has_its_own_cores_and_updates_independently() {
     let fixture = Fixture::start().await;
@@ -536,5 +551,122 @@ async fn gateway_update_with_a_shard_core_crash_recovers_both_shards() {
         ipc.is_empty(),
         "sockets or core.secret left behind: {ipc:?}"
     );
+    std::fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+/// `shards: [1]` restricts a `gateway-update` to that Shard only: Shard 0's Gateway and every
+/// Core stay untouched. A Shard that is not local is refused outright (nothing happens), and
+/// repeating the operation ID with a different filter is a conflict.
+#[tokio::test]
+async fn gateway_update_can_be_restricted_to_one_shard() {
+    let fixture = Fixture::start().await;
+    let first = fixture.accept().await;
+    let second = fixture.accept().await;
+    let (mut shard0, shard1) = match (
+        first.ready["shard_id"].as_u64(),
+        second.ready["shard_id"].as_u64(),
+    ) {
+        (Some(0), Some(1)) => (first, second),
+        (Some(1), Some(0)) => (second, first),
+        ids => panic!("unexpected Gateway shards: {ids:?}"),
+    };
+    let old0 = shard0.pid();
+    let old1 = shard1.pid();
+    let cores0 = worker_pids(&shard0.ready);
+    let cores1 = worker_pids(&shard1.ready);
+    let cores: Vec<u32> = cores0.iter().chain(&cores1).copied().collect();
+
+    // An unknown Shard is an error and starts nothing.
+    let unknown = control(
+        fixture.port,
+        json!({"command":"gateway-update","bot":"101","operation_id":"00000000000000000000000000000009","shards":[9]}),
+    )
+    .await;
+    assert_eq!(unknown["ok"], false, "{unknown}");
+    // Empty and duplicate filters are invalid requests.
+    for bad in [json!([]), json!([1, 1])] {
+        let refused = control_or_closed(
+            fixture.port,
+            json!({"command":"gateway-update","bot":"101","operation_id":"00000000000000000000000000000008","shards":bad}),
+        )
+        .await;
+        assert!(
+            refused.is_none(),
+            "invalid filter must get no response: {refused:?}"
+        );
+    }
+    // Filters are meaningless for read commands.
+    let read = control_or_closed(
+        fixture.port,
+        json!({"command":"status","bot":"101","shards":[0]}),
+    )
+    .await;
+    assert!(
+        read.is_none(),
+        "read command with a filter must get no response: {read:?}"
+    );
+
+    let id = "1111111111111111aaaaaaaaaaaaaaaa";
+    let admitted = control(
+        fixture.port,
+        json!({"command":"gateway-update","bot":"101","operation_id":id,"shards":[1]}),
+    )
+    .await;
+    assert_eq!(admitted["ok"], true, "{admitted}");
+    let replaced = fixture.accept().await;
+    assert_eq!(replaced.ready["shard_id"], 1);
+    let finished = bounded(async {
+        loop {
+            let view = control(
+                fixture.port,
+                json!({"command":"operation","operation_id":id}),
+            )
+            .await;
+            if view["operation"]["state"] != "running" {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert_eq!(finished["operation"]["state"], "succeeded", "{finished}");
+    assert_eq!(
+        finished["operation"]["shards"].as_array().map(Vec::len),
+        Some(1),
+        "{finished}"
+    );
+    let new1 = replaced.pid();
+    assert_ne!(new1, old1);
+    bounded(async {
+        while alive(old1) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    // Shard 0 was never touched.
+    let status0 = shard0.status().await;
+    assert_eq!(status0["pid"], old0);
+    assert!(alive(old0));
+    assert!(cores.iter().all(|pid| alive(*pid)));
+    assert_eq!(worker_pids(&replaced.ready), cores1);
+    assert_eq!(worker_pids(&status0), cores0);
+
+    // The same ID with a different filter is a conflict, not a replay.
+    let conflict = control(
+        fixture.port,
+        json!({"command":"gateway-update","bot":"101","operation_id":id,"shards":[0]}),
+    )
+    .await;
+    assert_eq!(conflict["ok"], false, "{conflict}");
+    let replay = control(
+        fixture.port,
+        json!({"command":"gateway-update","bot":"101","operation_id":id,"shards":[1]}),
+    )
+    .await;
+    assert_eq!(replay["operation"]["state"], "succeeded", "{replay}");
+
+    signal(fixture.daemon.id().unwrap(), "TERM");
+    let mut daemon = fixture.daemon;
+    bounded(daemon.wait()).await.unwrap();
     std::fs::remove_dir_all(&fixture.root).unwrap();
 }

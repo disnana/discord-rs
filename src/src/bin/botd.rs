@@ -325,6 +325,8 @@ struct StatusRequest {
     force: bool,
     #[serde(default)]
     yes: bool,
+    #[serde(default)]
+    shards: Option<Vec<u32>>,
 }
 
 struct Envelope {
@@ -434,6 +436,7 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
                     operation_id: Some(wire.request.operation_id.clone()),
                     force: false,
                     yes: wire.request.yes,
+                    shards: None,
                 },
                 Some(wire.request),
             ),
@@ -444,6 +447,7 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
                     operation_id: request.operation_id,
                     force: request.force,
                     yes: request.yes,
+                    shards: request.shards,
                 },
                 None,
             ),
@@ -1625,6 +1629,7 @@ mod tests {
             operation_id: None,
             force: false,
             yes: false,
+            shards: None,
         })
         .unwrap();
         frame.push(b'\n');
@@ -1673,6 +1678,7 @@ mod tests {
             operation_id: None,
             force: false,
             yes: false,
+            shards: None,
         })
         .unwrap();
         value["extra"] = json!(true);
