@@ -518,3 +518,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 結果（ユーザー報告の出力）：botd は active、journal 警告 0、`restarts` 0、Core 2 本 `running`。`botctl gateway-update --all --dry-run` が `targets: [test]`、`skipped: []` で成功（新しい操作が本番側で使える）。ユーザーは「動作した」と報告。
 - 更新前の記録：旧版（162112b、約 3.5 時間）の `gateway.log` は、新版で時刻が付いた行が `ログイン成功 … (2026-11-16T08:05:44Z)` のみで、その間の新しい close code 4000 は表示された範囲になかった。`soak-report` の `closes=11`、`login=3` と、画面の行（切断 10、ログイン 2）が合わない（数える対象が `gateway.log` 以外のログにも及ぶ可能性。原因は未確認）。旧版（17 時間 42 分）の切断は約 1.8 時間に 1 回（10 回）。**切断の頻度が新版で変わったとは言えない**（観測が短い）。
 - 未確認：新版（e61d8d4）の長時間（6 時間以上）、`--all --yes` と `--shard`／`--guild` の本番側での実行、Oracle の OS 再起動後の自動起動、切断の原因（時刻付きログで操作の直後に偏るかの確認）。
+
+### 追記（2026-11-16 夜）：Oracle での `--all --yes`、更新後のログの置き場所、cron の疑い
+
+- Oracle（本番側）で `botctl gateway-update --all --yes` が成功（約 1.3 秒、`ok: true`、`completed: 1`、Bot `test` の 1 シャード）。結果の `results[*].operation` に操作 ID・シャードごとの状態・`failed_shards` が入る。
+- **更新後の Gateway のログは `gateway-candidate.log` に出る**（`gateway.log` は更新前の Gateway のログのまま止まる）。`update-check.sh` の更新（08:06 UTC）以降の切断は `gateway-candidate.log` にあり、`soak-report` の `closes`（`gateway*.log` を合算）が 11 になり、`gateway.log` の表示（10）と食い違った理由。切断を調べるときは `gateway*.log` の両方を見る。更新を繰り返すと、`gateway-candidate.log` に複数世代のログが追記され得る（未確認）。**改善候補（未実装）**：更新の確定時にログの名前を整理する、または `soak-report`／運用ガイドに置き場所を明記する。
+- cron（`/etc/cron.d/soak-hourly`、毎時 0 分）：ファイルと cron は有効だが、`soak.log` に 09:00〜11:00 UTC の定時の記録がない（手動の 08:05 と 11:41 のみ）。作成が 11:00 UTC 以降だった可能性もあり、未確認（ユーザーに権限と journal の確認を依頼）。
