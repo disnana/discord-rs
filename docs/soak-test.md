@@ -74,3 +74,9 @@ sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --secret-file 
 一括確認：`sudo bash deploy/dev/update-check.sh test [--repeat N]` は、更新の前後の PID、Core の不変、旧 Gateway の消滅、IPC の残骸、マーカー、監査ログ、journald の警告を確認して PASS／FAIL の表を出す（終了コードは全 PASS のときだけ 0）。**サーバーでの実行は未検証**（`bash -n` のみ。WSL では同じ Bot の二重返信を避けるため実行していない）。最初の実行で表示が期待と違えば、スクリプト側の不具合を疑う。
 更新の前後で `sudo soak-report` を取り、Core の PID が変わらないこと、`!count`（または `/ping`）が続くことを確認する。`mv` で置き換えるのは、実行中のファイルに上書きしない（`Text file busy` を避ける）ため。
 
+### 5.1 うまくいかないとき（戻し方）
+
+- 入れ替え前に `/opt/discord-rs/bin/` の旧バイナリを `*.prev` に退避しておく：`for f in botd botctl src; do sudo cp -p /opt/discord-rs/bin/$f /opt/discord-rs/bin/$f.prev; done`。
+- 戻す：`.prev` を `mv` で元の名前に戻し、`sudo systemctl restart botd`（Bot は数秒止まる）。
+- `gateway-update` が `failed` になった場合は、旧 Gateway が再起動されて Bot は応答し続けるはず。`sudo -u discord-rs /opt/discord-rs/bin/botctl operation <操作ID> ...` と `gateway-update-audit.jsonl` の最後の行、`journalctl -u botd -n 100` を控える。
+- 更新中に同じ `!workers` が二重に返る可能性がある（既知の制限。`docs/known-limitations.md`）。`!count` / `!ping` の重複は Core 側で抑止される想定。
