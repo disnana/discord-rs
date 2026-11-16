@@ -4,8 +4,8 @@
 
 ## 0. 最新の状態（2026-11-16 夜の更新。詳細は progress.md の末尾）
 - **Gateway と Core の分離**（`botd --core-mode separate`、Linux、opt-in）と **Gateway の無停止更新**（`botctl gateway-update <bot>`）が入った。Core は botd の子で Gateway と独立に動き、Gateway の更新・クラッシュで Core の PID と `!count` の状態は変わらない。実機（WSL2、実 Discord）で、起動・各種クラッシュ復旧・更新 2 回・更新中の連投・重複排除・OS 再起動後の自動起動・待機 Gateway の失敗を確認済み。
-- **Oracle サーバー（aarch64）で放置試験中**（2026-11-15 22:10 JST 開始、separate、テスト用 Bot）。`~/soak.log` に記録（`soak-report`）、`deploy/dev/soak-diff.sh` で最初と最後を比較。次は `docs/soak-test.md` の §5（新ビルドへの入れ替え）。
-- **未検証・未実装**：長時間稼働の結果、複数 Shard の実機、Interaction（スラッシュ）の重複排除（ACK の規則による想定）、Core のホットスワップ（separate では未対応）、孤児 Core の再採用、`gateway-update` の検証付き監査（現状は追記ファイル）。Sol レビューの限界は `known-limitations.md`。
+- **Oracle サーバー（aarch64）で放置試験中**（2026-11-15 22:10 JST 開始、separate、テスト用 Bot）。`/home/ubuntu/soak.log` に記録（`soak-report`。root の `~` は `/root` なので絶対パスで指定する）、`deploy/dev/soak-diff.sh` で最初と最後を比較。次は `docs/soak-test.md` の §5（新ビルドへの入れ替え）。
+- **未検証・未実装**：長時間稼働の結果、複数 Shard の長時間・繰り返し・3 Shard 以上の実機（2 Shard は WSL の実 Discord で 1 回確認済み）、Interaction（スラッシュ）の重複排除（ACK の規則による想定）、Core のホットスワップ（separate では未対応）、孤児 Core の再採用、`gateway-update` の検証付き監査（現状は追記ファイル）。Sol レビューの限界は `known-limitations.md`。
 - **ツール**：Codex は ChatGPT アカウントで `gpt-6.1-terra`／`gpt-6.1-sol`（`Terra` 等の別名は不可）。Haiku は docs・補助スクリプト、Codex は試験の執筆とレビュー、Claude が設計・統合・検証。CI の確認は ci-verify ブランチに push して Actions で行う。
 
 ## 1. 現状の要約

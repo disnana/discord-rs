@@ -3736,7 +3736,12 @@ async fn observe_request<F: std::future::Future>(
         REQUEST_CHECK_EVERY,
         REQUEST_WARN_AFTER,
         |elapsed, count| {
-            eprintln!(
+            // Best effort: a failing stderr (a full log filesystem) must not unwind this future
+            // and abandon the request that owns the Core's state, so the result is ignored
+            // (`eprintln!` would panic).
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
                 "要求が 30 秒以上完了していません（経過 {} 秒、未完了 {} 件）",
                 elapsed.as_secs(),
                 count
@@ -3782,15 +3787,30 @@ mod request_observation_tests {
     async fn the_observer_reports_a_slow_request_once_and_still_returns_its_result() {
         let mut observations = RequestObservations::default();
         let mut warnings = Vec::new();
+        // The request stays pending until the observer has actually reported it, so a scheduling
+        // pause cannot let it finish first (a fixed sleep made this test timing dependent). The
+        // outer timeout only turns a broken observer into a failure instead of a hang.
+        let (reported, wait_for_report) = tokio::sync::oneshot::channel::<()>();
+        let mut reported = Some(reported);
         let value = observe_request_with(
             &mut observations,
             async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::time::timeout(Duration::from_secs(10), wait_for_report)
+                    .await
+                    .expect("the observer must report the slow request")
+                    .expect("the report signal");
+                // One more check period: a second report would show up as a duplicate.
+                tokio::time::sleep(Duration::from_millis(60)).await;
                 7
             },
             Duration::from_millis(20),
             Duration::from_millis(80),
-            |elapsed, count| warnings.push((elapsed, count)),
+            |elapsed, count| {
+                warnings.push((elapsed, count));
+                if let Some(signal) = reported.take() {
+                    let _ = signal.send(());
+                }
+            },
         )
         .await;
         assert_eq!(value, 7, "the request's own result is returned");

@@ -547,7 +547,7 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 ### 2026-11-16 夜：更新後のログを 1 つの `gateway.log` に（work/next）
 
-- 変更：待機（候補）Gateway の出力先を `gateway-candidate.log` から、そのシャードの `gateway.log`（追記）に変更。旧 Gateway と新 Gateway は更新の重なりの短い間だけ、行単位で混ざる（出力に時刻が入る）。これで運用者が `gateway.log` を読めば、常に現在の Gateway の出力が見える。旧版が作った `gateway-candidate.log` は、残っていてもローテーション（8 MiB）の対象とし、`soak-report` も合算して読む。
+- 変更：待機（候補）Gateway の出力先を `gateway-candidate.log` から、そのシャードの `gateway.log`（追記）に変更。旧 Gateway と新 Gateway は更新の重なりの短い間だけ、同じファイルに追記する（追記モードなので 1 回の書き込みは壊れないが、書式付きの出力は複数回の書き込みになり得るため、行の途中で混ざることはあり得る。行単位の保証はしない。時刻が入る）。これで運用者が `gateway.log` を読めば、常に現在の Gateway の出力が見える。旧版が作った `gateway-candidate.log` は、残っていてもローテーション（8 MiB）の対象とし、`soak-report` も合算して読む。
 - 試験：統合テスト `gateway_update_replaces_the_gateway_and_keeps_the_cores` に「更新後に `gateway-candidate.log` が作られず、`gateway.log` が 1 つだけ」の確認を追加。**変更を外すとこのテストが失敗することを確認**（`a separate candidate log was created`）。WSL で clippy 警告なし、統合テスト 2 回成功、lib 223 件成功。実 Discord・Oracle での確認は未実施（次回の更新で確認）。
 - 運用者ガイド（`docs/operator-guide.md`）に、`--shard`／`--guild`／`--all`、既定のタイムアウト、障害時の確認先、バイナリの復旧を追加（Terra が作成、私が内容をコードと照合）。
 
@@ -556,3 +556,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - **B3 の観測（第一段階）**：Core が、30 秒以上完了しない要求を、標準エラーに 1 行（`要求が 30 秒以上完了していません（経過 N 秒、未完了 M 件）`）で出す（同じ要求の再警告は 5 分以上空ける）。**要求は打ち切らず、ドロップも再試行もしない**（ハンドラが状態を持つため打ち切りは危険、という既知の理由）。内容・ID・秘密は出さない。IPC は変えていない。試験：判定（時刻を注入）の単体テスト 2 件と、実時間の短い値で本物の `select!` を通すテスト 1 件（遅い要求は 1 回だけ警告され結果を返す、速い要求は警告されない、完了後は保留 0）。実際の stuck の再現と実機での確認は未実施。
 - **`deploy/dev/update-check.sh`**：N シャードに対応（`botctl inspect` で shard 数を取り、Core が 2×N・Gateway が N あることを確認、更新後は全 Core 不変・全 Gateway 入れ替え、シャードごとの IPC）、`--shard N`（対象の Gateway だけが変わり他は不変）、`ROOT=...` で runtime のルートを上書き可。WSL（実 Discord、2 シャード）で、全更新と `--shard 1` の両方が全 PASS。Core を落とした直後・存在しないシャード・`--repeat 0` は FAIL／拒否されることを確認。Ubuntu の Oracle での実行は未確認。
 - **WSL 固有の失敗の原因と解消**：`botctl_update_control`（1 件）と `botctl_update_daemon`（4 件）が WSL でだけ失敗していたのは、テストが一時ディレクトリを `CARGO_MANIFEST_DIR/target`（WSL では NTFS の `/mnt/d` 上で、Unix の権限が効かず 0600 の検査が `Io` エラー）に作っていたため。cargo の `CARGO_TARGET_TMPDIR`（`CARGO_TARGET_DIR` の下）を使うように変更し、WSL でも 9 件と 6 件が全て成功。本番のコードの問題ではない。
+
+### 2026-11-16 夜：Astra 第 15 回（6 件）への対応と、Haiku による文書の矛盾の洗い出し
+
+- B3 の警告の出力は、標準エラーが書けなくてもパニックしない最善努力の書き込み（`writeln!` の結果を捨てる）に変更（満杯のログファイルで観測の future が巻き戻り、要求を放棄する事故の防止）。観測のテストは、要求を「警告が出るまで保留」にして、固定の 300 ms への依存をなくした（5 回連続成功）。
+- `update-check.sh`：空・数字でない・重複の `--shard` を終了コード 2 で拒否（以前は空だと全シャードの更新になった）。ローカルのシャード（`inspect` の processes）を基準に検証し、他のホストが持つシャードに引きずられない。WSL（実サービス）で、拒否の 3 種、範囲外（FAIL）、`--shard 0`（全 PASS）を確認。
+- 文書：「行単位で混ざる」の保証を削除（書式付きの出力は複数回の書き込みになり得る）。「2 シャードは実 Discord で未検証」と読める記述を、記録（WSL の実 Discord で 1 回確認、長時間・繰り返し・3 シャード以上は未検証）に合わせて訂正（known-limitations、operator-guide、handoff、real-separate-verification、next-steps、soak-test）。`~/soak.log`・相対パスの記述を `/home/ubuntu/soak.log` に。Haiku の洗い出し 10 件のうち、9 件は正しく反映し、1 件（`--all --yes` の Oracle での成功を WSL と取り違えたもの）は事実と合わないため反映しなかった。
+- 並行の作業（別 worktree、未統合）：`work/flake`（botctl 系テストの stdin の BrokenPipe の許容。WSL で 12 回成功。CI の確率的な失敗への効果は未確認）、`work/workers`（`!workers` を返す前に Core 接続を確認し、fence 済みの旧 Gateway は返信しない。Core が 2 秒で応答しないときは従来どおり返信。実 Discord での確認は未実施）。

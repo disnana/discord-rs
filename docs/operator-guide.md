@@ -121,7 +121,7 @@ botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GAT
 
 - ホットスワップ（Core の無停止差し替え）は separate では未対応です。
 - botd が死亡すると Core も失われます。Gateway が残らないよう `--stop-children-on-exit` が必須です。botd が SIGKILL で止まった場合の後始末は未検証です。
-- 実 Discord、systemd 常駐、WSL の再起動後の自動起動、長時間稼働、複数 Shard での separate は未検証です。
+- WSL の再起動後の自動起動、長時間稼働（Oracle の放置は旧版で約 18 時間、最新版は実施中）、3 Shard 以上は未検証です。実 Discord での 1・2 Shard（WSL）と Oracle の systemd 常駐は確認の記録があります（`docs/progress.md`）。
 - 結果不明の外部操作と、Core の再起動をまたぐ未確認イベントの扱いは、既定経路と同じく保証しません。
 
 ### separate での Gateway 無停止更新：gateway-update
@@ -157,7 +157,7 @@ botd は Shard ごとに順番に次を行います。
 
 ログは稼働中も大きさに上限があります。`gateway.log` と `gateway-candidate.log` は 8 MiB、`core-*.log` は 4 MiB を超えると、約 60 秒ごとに `.1` へ写してから空にします（既存の `.1` は置き換えます）。起動時は `gateway.log` が 1 MiB を超えていれば `.1` へ退避します。 常に書き続ける書き手でも回転が止まらないよう、増えた分を数回コピーしてから空にします。その代わり、コピーと空にする間に書かれた分は失われ得ます（量は保証しません。上限を優先）。ローテーション後は `.1` に直前の分だけが残るため、`soak-diff.sh` の「最初と最後の比較」では回転をまたぐと件数が減ることがあります。
 
-待機 Gateway を同じ `gateway.log` に書く今回の変更は未検証です。ログの回転も実 Discord での確認はありません。
+待機 Gateway を同じ `gateway.log` に書く変更は、自動テスト（WSL。更新後に候補のログが作られないこと）で確認済みですが、Oracle・実 Discord ではまだ確認していません。ログの回転も実 Discord での確認はありません。
 
 ### Discordに接続しない模擬実行
 

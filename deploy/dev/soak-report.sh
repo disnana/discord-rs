@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 長時間稼働（放置）試験のスナップショット。読み取り専用で、秘密を出力しない。
-# サーバーで root（または sudo）で実行する。例:  sudo ./soak-report.sh | tee -a soak.log
+# サーバーで root（または sudo）で実行する。例:  sudo ./soak-report.sh | tee -a /home/ubuntu/soak.log
 # 数時間おきに実行して、増え続ける値（RSS、fd、ログの大きさ、再起動回数）を比べる。
 set -u
 UNIT=${UNIT:-botd}

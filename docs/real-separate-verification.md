@@ -49,7 +49,7 @@ Discord 側では、そのつど `!ping` と `!count` を送って返答と数�
 
 ## 4. まだ確認できないこと（記録しておく）
 
-- 長時間稼働、複数 Shard、Resume、レート制限。
+- 長時間稼働（Oracle の放置は別記録）、3 Shard 以上、複数 Shard の繰り返し、Resume（再起動をまたぐもの）、レート制限。（2 Shard は WSL の実 Discord で 1 回確認済み。`docs/progress.md`）
 - Core のホットスワップ（`worker-path.txt`）は separate では動かない（未対応）。
 - Gateway の無停止更新（旧新 Gateway の同時接続）は未実装。
 - botd の `kill -9` 後に systemd 外で Core が孤児になる場合の扱い：Core は stdin の EOF で終了するので残らない設計だが、実機では未確認。

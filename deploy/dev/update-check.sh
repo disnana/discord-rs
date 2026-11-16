@@ -11,6 +11,7 @@ PORT=47321
 bot=test
 repeat=1
 selected_shard=
+shard_given=0
 bot_set=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -18,8 +19,9 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { echo 'Missing repeat count' >&2; exit 2; }
       repeat=$2; shift 2 ;;
     --shard)
-      [ "$#" -ge 2 ] && [ -z "$selected_shard" ] || { echo 'Missing or duplicate shard' >&2; exit 2; }
-      selected_shard=$2; shift 2 ;;
+      [ "$#" -ge 2 ] && [ "$shard_given" -eq 0 ] || { echo 'Missing or duplicate shard' >&2; exit 2; }
+      [[ "$2" =~ ^[0-9]+$ ]] && [ "${#2}" -le 10 ] || { echo 'Shard must be a non-negative integer' >&2; exit 2; }
+      selected_shard=$((10#$2)); shard_given=1; shift 2 ;;
     --*) echo 'Unknown option' >&2; exit 2 ;;
     *) [ "$bot_set" -eq 0 ] || { echo 'Too many bot arguments' >&2; exit 2; }
        bot=$1; bot_set=1; shift ;;
@@ -28,10 +30,6 @@ done
 case "$repeat" in ''|*[!0-9]*) echo 'Repeat count must be a positive integer' >&2; exit 2;; esac
 [[ "$repeat" =~ ^0*[1-9][0-9]*$ ]] || { echo 'Repeat count must be positive' >&2; exit 2; }
 repeat=$((10#$repeat))
-if [ -n "$selected_shard" ]; then
-  [[ "$selected_shard" =~ ^[0-9]+$ ]] && [ "${#selected_shard}" -le 10 ] || { echo 'Shard must be a non-negative integer' >&2; exit 2; }
-  selected_shard=$((10#$selected_shard))
-fi
 [ "$(id -u)" -eq 0 ] || { echo 'Run as root via sudo' >&2; exit 2; }
 
 results=()
@@ -84,7 +82,7 @@ snapshot() {
       core) [ -n "$socket" ] || continue; core_by_socket["$socket"]=$pid; core_socket_count["$socket"]=$(( ${core_socket_count["$socket"]:-0} + 1 )); continue ;;
       gateway)
         [ "$process_bot" = "$target_id" ] || continue
-        [[ "$shard" =~ ^(0|[1-9][0-9]*)$ ]] && [ "$shard" -lt "$shard_count" ] && [ -n "$ipc" ] || { snapshot_invalid=1; continue; }
+        [[ "$shard" =~ ^(0|[1-9][0-9]*)$ ]] && [ "$shard" -lt "$shard_count" ] && [ -n "${local_shard_set[$shard]:-}" ] && [ -n "$ipc" ] || { snapshot_invalid=1; continue; }
         [ -z "${gateway_by_shard[$shard]:-}" ] || snapshot_invalid=1
         gateways+=("$pid"); gateway_by_shard[$shard]=$pid; ipc_by_shard[$shard]=$ipc ;;
       *) case "$cmd" in */botd) daemons+=("$pid");; esac ;;
@@ -94,10 +92,13 @@ snapshot() {
     case "$role" in gateway) printf ' core_epoch=%s' "$epoch";; esac
     printf '\n'
   done
-  for ((s=0; s<shard_count; s++)); do
+  for s in "${local_shards[@]}"; do
     ipc=${ipc_by_shard[$s]:-}
     [ -n "$ipc" ] || continue
-    for ((other=0; other<s; other++)); do [ "$ipc" != "${ipc_by_shard[$other]:-}" ] || snapshot_invalid=1; done
+    for other in "${local_shards[@]}"; do
+      [ "$other" -ge "$s" ] && break
+      [ "$ipc" != "${ipc_by_shard[$other]:-}" ] || snapshot_invalid=1
+    done
     for key in "${!core_by_socket[@]}"; do
       if [[ "$key" == "$ipc/"* ]] && [ "$key" != "$ipc/core-0.sock" ] && [ "$key" != "$ipc/core-1.sock" ]; then snapshot_invalid=1; fi
     done
@@ -117,26 +118,42 @@ declare -A gateway_by_shard ipc_by_shard core_by_socket core_socket_count baseli
 inspect=$(ctl inspect "$bot") || inspect=
 target_id=$(json_string bot_id "$inspect")
 shard_count=$(printf '%s' "$inspect" | python3 -c 'import json,sys; v=json.load(sys.stdin)["bot"]["total_shards"]; print(v if type(v) is int and 0 < v <= 4294967295 else "")' 2>/dev/null) || shard_count=
-if [ -z "$target_id" ] || [ -z "$shard_count" ] || { [ -n "$selected_shard" ] && [ "$selected_shard" -ge "$shard_count" ]; }; then
-  record FAIL 'R1 preconditions' 'bot inspection failed or shard is out of range; update skipped'
+local_shard_list=$(printf '%s' "$inspect" | python3 -c '
+import json, sys
+bot = json.load(sys.stdin)["bot"]
+total = bot["total_shards"]
+processes = bot["processes"]
+if type(total) is not int or not 0 < total <= 4294967295 or not isinstance(processes, list):
+    raise ValueError("invalid inspection")
+ids = [process["key"]["shard_id"] for process in processes]
+if not ids or any(type(i) is not int or not 0 <= i < total for i in ids) or len(ids) != len(set(ids)):
+    raise ValueError("invalid local shards")
+print(" ".join(map(str, sorted(ids))))
+' 2>/dev/null) || local_shard_list=
+read -r -a local_shards <<< "$local_shard_list"
+local_count=${#local_shards[@]}
+declare -A local_shard_set=()
+for s in "${local_shards[@]}"; do local_shard_set[$s]=1; done
+if [ -z "$target_id" ] || [ -z "$shard_count" ] || [ "$local_count" -eq 0 ] || { [ "$shard_given" -eq 1 ] && { [ "$selected_shard" -ge "$shard_count" ] || [ -z "${local_shard_set[$selected_shard]:-}" ]; }; }; then
+  record FAIL 'R1 preconditions' 'bot inspection failed or shard is out of range or not local; update skipped'
   echo '=== Summary ==='; printf '%s\n' "${results[@]}"; exit 1
 fi
 for ((round=1; round<=repeat; round++)); do
   echo "=== Round $round/$repeat PRE ==="
   snapshot_invalid=0
   snapshot
-  before_cores="${cores[*]}"; old=${gateway_by_shard[0]:-}; declare -A old_gateways=() old_ipcs=()
-  for ((s=0; s<shard_count; s++)); do old_gateways[$s]=${gateway_by_shard[$s]:-}; old_ipcs[$s]=${ipc_by_shard[$s]:-}; done
-  if [ "$(systemctl is-active botd 2>/dev/null)" = active ] && [ "${#daemons[@]}" -eq 1 ] && [ "${#cores[@]}" -eq $((2*shard_count)) ] && [ "${#gateways[@]}" -eq "$shard_count" ] && [ "$snapshot_invalid" -eq 0 ]; then
-    if [ "$shard_count" -eq 1 ]; then record PASS "R$round preconditions" 'botd, two cores and one gateway found'; else record PASS "R$round preconditions" "botd, $((2*shard_count)) cores and $shard_count gateways found"; fi
+  before_cores="${cores[*]}"; old=${gateway_by_shard[${local_shards[0]}]:-}; declare -A old_gateways=() old_ipcs=()
+  for s in "${local_shards[@]}"; do old_gateways[$s]=${gateway_by_shard[$s]:-}; old_ipcs[$s]=${ipc_by_shard[$s]:-}; done
+  if [ "$(systemctl is-active botd 2>/dev/null)" = active ] && [ "${#daemons[@]}" -eq 1 ] && [ "${#cores[@]}" -eq $((2*local_count)) ] && [ "${#gateways[@]}" -eq "$local_count" ] && [ "$snapshot_invalid" -eq 0 ]; then
+    if [ "$local_count" -eq 1 ]; then record PASS "R$round preconditions" 'botd, two cores and one gateway found'; else record PASS "R$round preconditions" "botd, $((2*local_count)) cores and $local_count gateways found"; fi
   else
-    if [ "$shard_count" -eq 1 ]; then record FAIL "R$round preconditions" 'expected one botd, two cores and one gateway; update skipped'; else record FAIL "R$round preconditions" "expected one botd, $((2*shard_count)) cores and $shard_count gateways; update skipped"; fi
+    if [ "$local_count" -eq 1 ]; then record FAIL "R$round preconditions" 'expected one botd, two cores and one gateway; update skipped'; else record FAIL "R$round preconditions" "expected one botd, $((2*local_count)) cores and $local_count gateways; update skipped"; fi
     break
   fi
   before_warnings=$(warnings) || before_warnings=unknown
   start=$SECONDS
   update_args=(gateway-update "$bot")
-  [ -z "$selected_shard" ] || update_args+=(--shard "$selected_shard")
+  [ "$shard_given" -eq 0 ] || update_args+=(--shard "$selected_shard")
   response=$(ctl "${update_args[@]}") || :
   id=$(json_string operation_id "$response")
   state=unknown
@@ -154,31 +171,31 @@ for ((round=1; round<=repeat; round++)); do
   # The old Gateway is asked to exit after the hand-over and is killed after 30 s: wait for it
   # to be gone before taking the "after" snapshot, so the new Gateway cannot be mistaken for it.
   deadline=$((SECONDS+40))
-  for ((s=0; s<shard_count; s++)); do
-    [ -z "$selected_shard" ] || [ "$s" -eq "$selected_shard" ] || continue
+  for s in "${local_shards[@]}"; do
+    [ "$shard_given" -eq 0 ] || [ "$s" -eq "$selected_shard" ] || continue
     while kill -0 "${old_gateways[$s]}" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
   done
   sleep 2
   echo "=== Round $round/$repeat POST ==="
   snapshot_invalid=0; snapshot
-  if [ "$snapshot_invalid" -eq 0 ] && [ "${#cores[@]}" -eq $((2*shard_count)) ] && [ "${cores[*]}" = "$before_cores" ]; then record PASS "R$round cores" "unchanged: $before_cores"; else record FAIL "R$round cores" 'core count or PIDs changed'; fi
-  new=${gateway_by_shard[0]:-}; gateway_ok=1
-  for ((s=0; s<shard_count; s++)); do
+  if [ "$snapshot_invalid" -eq 0 ] && [ "${#cores[@]}" -eq $((2*local_count)) ] && [ "${cores[*]}" = "$before_cores" ]; then record PASS "R$round cores" "unchanged: $before_cores"; else record FAIL "R$round cores" 'core count or PIDs changed'; fi
+  new=${gateway_by_shard[${local_shards[0]}]:-}; gateway_ok=1
+  for s in "${local_shards[@]}"; do
     current=${gateway_by_shard[$s]:-}
     if [ -z "$current" ] || [ "${ipc_by_shard[$s]:-}" != "${old_ipcs[$s]}" ]; then gateway_ok=0
-    elif [ -z "$selected_shard" ] || [ "$s" -eq "$selected_shard" ]; then [ "$current" != "${old_gateways[$s]}" ] || gateway_ok=0
+    elif [ "$shard_given" -eq 0 ] || [ "$s" -eq "$selected_shard" ]; then [ "$current" != "${old_gateways[$s]}" ] || gateway_ok=0
     else [ "$current" = "${old_gateways[$s]}" ] || gateway_ok=0; fi
   done
-  if [ "$gateway_ok" -eq 1 ] && [ "$snapshot_invalid" -eq 0 ] && [ "${#gateways[@]}" -eq "$shard_count" ]; then
-    if [ "$shard_count" -eq 1 ]; then record PASS "R$round gateway PID" "$old -> $new"; else record PASS "R$round gateway PID" 'target gateways replaced; other shard PIDs unchanged'; fi
+  if [ "$gateway_ok" -eq 1 ] && [ "$snapshot_invalid" -eq 0 ] && [ "${#gateways[@]}" -eq "$local_count" ]; then
+    if [ "$local_count" -eq 1 ]; then record PASS "R$round gateway PID" "$old -> $new"; else record PASS "R$round gateway PID" 'target gateways replaced; other shard PIDs unchanged'; fi
   else record FAIL "R$round gateway PID" 'replacement not uniquely identified'; fi
-  if [ "${#gateways[@]}" -eq "$shard_count" ] && [ "$snapshot_invalid" -eq 0 ]; then
-    if [ "$shard_count" -eq 1 ]; then record PASS "R$round gateway count" 'exactly one Gateway process (no standby or retiring one left)'; else record PASS "R$round gateway count" "exactly $shard_count Gateway processes"; fi
+  if [ "${#gateways[@]}" -eq "$local_count" ] && [ "$snapshot_invalid" -eq 0 ]; then
+    if [ "$local_count" -eq 1 ]; then record PASS "R$round gateway count" 'exactly one Gateway process (no standby or retiring one left)'; else record PASS "R$round gateway count" "exactly $local_count Gateway processes"; fi
   else record FAIL "R$round gateway count" "gateways=${#gateways[@]}"; fi
   deadline=$((SECONDS+35))
   old_ok=1; ipc_ok=1; sockets=0; secrets=0
-  for ((s=0; s<shard_count; s++)); do
-    if [ -z "$selected_shard" ] || [ "$s" -eq "$selected_shard" ]; then
+  for s in "${local_shards[@]}"; do
+    if [ "$shard_given" -eq 0 ] || [ "$s" -eq "$selected_shard" ]; then
       old_pid=${old_gateways[$s]}
       while kill -0 "$old_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
       kill -0 "$old_pid" 2>/dev/null && old_ok=0
@@ -188,8 +205,8 @@ for ((round=1; round<=repeat; round++)); do
     secrets=$(find "$ipc" -maxdepth 1 -type f -name core.secret -printf '.' 2>/dev/null | wc -c)
     [ "$sockets" -eq 2 ] && [ "$secrets" -eq 1 ] && [ -S "$ipc/core-0.sock" ] && [ -S "$ipc/core-1.sock" ] || ipc_ok=0
   done
-  if [ "$old_ok" -eq 1 ]; then if [ "$shard_count" -eq 1 ]; then record PASS "R$round old gateway" "PID $old is gone"; else record PASS "R$round old gateway" 'all replaced Gateway PIDs are gone'; fi; else if [ "$shard_count" -eq 1 ]; then record FAIL "R$round old gateway" "PID $old still exists"; else record FAIL "R$round old gateway" 'a replaced Gateway PID still exists'; fi; fi
-  if [ "$ipc_ok" -eq 1 ]; then if [ "$shard_count" -eq 1 ]; then record PASS "R$round IPC" 'two expected sockets and core.secret'; else record PASS "R$round IPC" 'two expected sockets and core.secret per shard'; fi; else if [ "$shard_count" -eq 1 ]; then record FAIL "R$round IPC" "sockets=$sockets core.secret=$secrets"; else record FAIL "R$round IPC" 'socket or core.secret count incorrect for a shard'; fi; fi
+  if [ "$old_ok" -eq 1 ]; then if [ "$local_count" -eq 1 ]; then record PASS "R$round old gateway" "PID $old is gone"; else record PASS "R$round old gateway" 'all replaced Gateway PIDs are gone'; fi; else if [ "$local_count" -eq 1 ]; then record FAIL "R$round old gateway" "PID $old still exists"; else record FAIL "R$round old gateway" 'a replaced Gateway PID still exists'; fi; fi
+  if [ "$ipc_ok" -eq 1 ]; then if [ "$local_count" -eq 1 ]; then record PASS "R$round IPC" 'two expected sockets and core.secret'; else record PASS "R$round IPC" 'two expected sockets and core.secret per shard'; fi; else if [ "$local_count" -eq 1 ]; then record FAIL "R$round IPC" "sockets=$sockets core.secret=$secrets"; else record FAIL "R$round IPC" 'socket or core.secret count incorrect for a shard'; fi; fi
   markers=$(find "$ROOT" \( -name standby-ready -o -name standby-active \) -print 2>/dev/null) || markers=unavailable
   if [ -z "$markers" ] && [ -d "$ROOT" ]; then record PASS "R$round markers" 'no standby markers'; else record FAIL "R$round markers" 'markers found or runtime root unreadable'; fi
   events=
@@ -201,12 +218,12 @@ for ((round=1; round<=repeat; round++)); do
   if [ "$before_warnings" != unknown ] && [ "$after_warnings" != unknown ] && [ "$before_warnings" = "$after_warnings" ]; then record PASS "R$round warnings" "count unchanged: $after_warnings"; else record FAIL "R$round warnings" "count: $before_warnings -> $after_warnings"; fi
   if [ "$repeat" -gt 1 ]; then
     rss_ok=1; gateway_rss=
-    for ((s=0; s<shard_count; s++)); do
+    for s in "${local_shards[@]}"; do
       for role in gateway core-0 core-1; do
         case "$role" in gateway) pid=${gateway_by_shard[$s]:-};; *) pid=${core_by_socket["${old_ipcs[$s]}/$role.sock"]:-};; esac
         rss=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
         echo "Shard $s $role RSS after round $round: ${rss:-unknown} kB"
-        [ "$s:$role" != 0:gateway ] || gateway_rss=$rss
+        [ "$s:$role" != "${local_shards[0]}:gateway" ] || gateway_rss=$rss
         key="$s:$role"
         if [[ "$rss" =~ ^[0-9]+$ ]] && [ "$rss" -gt 0 ]; then
           [ "$round" -ne 1 ] || baseline_rss[$key]=$rss
@@ -215,7 +232,7 @@ for ((round=1; round<=repeat; round++)); do
       done
     done
     if [ "$rss_ok" -eq 1 ]; then
-      if [ "$shard_count" -eq 1 ]; then record PASS "R$round RSS" "${gateway_rss} kB, baseline ${baseline_rss[0:gateway]} kB"; else record PASS "R$round RSS" 'all process RSS values within 20% of their baselines'; fi
+      if [ "$local_count" -eq 1 ]; then record PASS "R$round RSS" "${gateway_rss} kB, baseline ${baseline_rss[${local_shards[0]}:gateway]} kB"; else record PASS "R$round RSS" 'all process RSS values within 20% of their baselines'; fi
     else record FAIL "R$round RSS" 'process RSS unavailable or exceeds baseline by over 20%'; fi
   fi
 done
