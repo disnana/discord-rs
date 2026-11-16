@@ -386,3 +386,25 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - **解釈（Discord の一般的な仕様に基づく推測で、このログだけでは確認できない）**：4000 は「不明なエラー」で、Discord は再接続を許す（再開可能な）コードとされる。ログイン成功が 1 回のままなので、Gateway プロセスは終了せず、twilight が同じセッションで再接続（Resume）している可能性が高い。ただし **再接続の成功、Resume か新規 Identify か、切断中に落としたイベントの有無は、現在のログに出ないため未確認。**
 - 頻度：約 10 時間（開始から確認時点まで）に 10 回、およそ 1 時間に 1 回前後。Discord 側の都合による切断として珍しくはないが、原因はこのログからは分からない。切断のたびに新規 Identify を消費している証拠はない（`login=1`）が、これも直接の確認ではない。
 - **ログの不足（改善案、未実装）**：切断行に時刻がなく、再接続の成功・Resume の有無・切断から復帰までの時間が出ない。次の版で、切断と再接続の各行に時刻と結果（resumed／identify）を出すと、実機で原因を切り分けられる。
+
+## 2026-11-16 午後：新版（main 2746d26 のコード）の WSL 実機試験（実 Discord、separate、1 Shard）
+
+環境：WSL2 Ubuntu 24.04、release ビルド（`cargo build --release --locked -j 4`）、`botd --core-mode separate --stop-children-on-exit`、テスト用 Bot（Oracle と同じ token のため、Oracle の botd は事前に `systemctl stop` して停止）。ユーザーが `!count` を送って数と返信件数を確認。**実機の確認はこの 1 回の範囲で、再現性・長時間・複数 Shard は未確認。**
+
+| 項目 | 結果 |
+|---|---|
+| 起動 | ログイン成功、`!ping`・`!count`（61）が返る。Core 2 本、Gateway 1 本、親は botd |
+| `gateway-update`（1 回）`update-check.sh` | 全 PASS：Core PID 不変、Gateway 961→1105、旧 Gateway 消滅、IPC・マーカー・監査（requested→succeeded、約 1 秒）。`!count` 61→65 が連続 |
+| Gateway `kill -9` | 約 1.5 秒で再起動、Core 不変。**ログインの成功時間は未計測**（PID の出現のみ） |
+| Core 1 本 `kill -9`／2 本 `kill -9` | botd が再起動（約 6 秒／約 9〜11 秒）、Gateway 不変。`!count` 65→70 が連続（巻き戻りなし） |
+| botd `kill -9`（#6） | systemd が約 5 秒で再起動、Core・Gateway は新しい PID に入れ替わり、古い予約を整理。`!count` 70→73 が連続 |
+| `gateway-update` ×3（`--repeat 3`）| 全 PASS（各回 Core 不変、Gateway 1 本、RSS 10.7〜11.1 MB で増加なし）。`!count` 73→76 が連続 |
+| 更新中に Core 0 を `kill -9` | 更新は成功（約 1.5 秒）、Core 0 は botd が 1 本だけ再起動、Gateway 1 本。`!count` 76→79 が連続 |
+| `systemctl stop`（#5） | 0 秒、`Result=success`、残りプロセス 0、ipc に sock・secret なし、`core-state.json` は残る |
+
+- journal の警告 4 件は、私が行った botd の `kill -9` に対する systemd のメッセージ（WSL の cgroup の `Failed to kill control group … Invalid argument`）で、更新中の警告ではない。
+- 途中、WSL の botd が 15:54:11 に正常停止していた（原因は未確認。WSL の呼び出し終了の影響の可能性があるが推測）。端末を開いたままにしてからは再発していない。
+- 未確認：更新中の「重複の抑止」（今回の試験では重複返信は観察されなかったが、観察は `!count` の返信件数のみ）、複数 Shard、長時間、Interaction の重複、`!workers` の重複。
+- 試験後、WSL の botd は停止・無効のまま（Oracle で再開するため）。
+
+次：Oracle で新版を入れ替え（`docs/soak-test.md` §5）、新版の放置（6 時間以上）。
