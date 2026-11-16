@@ -930,7 +930,17 @@ pub mod control {
         gateway_update_audit: Option<PathBuf>,
         /// Who asked, per operation, so the outcome can be recorded against them.
         gateway_update_actors: BTreeMap<String, (String, String)>,
+        pending_audit: Vec<PendingAudit>,
     }
+
+    /// A terminal record not yet written: event word, operation ID, Bot, (subject, role), error.
+    type PendingAudit = (
+        String,
+        String,
+        String,
+        (String, String),
+        Option<DaemonError>,
+    );
 
     impl ControlPlane {
         /// Records `gateway-update` requests and outcomes in an append-only file. A request
@@ -953,14 +963,13 @@ pub mod control {
                 return Ok(());
             };
             use std::io::Write;
-            let mut options = std::fs::OpenOptions::new();
-            options.create(true).append(true);
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(path)?;
+            let mut file = crate::core_units::open_append_private(path)?;
+            #[cfg(not(unix))]
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
             let at_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis());
@@ -973,6 +982,18 @@ pub mod control {
             line.push(b'\n');
             file.write_all(&line)?;
             file.sync_data()
+        }
+
+        fn retry_pending_audit(&mut self) {
+            let pending = std::mem::take(&mut self.pending_audit);
+            for (event, id, bot, actor, error) in pending {
+                if self
+                    .audit_gateway_update(&event, &id, &bot, &actor, error)
+                    .is_err()
+                {
+                    self.pending_audit.push((event, id, bot, actor, error));
+                }
+            }
         }
 
         pub fn recovery_events_dropped(&self) -> u64 {
@@ -1068,6 +1089,7 @@ pub mod control {
                 last_advanced: String::new(),
                 gateway_update_audit: None,
                 gateway_update_actors: BTreeMap::new(),
+                pending_audit: Vec::new(),
             }
         }
 
@@ -1202,6 +1224,13 @@ pub mod control {
                     .audit_gateway_update(event, &op.id, &op.bot_id, actor, first_error)
                     .is_err()
                 {
+                    self.pending_audit.push((
+                        event.to_owned(),
+                        op.id.clone(),
+                        op.bot_id.clone(),
+                        actor.clone(),
+                        first_error,
+                    ));
                     eprintln!("gateway-update の完了を監査に記録できません");
                 }
             }
@@ -1256,6 +1285,7 @@ pub mod control {
                         .collect();
                     let mut value = json!({"ok": true, "offline": false, "note": NOTE,
                         "status": {"processes": self.process_views(&processes), "monitor_ok": self.monitor_ok}});
+                    value["status"]["gateway_update_audit"] = json!({"ok": self.pending_audit.is_empty(), "pending": self.pending_audit.len()});
                     // Advisory observations only; no labels beyond Bot/shard/generation.
                     value["status"]["metrics"] = self
                         .daemon
@@ -1390,6 +1420,7 @@ pub mod control {
             credentials: &impl CredentialSource,
             deadline: Duration,
         ) -> Vec<ShardKey> {
+            self.retry_pending_audit();
             let keys: Vec<ShardKey> = self.daemon.snapshots().into_iter().map(|s| s.key).collect();
             #[cfg(unix)]
             self.daemon.abandon_gateway_updates();
@@ -1418,6 +1449,7 @@ pub mod control {
         /// Observe actual exits before advancing operations. One command per
         /// Bot per tick bounds cooperative writes and keeps reads responsive.
         pub async fn tick(&mut self, credentials: &impl CredentialSource) {
+            self.retry_pending_audit();
             self.monitor_ok = self.daemon.poll(credentials).is_ok();
             let mut ids: Vec<_> = self
                 .operations
@@ -3090,11 +3122,13 @@ impl<C: Clock> Daemon<C> {
                 .ok_or(DaemonError::InvalidSpec)?;
             let shard = crate::protocol::Shard::new(entry.spec.shard_id, entry.spec.total_shards)
                 .map_err(|_| DaemonError::InvalidSpec)?;
-            entry.cores = Some(crate::core_units::CoreUnits::new(
+            let mut cores = crate::core_units::CoreUnits::new(
                 entry.spec.ipc_path.clone(),
                 crate::protocol::BotId(bot_id),
                 shard,
-            ));
+            );
+            cores.set_epoch_floor(entry.epoch);
+            entry.cores = Some(cores);
         }
         Ok(())
     }
@@ -3130,6 +3164,19 @@ impl<C: Clock> Daemon<C> {
         if !entry.started || !running || entry.candidate.is_some() || entry.retiring.is_some() {
             return Err(DaemonError::InvalidState);
         }
+        if entry.mock_discord.is_none() {
+            use crate::local_identify::LocalAdmission;
+            let now = std::time::Instant::now();
+            let mut probe = self.local_identify.clone();
+            if probe.try_acquire(&entry.spec.bot_id, now) != LocalAdmission::Granted
+                || matches!(
+                    probe.try_acquire(&entry.spec.bot_id, now),
+                    LocalAdmission::Exhausted { .. }
+                )
+            {
+                return Err(DaemonError::InvalidState);
+            }
+        }
         let spec = &entry.spec.gateway;
         if !safe_path(Path::new(&spec.program)) {
             return Err(DaemonError::InvalidProgram);
@@ -3159,13 +3206,7 @@ impl<C: Clock> Daemon<C> {
         }
         let log = spec.management_path.parent().and_then(|dir| {
             let path = dir.join("gateway-candidate.log");
-            let mut options = std::fs::OpenOptions::new();
-            options.create(true).append(true);
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            options.open(path).ok()
+            crate::core_units::open_append_private(&path).ok()
         });
         let (out, err) = match log.and_then(|file| file.try_clone().ok().map(|c| (file, c))) {
             Some((a, b)) => (Stdio::from(a), Stdio::from(b)),
@@ -3289,6 +3330,9 @@ impl<C: Clock> Daemon<C> {
             return Err(DaemonError::StopFailed);
         }
         entry.epoch = epoch;
+        if let Some(cores) = entry.cores.as_mut() {
+            cores.set_epoch_floor(epoch);
+        }
         let _ = std::fs::remove_file(&candidate.ready_marker);
         candidate.activated = Some(std::time::Instant::now());
         Ok(())

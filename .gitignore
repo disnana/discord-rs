@@ -8,3 +8,4 @@ src/worker-path.txt*
 
 # Claude Code サブエージェントの作業ツリー
 .claude/worktrees/
+src.zip

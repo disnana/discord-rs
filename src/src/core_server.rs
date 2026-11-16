@@ -195,6 +195,7 @@ pub async fn serve(
     secret: Secret<[u8; SECRET_BYTES]>,
     backend: Option<std::sync::Arc<dyn crate::state_store::StateStore>>,
     lifetime: Lifetime,
+    initial_floor: u64,
 ) -> Result<(), AppError> {
     let mut life = CoreLife::new(backend)?;
     let failed = std::sync::atomic::AtomicU32::new(0);
@@ -210,13 +211,13 @@ pub async fn serve(
     // - a lower epoch is refused at once.
     // The acceptor is one future kept across the whole loop: dropping it while a client is
     // half-way through authenticating would silently lose that client.
-    let (fence_tx, _) = tokio::sync::watch::channel(0u64);
+    let (fence_tx, _) = tokio::sync::watch::channel(initial_floor);
     let mut pending: Option<(UnixStream, u64)> = None;
     let mut acceptor = Box::pin(accept_authenticated(&listener, &secret, &failed));
     // The highest epoch this Core has ever served. It outlives the connection that set it:
     // once a Gateway has taken over at epoch N, no Gateway below N may attach again, even
     // when nothing is connected at that moment.
-    let mut floor = 0u64;
+    let mut floor = initial_floor;
     loop {
         let (stream, epoch) = match pending.take() {
             Some(next) => next,
@@ -300,7 +301,7 @@ async fn read_secret_from_stdin() -> Result<Secret<[u8; SECRET_BYTES]>, CoreServ
 }
 
 /// Process entry for `src --core-listen <absolute socket path>`.
-pub async fn run(socket: PathBuf, lifetime: Lifetime) -> Result<(), AppError> {
+pub async fn run(socket: PathBuf, lifetime: Lifetime, floor: u64) -> Result<(), AppError> {
     let secret = read_secret_from_stdin().await?;
     let listener = bind_socket(&socket)?;
     if lifetime == Lifetime::UntilStopped {
@@ -314,7 +315,7 @@ pub async fn run(socket: PathBuf, lifetime: Lifetime) -> Result<(), AppError> {
             std::process::exit(0);
         });
     }
-    let result = serve(listener, secret, None, lifetime).await;
+    let result = serve(listener, secret, None, lifetime, floor).await;
     if lifetime == Lifetime::UntilStopped {
         // The stdin watcher above is a blocking read that cannot be cancelled, so returning
         // would leave the runtime waiting on it: a live process with no listener, which botd

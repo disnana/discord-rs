@@ -4194,6 +4194,8 @@ async fn connection_loop(
                     checked_result(&mut unchanged, previous, None)?
                 } else {
                     let owned = std::mem::take(state);
+                    // Do not timeout this future: cancellation abandons its registered
+                    // request and running task, so draining and state ownership are unsafe.
                     match tasks
                         .request(handle_command(command, owned, runtime.clone()))
                         .await

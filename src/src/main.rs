@@ -936,6 +936,7 @@ async fn run() -> Result<(), AppError> {
         return src::core_server::run(
             PathBuf::from(socket),
             src::core_server::Lifetime::OneConnection,
+            0,
         )
         .await;
     }
@@ -948,6 +949,30 @@ async fn run() -> Result<(), AppError> {
         return src::core_server::run(
             PathBuf::from(socket),
             src::core_server::Lifetime::UntilStopped,
+            0,
+        )
+        .await;
+    }
+    #[cfg(unix)]
+    if let [flag, socket, persist, floor_flag, value] = args.as_slice()
+        && flag == "--core-listen"
+        && persist == "--core-persist"
+        && floor_flag == "--epoch-floor"
+    {
+        let value = value.to_str().ok_or(StartupFailure::InvalidArguments)?;
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(StartupFailure::InvalidArguments.into());
+        }
+        let floor = value
+            .parse::<u64>()
+            .map_err(|_| StartupFailure::InvalidArguments)?;
+        if floor == 0 {
+            return Err(StartupFailure::InvalidArguments.into());
+        }
+        return src::core_server::run(
+            PathBuf::from(socket),
+            src::core_server::Lifetime::UntilStopped,
+            floor,
         )
         .await;
     }
@@ -1139,7 +1164,7 @@ async fn live_events(
     let mut requests = JoinSet::new();
     tokio::pin!(shutdown);
     println!("Botを起動しています...");
-    loop {
+    'events: loop {
         // Events a standby Gateway held back come first, in the order they arrived.
         let mut replaying = false;
         let result = if let Some(held) = backlog.pop_front() {
@@ -1162,10 +1187,36 @@ async fn live_events(
             },
             }
         };
+        let mut replay_permit = if replaying {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => {
+                        manager.stop_reconnecting();
+                        break 'events;
+                    }
+                    permit = capacity.clone().acquire_owned() => break permit.ok(),
+                    event = shard.next_event(EventTypeFlags::all()) => match event {
+                        Some(event) if backlog.len() < 512 => backlog.push_back(event),
+                        _ => {
+                            eprintln!("Gateway replay backlog overflow or shard closed");
+                            manager.stop_reconnecting();
+                            return Err(StartupFailure::InvalidArguments.into());
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
         match result {
             Ok(Event::Ready(ready)) => {
                 println!("ログイン成功: {}", ready.user.id);
-                let Some(permit) = event_permit(&capacity, replaying).await else {
+                let Some(permit) = (if replaying {
+                    replay_permit.take()
+                } else {
+                    event_permit(&capacity, false).await
+                }) else {
                     eprintln!("Ready イベントを処理できません: 混雑中");
                     continue;
                 };
@@ -1182,7 +1233,11 @@ async fn live_events(
                 });
             }
             Ok(Event::MessageCreate(message)) if !message.author.bot => {
-                let Some(permit) = event_permit(&capacity, replaying).await else {
+                let Some(permit) = (if replaying {
+                    replay_permit.take()
+                } else {
+                    event_permit(&capacity, false).await
+                }) else {
                     eprintln!("Workerが混雑しているためメッセージを処理できませんでした");
                     continue;
                 };
@@ -1293,7 +1348,11 @@ async fn live_events(
                 let key = channel.id.get();
                 let manager = manager.clone();
                 let http = http.clone();
-                let Some(permit) = event_permit(&capacity, replaying).await else {
+                let Some(permit) = (if replaying {
+                    replay_permit.take()
+                } else {
+                    event_permit(&capacity, false).await
+                }) else {
                     eprintln!("Interaction を受け付けられません: 混雑中");
                     // Inline and short-timeout on purpose: no extra task under overload.
                     reject_interaction(

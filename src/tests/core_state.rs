@@ -399,3 +399,71 @@ async fn a_newer_writer_always_outranks_the_older_one_whatever_the_file_carries(
         "an older writer never replaces what a newer one saved"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn writer_stamps_increase_before_either_writer_saves() {
+    let dir = Dir::new();
+    let path = dir.0.join("core-state.writer");
+    let future = u64::MAX / 2;
+    std::fs::write(&path, future.to_string()).unwrap();
+    let (first, _) = Persister::open(dir.0.clone(), binding()).await;
+    let stamp1: u64 = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    let (second, _) = Persister::open(dir.0.clone(), binding()).await;
+    let stamp2: u64 = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(stamp1, future + 1);
+    assert_eq!(stamp2, stamp1 + 1);
+    second.observe(0, &count(5));
+    second.flush(true).await;
+    first.observe(0, &count(3));
+    first.flush(true).await;
+    assert_eq!(
+        core_state::load(&dir.0, &binding()),
+        vec![Some(count(5)), None]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exhausted_writer_stamp_disables_writes_but_loads_state() {
+    let dir = Dir::new();
+    let states = vec![Some(count(9)), None];
+    core_state::store(&dir.0, &binding(), &states).unwrap();
+    std::fs::write(dir.0.join("core-state.writer"), u64::MAX.to_string()).unwrap();
+    let (persister, loaded) = Persister::open(dir.0.clone(), binding()).await;
+    assert_eq!(loaded, states);
+    persister.observe(0, &count(10));
+    persister.flush(true).await;
+    persister.flush(true).await;
+    assert_eq!(core_state::load(&dir.0, &binding()), states);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn writer_stamp_rejects_symlink_and_accepts_existing_public_mode() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = Dir::new();
+    let target = dir.0.join("target");
+    std::fs::write(&target, "123").unwrap();
+    let path = dir.0.join("core-state.writer");
+    symlink(&target, &path).unwrap();
+    let (disabled, _) = Persister::open(dir.0.clone(), binding()).await;
+    disabled.observe(0, &count(1));
+    disabled.flush(true).await;
+    assert!(!dir.file().exists());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "123");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, "123").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (enabled, _) = Persister::open(dir.0.clone(), binding()).await;
+    enabled.observe(0, &count(2));
+    enabled.flush(true).await;
+    assert_eq!(
+        core_state::load(&dir.0, &binding()),
+        vec![Some(count(2)), None]
+    );
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}

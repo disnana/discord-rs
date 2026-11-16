@@ -52,12 +52,12 @@ impl Core {
     }
 
     async fn start_with_identity(socket: &Path, secret: &str, identity: Option<&str>) -> Self {
-        Self::start_mode(socket, secret, identity, false).await
+        Self::start_mode(socket, secret, identity, false, None).await
     }
 
     /// 接続をまたいで動き続ける Core（`--core-persist`）。
     async fn start_persistent(socket: &Path, secret: &str, identity: &str) -> Self {
-        Self::start_mode(socket, secret, Some(identity), true).await
+        Self::start_mode(socket, secret, Some(identity), true, None).await
     }
 
     async fn start_mode(
@@ -65,11 +65,15 @@ impl Core {
         secret: &str,
         identity: Option<&str>,
         persistent: bool,
+        floor: Option<u64>,
     ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_src"));
         command.arg("--core-listen").arg(socket).env_clear();
         if persistent {
             command.arg("--core-persist");
+        }
+        if let Some(floor) = floor {
+            command.arg("--epoch-floor").arg(floor.to_string());
         }
         if let Some(identity) = identity {
             command.env("BOT_WORKER_IPC_IDENTITY", identity);
@@ -451,7 +455,7 @@ async fn a_persistent_core_serves_a_second_connection_after_the_first_ends() {
     let dir = private_dir();
     let socket = dir.join("core.sock");
     let listener = bind_socket(&socket).unwrap();
-    let server = tokio::spawn(serve(listener, secret(), None, Lifetime::UntilStopped));
+    let server = tokio::spawn(serve(listener, secret(), None, Lifetime::UntilStopped, 0));
 
     for round in 0..3 {
         if round == 1 {
@@ -474,7 +478,7 @@ async fn a_persistent_core_serves_a_second_connection_after_the_first_ends() {
     server.abort();
 
     let listener = bind_socket(&socket).unwrap();
-    let once = tokio::spawn(serve(listener, secret(), None, Lifetime::OneConnection));
+    let once = tokio::spawn(serve(listener, secret(), None, Lifetime::OneConnection, 0));
     let mut stream = attach(&socket, SECRET).await;
     assert!(
         bounded(exchange(&mut stream, r#"{"type":"health"}"#))
@@ -1080,4 +1084,40 @@ async fn a_persistent_core_exits_after_too_many_failed_attaches() {
     let status = bounded(core.child.wait()).await.unwrap();
     assert!(!status.success(), "the Core exits (non-zero): {status:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn persistent_core_respects_initial_epoch_floor() {
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let _core = Core::start_mode(&socket, SECRET, None, true, Some(5)).await;
+    let mut lower = attach_with_epoch(&socket, SECRET, 3).await;
+    assert!(!healthy(&mut lower).await);
+    let mut equal = attach_with_epoch(&socket, SECRET, 5).await;
+    assert!(healthy(&mut equal).await);
+    let mut higher = attach_with_epoch(&socket, SECRET, 6).await;
+    assert!(healthy(&mut higher).await);
+}
+
+#[tokio::test]
+async fn invalid_epoch_floor_exits_nonzero() {
+    for value in ["0", "-1", "5x", "18446744073709551616"] {
+        let status = bounded(
+            Command::new(env!("CARGO_BIN_EXE_src"))
+                .args([
+                    "--core-listen",
+                    "/tmp/core.sock",
+                    "--core-persist",
+                    "--epoch-floor",
+                    value,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        )
+        .await
+        .unwrap();
+        assert!(!status.success(), "accepted {value}");
+    }
 }

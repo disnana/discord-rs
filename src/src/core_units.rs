@@ -86,6 +86,37 @@ pub fn rotate_in_place(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Opens a private append-only file without following a replaced symlink.
+pub fn open_append_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::PermissionsExt;
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // Linux O_NOFOLLOW closes the race between the path check and open.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(0o400000)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != unsafe { geteuid() } || meta.nlink() != 1 {
+        return Err(std::io::Error::other("unsafe file"));
+    }
+    if meta.mode() & 0o7777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 struct Slot {
     child: Option<Child>,
     /// Held so the Core sees EOF (and exits) when botd closes or loses it.
@@ -114,6 +145,7 @@ pub struct CoreUnits {
     slots: Vec<Slot>,
     prepared: bool,
     log_checked: Option<Instant>,
+    epoch_floor: u64,
 }
 
 /// What an operator may be told about a Core, never a path, secret or argument.
@@ -132,7 +164,12 @@ impl CoreUnits {
             slots: (0..SLOTS).map(|_| Slot::empty()).collect(),
             prepared: false,
             log_checked: None,
+            epoch_floor: 0,
         }
+    }
+
+    pub fn set_epoch_floor(&mut self, floor: u64) {
+        self.epoch_floor = self.epoch_floor.max(floor);
     }
 
     pub fn dir(&self) -> &Path {
@@ -181,7 +218,13 @@ impl CoreUnits {
         command
             .arg("--core-listen")
             .arg(socket_path(&self.dir, index))
-            .arg("--core-persist")
+            .arg("--core-persist");
+        if self.epoch_floor > 0 {
+            command
+                .arg("--epoch-floor")
+                .arg(self.epoch_floor.to_string());
+        }
+        command
             .env_clear()
             .env("BOT_WORKER_IPC_IDENTITY", identity)
             .stdin(Stdio::piped())
@@ -334,4 +377,30 @@ fn open_log(dir: &Path, index: usize) -> Option<std::fs::File> {
         .ok()?;
     writeln!(file, "--- core slot {index} start ---").ok()?;
     Some(file)
+}
+
+#[cfg(test)]
+mod private_append_tests {
+    use super::open_append_private;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn refuses_symlink_and_restricts_existing_file() {
+        let dir = std::env::temp_dir().join(format!("core-private-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let link = dir.join("link");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(open_append_private(&link).is_err());
+        open_append_private(&target).unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 }

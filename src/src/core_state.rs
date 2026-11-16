@@ -14,7 +14,7 @@
 
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Mutex as StdMutex,
     time::{Duration, Instant},
@@ -263,6 +263,78 @@ fn remove_dead_temporaries(dir: &Path) {
     }
 }
 
+// Allocate under a cross-process lock. Invalid or incomplete metadata fails closed.
+#[cfg(unix)]
+fn allocate_stamp(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    let path = dir.join("core-state.writer");
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.is_file() => return Err(io::Error::other("invalid writer file")),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // Linux O_NOFOLLOW and O_NONBLOCK prevent following a replaced link or blocking on a FIFO.
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(0o400000 | 0o4000);
+    let (mut file, created) = match options.create_new(true).open(&path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            (options.create_new(false).open(&path)?, false)
+        }
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != unsafe { geteuid() } {
+        return Err(io::Error::other("invalid writer file owner or type"));
+    }
+    file.lock()?;
+    let result = (|| {
+        let mut text = String::new();
+        (&mut file).take(21).read_to_string(&mut text)?;
+        let last = if text.is_empty() && created {
+            0
+        } else {
+            text.parse::<u64>()
+                .map_err(|_| io::Error::other("invalid writer stamp"))?
+        };
+        let next_last = last
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("writer stamp exhausted"))?;
+        let next_stored = stored_epoch(dir)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("stored stamp exhausted"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?;
+        let now = u64::try_from(now.as_nanos()).map_err(io::Error::other)?;
+        let next = now.max(next_last).max(next_stored);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(next.to_string().as_bytes())?;
+        file.set_len(next.to_string().len() as u64)?;
+        file.sync_all()?;
+        fs::File::open(dir)?.sync_all()?;
+        Ok(next)
+    })();
+    let unlocked = file.unlock();
+    match (result, unlocked) {
+        (Ok(stamp), Ok(())) => Ok(stamp),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn allocate_stamp(_dir: &Path) -> io::Result<u64> {
+    Err(io::Error::other("writer stamps require Linux"))
+}
+
 struct Pending {
     latest: Vec<Option<Value>>,
     version: u64,
@@ -278,11 +350,12 @@ pub struct Persister {
     pending: StdMutex<Pending>,
     // Serializes writers within this process.
     writing: Mutex<()>,
-    epoch: u64,
+    epoch: Option<u64>,
 }
 
 impl Persister {
-    /// Load any valid persisted states (blocking read on a worker thread).
+    /// Load valid states and durably allocate a writer stamp. Allocation failure disables
+    /// persistence for this writer and emits one warning; loading remains independent.
     pub async fn open(dir: PathBuf, binding: Binding) -> (Self, Vec<Option<Value>>) {
         let loaded = {
             let dir = dir.clone();
@@ -290,43 +363,19 @@ impl Persister {
                 .await
                 .unwrap_or_else(|_| empty(&binding))
         };
-        // The stamp this writer puts on its saves: the time it started, in nanoseconds, but
-        // always above whatever the file already carries (a clock that stepped back, or a tie,
-        // must not leave a new writer "older" than the file it is about to take over). A writer
-        // that started later therefore always outranks the earlier one, whichever layout, botd
-        // incarnation or ownership epoch either of them had.
         let stamp = {
             let dir = dir.clone();
-            tokio::task::spawn_blocking(move || {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| {
-                        u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
-                    });
-                // Also above every stamp this process has already handed out, so two writers
-                // opened back to back (before either has saved) never share one.
-                static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                // Kept below u64::MAX so that "one above" always exists (a file stamped at the
-                // very top would otherwise make every later allocation return the same value).
-                let wanted = now
-                    .max(stored_epoch(&dir).saturating_add(1))
-                    .min(u64::MAX - 1);
-                let mut last = LAST.load(std::sync::atomic::Ordering::Acquire);
-                loop {
-                    let next = wanted.max(last.saturating_add(1));
-                    match LAST.compare_exchange(
-                        last,
-                        next,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    ) {
-                        Ok(_) => break next,
-                        Err(seen) => last = seen,
-                    }
+            match tokio::task::spawn_blocking(move || allocate_stamp(&dir)).await {
+                Ok(Ok(stamp)) => Some(stamp),
+                Ok(Err(error)) => {
+                    eprintln!("??: ?????????????? (kind={:?})", error.kind());
+                    None
                 }
-            })
-            .await
-            .unwrap_or(1)
+                Err(_) => {
+                    eprintln!("??: ?????????????? (???????)");
+                    None
+                }
+            }
         };
         let persister = Self {
             dir,
@@ -365,6 +414,7 @@ impl Persister {
     /// Write if dirty. Unless `force`, honor [`MIN_WRITE_INTERVAL`]. Failure is
     /// a warning; the dirty mark is kept so a later flush retries.
     pub async fn flush(&self, force: bool) {
+        let Some(epoch) = self.epoch else { return };
         let _writing = self.writing.lock().await;
         let (states, version) = {
             let mut pending = self.pending.lock().unwrap();
@@ -383,7 +433,6 @@ impl Persister {
         };
         let dir = self.dir.clone();
         let binding = self.binding;
-        let epoch = self.epoch;
         let result = tokio::task::spawn_blocking(move || store_at(&dir, &binding, &states, epoch))
             .await
             .unwrap_or_else(|_| Err(io::Error::other("persist task failed")));
