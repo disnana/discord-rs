@@ -524,3 +524,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - Oracle（本番側）で `botctl gateway-update --all --yes` が成功（約 1.3 秒、`ok: true`、`completed: 1`、Bot `test` の 1 シャード）。結果の `results[*].operation` に操作 ID・シャードごとの状態・`failed_shards` が入る。
 - **更新後の Gateway のログは `gateway-candidate.log` に出る**（`gateway.log` は更新前の Gateway のログのまま止まる）。`update-check.sh` の更新（08:06 UTC）以降の切断は `gateway-candidate.log` にあり、`soak-report` の `closes`（`gateway*.log` を合算）が 11 になり、`gateway.log` の表示（10）と食い違った理由。切断を調べるときは `gateway*.log` の両方を見る。更新を繰り返すと、`gateway-candidate.log` に複数世代のログが追記され得る（未確認）。**改善候補（未実装）**：更新の確定時にログの名前を整理する、または `soak-report`／運用ガイドに置き場所を明記する。
 - cron（`/etc/cron.d/soak-hourly`、毎時 0 分）：ファイルと cron は有効だが、`soak.log` に 09:00〜11:00 UTC の定時の記録がない（手動の 08:05 と 11:41 のみ）。作成が 11:00 UTC 以降だった可能性もあり、未確認（ユーザーに権限と journal の確認を依頼）。
+
+### 追記（2026-11-16 夜）：新版の切断の中身（Oracle、`gateway-candidate.log`、時刻つき）
+
+- 08:06:19Z（update-check の更新）以降の候補ログ：`09:53:28Z Gateway 再接続の要求を受信` → `09:53:28Z Gateway 切断: close code 4000` → `09:53:29Z Gateway 再開（Resume 成功）`。**Discord の再接続の要求（Reconnect）に続く 4000 の切断で、約 1 秒後に Resume で復帰し、新規の Identify は使っていない**（ログインの行が増えていない）。通常の動作と見られる。旧版の 10 回の 4000 も同じ性質か（旧版には時刻・Resume の行がなく確認できない）。
+- 約 3.5 時間（08:06Z〜11:45Z）で再接続の要求は 1 回。頻度の傾向や、ユーザーの操作との関係（「操作の直後に切れる」仮説）は、この 1 回では判断できない。
+- 候補ログに 11:46:55Z（`--all` の更新）の世代が追記されていることを確認（更新ごとに追記される）。botd の再起動後の Gateway（11:45:34Z）は `gateway.log` に出る。
+- cron の毎時の記録（09:00〜11:00 UTC）が `soak.log` にない件は、ファイル（0644、root、08:07 作成）に問題はなく、原因は未確認（調査中）。
