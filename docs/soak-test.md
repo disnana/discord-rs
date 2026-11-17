@@ -86,3 +86,4 @@ sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --secret-file 
 - **2026-11-15 13:10 UTC 〜 約 9 時間 50 分（Oracle aarch64、1 Shard、separate、旧版）**：再起動 0、worker_unavailable 0、REST unknown 0、journal 警告 0、RSS・fd に増加傾向なし（数値と限定は `docs/progress.md` の 2026-11-16 の節）。ユーザーの報告による。**`closes`（4 → 7）の原因は `gateway.log` の close code が未回収のため未確認。** 新版（2746d26）の放置は未実施。
 - 次回の記録欄：新版の入れ替え日時／`update-check.sh` の結果／再放置の時間と数値／`closes` の内訳。
 - **2026-11-16（WSL、実 Discord、新版）**：更新 ×4（うち 1 回は Core を落としながら）、Gateway・Core・botd の `kill -9`、`systemctl stop` を実施し、`!count` 61→79 が連続。詳細は `docs/progress.md`。Oracle での新版の入れ替えと再放置は未実施。
+- **2026-11-17（Oracle、e61d8d4 版、25.0 時間）**：RSS・fd・再起動・世代・警告は OK（Gateway RSS +28 kB/h、fd 増減 0、NRestarts 0）。`closes` 11→24（WATCH、13 件。Resume か否かはこの集計では未確認）。詳細は `docs/progress.md`。

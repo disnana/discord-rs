@@ -616,3 +616,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - **未確認：** Oracle・実サーバーの systemd（`RuntimeDirectory`）、実際の長時間運用、本物の「固まったハンドラ」での検知（`SIGSTOP` による Core 全体の停止で代用した）、Astra の第 21 回の再監査。
 - **私の誤り（記録）：** 試験スクリプトで `/tmp` の権限を `0755` に変え、WSL の一般ユーザーがコンパイルできなくなった（`1777` に復旧。本番に影響なし）。`cargo` を root で実行して失敗した（一般ユーザーで再実行）。
 - **気づき（推測、未確認）：** botd をセッションの終了で強制終了した試験（systemd の外）で、Gateway が 2 つ取り残された。systemd の制御グループ下では起きにくいと考えているが、確認していない（`06-botd-supervision.md` の論点に近い）。
+
+## 2026-11-17 Oracle 放置の最終数値（e61d8d4 版、25.0 時間）
+- 実測（`soak-diff`、2026-11-16T12:00Z〜11-17T13:00Z、スナップショット 26 件）：botd RSS +4 kB/h、Core 2 つ +1 / +0 kB/h、**Gateway RSS 10256→10952 kB（+696 kB、+28 kB/h）**、fd はすべて増減 0、NRestarts 0、journal の警告 0、世代 3 のまま、worker_unavailable 0。判定は RSS・fd・再起動・ファイル・世代・警告が OK。
+- `closes` は 11→24（判定 WATCH）。増分 13 件は、先の分析（Resume のみ、Identify 0、平均約 1.7 時間間隔）と件数が一致する。ただしこの版のログには `resumed=` がなく、今回の集計では Resume か Identify かを**確認していない**（先の分析は個別ログの読みによる）。
+- Gateway RSS は +28 kB/h と微増。25 時間で +0.7 MB であり、リークの断定も否定もできない（要・さらに長い観測）。
+- **未確認のまま：** Oracle は最新 main（ログ統一・B3・`!workers`・P1）を受け取っていない。OS 再起動後の自動起動は未検証。
