@@ -3732,13 +3732,44 @@ pub(crate) struct CoreLife {
     seen: SeenIds,
 }
 
-const REQUEST_WARN_AFTER: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_WARN_AFTER: Duration = Duration::from_secs(30);
 const REQUEST_CHECK_EVERY: Duration = Duration::from_secs(5);
 const REQUEST_WARN_REPEAT: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RequestSummary {
+    pending: usize,
+    oldest: Option<tokio::time::Instant>,
+    warned: usize,
+}
+
+impl RequestSummary {
+    pub(crate) fn record(
+        self,
+        now: tokio::time::Instant,
+        updated_at_ms: u64,
+    ) -> crate::core_status::StatusRecord {
+        crate::core_status::StatusRecord {
+            pending: self.pending.min(u32::MAX as usize) as u32,
+            oldest_age_s: self.oldest.map_or(0, |start| {
+                now.saturating_duration_since(start)
+                    .as_secs()
+                    .min(u32::MAX as u64) as u32
+            }),
+            warned: self.warned.min(u32::MAX as usize) as u32,
+            threshold_s: REQUEST_WARN_AFTER.as_secs() as u32,
+            updated_at_ms,
+            pid: std::process::id(),
+        }
+    }
+}
+
+pub(crate) type SharedRequestSummary = Arc<std::sync::Mutex<RequestSummary>>;
 
 #[derive(Default)]
 struct RequestObservations {
     next: u64,
+    summary: SharedRequestSummary,
     pending: std::collections::HashMap<u64, (tokio::time::Instant, Option<tokio::time::Instant>)>,
 }
 
@@ -3747,11 +3778,32 @@ impl RequestObservations {
         let id = self.next;
         self.next = self.next.checked_add(1).expect("request counter exhausted");
         self.pending.insert(id, (now, None));
+        let mut summary = self
+            .summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        summary.pending = self.pending.len();
+        summary.oldest = Some(summary.oldest.map_or(now, |oldest| oldest.min(now)));
         id
     }
 
     fn finish(&mut self, id: u64) {
         self.pending.remove(&id);
+        self.refresh_summary();
+    }
+
+    fn refresh_summary(&self) {
+        let mut summary = self
+            .summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        summary.pending = self.pending.len();
+        summary.oldest = self.pending.values().map(|(started, _)| *started).min();
+        summary.warned = self
+            .pending
+            .values()
+            .filter(|(_, warned)| warned.is_some())
+            .count();
     }
 
     fn check(
@@ -3770,6 +3822,7 @@ impl RequestObservations {
                 warn(elapsed, count);
             }
         }
+        self.refresh_summary();
     }
 }
 
@@ -3828,6 +3881,53 @@ async fn observe_request_with<F: std::future::Future>(
 #[cfg(test)]
 mod request_observation_tests {
     use super::*;
+
+    #[test]
+    fn summary_tracks_oldest_and_warned_with_injected_clock() {
+        let mut observations = RequestObservations::default();
+        let base = tokio::time::Instant::now();
+        let first = observations.start(base);
+        let second = observations.start(base + Duration::from_secs(2));
+        observations.check(
+            base + Duration::from_secs(31),
+            Duration::from_secs(30),
+            |_, _| {},
+        );
+        let snapshot = *observations
+            .summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = snapshot.record(base + Duration::from_secs(31), 123);
+        assert_eq!(
+            (
+                record.pending,
+                record.oldest_age_s,
+                record.warned,
+                record.threshold_s
+            ),
+            (2, 31, 1, 30)
+        );
+        observations.finish(first);
+        let snapshot = *observations
+            .summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = snapshot.record(base + Duration::from_secs(32), 124);
+        assert_eq!(
+            (record.pending, record.oldest_age_s, record.warned),
+            (1, 30, 0)
+        );
+        observations.finish(second);
+        let snapshot = *observations
+            .summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = snapshot.record(base, 125);
+        assert_eq!(
+            (record.pending, record.oldest_age_s, record.warned),
+            (0, 0, 0)
+        );
+    }
 
     /// The real `select!` loop with short real timers: a slow request is reported exactly once
     /// (the repeat interval is five minutes) and is still awaited to completion with its own
@@ -3981,6 +4081,10 @@ impl SeenIds {
 }
 
 impl CoreLife {
+    pub(crate) fn request_summary(&self) -> SharedRequestSummary {
+        Arc::clone(&self.requests.summary)
+    }
+
     pub(crate) fn new(
         backend: Option<Arc<dyn crate::state_store::StateStore>>,
     ) -> Result<Self, AppError> {

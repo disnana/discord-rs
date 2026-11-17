@@ -603,3 +603,7 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `files: WATCH`（`gateway-candidate.log` が 573→2,452 バイト、+1.9 KB）と `closes: WATCH`（11→22）は過剰な警告だった。前者は切断のたびに数行増えるだけの小さい増加、後者は Discord の Reconnect 要求で、増えた切断はすべて Resume で復帰（直前の記録）。
 - ツール側の修正（main 7d7f844）：Gateway を `--shard-id` でも判定／小さいログの増加（100 KiB 未満）は警告しない／`soak-report` に `resumed=`（Resume 成功の件数）を追加し、`soak-diff` は「増えた切断がすべて Resume で復帰」なら `closes` を OK にする（`resumed` を含む記録が 2 件以上たまってから有効。古い形式の記録では従来の規則）。合成のログ 4 種で、OK／WATCH／従来の規則／大きな増加の判定を確認。Oracle への反映と再実行は、ユーザーの出力待ち。
 - **「シングルの完成条件」の 1（最新版の放置 6 時間以上、再起動 0、メモリと fd に増加なし）：** botd と Core については満たしている。Gateway は、再実行の結果で確認する。
+
+## P1 停滞診断 Step 2
+
+Core は要求の要約を `core-N.status` に最小頻度で上書きし、待機中も生存情報を更新する。botd による読み取りは未実装（Step 3）。I/O 負荷の実測は未実施。Cargo と実プロセス試験は今回未実行。

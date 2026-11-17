@@ -966,6 +966,45 @@ async fn run() -> Result<(), AppError> {
     if args == [OsString::from("--worker")] {
         return worker::run().await;
     }
+    // Test-only: override the Core status check interval and use twice it for heartbeats.
+    #[cfg(unix)]
+    if args.len() >= 4
+        && args[0] == "--core-listen"
+        && args[args.len() - 2] == "--core-status-interval-ms"
+    {
+        let value = args
+            .last()
+            .and_then(|v| v.to_str())
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .ok_or(StartupFailure::InvalidArguments)?;
+        let rest = &args[2..args.len() - 2];
+        let (lifetime, floor) = if rest.is_empty() {
+            (src::core_server::Lifetime::OneConnection, 0)
+        } else if rest == [OsString::from("--core-persist")] {
+            (src::core_server::Lifetime::UntilStopped, 0)
+        } else if let [persist, flag, floor] = rest {
+            if persist != "--core-persist" || flag != "--epoch-floor" {
+                return Err(StartupFailure::InvalidArguments.into());
+            }
+            let floor = floor
+                .to_str()
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .ok_or(StartupFailure::InvalidArguments)?;
+            (src::core_server::Lifetime::UntilStopped, floor)
+        } else {
+            return Err(StartupFailure::InvalidArguments.into());
+        };
+        return src::core_server::run_with_status_interval(
+            PathBuf::from(&args[1]),
+            lifetime,
+            floor,
+            std::time::Duration::from_millis(value),
+        )
+        .await;
+    }
     // Connection-oriented Core (stage 1-B1 of the Gateway/Core separation): listens on a
     // Unix socket instead of using stdin/stdout. Never combined with other arguments.
     #[cfg(unix)]

@@ -5,7 +5,7 @@
 use serde_json::Value;
 use std::{
     future::Future,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
@@ -67,6 +67,17 @@ impl Core {
         persistent: bool,
         floor: Option<u64>,
     ) -> Self {
+        Self::start_mode_with_interval(socket, secret, identity, persistent, floor, None).await
+    }
+
+    async fn start_mode_with_interval(
+        socket: &Path,
+        secret: &str,
+        identity: Option<&str>,
+        persistent: bool,
+        floor: Option<u64>,
+        interval_ms: Option<u64>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_src"));
         command.arg("--core-listen").arg(socket).env_clear();
         if persistent {
@@ -74,6 +85,11 @@ impl Core {
         }
         if let Some(floor) = floor {
             command.arg("--epoch-floor").arg(floor.to_string());
+        }
+        if let Some(interval) = interval_ms {
+            command
+                .arg("--core-status-interval-ms")
+                .arg(interval.to_string());
         }
         if let Some(identity) = identity {
             command.env("BOT_WORKER_IPC_IDENTITY", identity);
@@ -1123,4 +1139,66 @@ async fn invalid_epoch_floor_exits_nonzero() {
         .unwrap();
         assert!(!status.success(), "accepted {value}");
     }
+}
+
+#[tokio::test]
+async fn core_status_heartbeat_is_in_place_and_nonstandard_socket_still_works() {
+    use src::core_status::{StatusRead, read_status};
+    let dir = private_dir();
+    let socket = dir.join("core-42.sock");
+    let mut core =
+        Core::start_mode_with_interval(&socket, SECRET, None, false, None, Some(100)).await;
+    let path = dir.join("core-42.status");
+    let first = bounded(async {
+        loop {
+            if let StatusRead::Fresh { record, .. } = read_status(&path, 0) {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert_eq!(first.pending, 0);
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.len(), 64);
+    bounded(async {
+        loop {
+            if let StatusRead::Fresh { record, .. } = read_status(&path, 0)
+                && record.updated_at_ms > first.updated_at_ms
+            {
+                assert_eq!(record.pending, 0);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!((metadata.dev(), metadata.ino()), (after.dev(), after.ino()));
+    let mut stream = attach(&socket, SECRET).await;
+    assert_eq!(
+        bounded(exchange(&mut stream, r#"{"type":"health"}"#))
+            .await
+            .unwrap()["type"],
+        "ready"
+    );
+    drop(stream);
+    let _ = bounded(core.child.wait()).await;
+
+    let other = dir.join("other.sock");
+    let mut core =
+        Core::start_mode_with_interval(&other, SECRET, None, false, None, Some(100)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!dir.join("other.status").exists());
+    let mut stream = attach(&other, SECRET).await;
+    assert_eq!(
+        bounded(exchange(&mut stream, r#"{"type":"health"}"#))
+            .await
+            .unwrap()["type"],
+        "ready"
+    );
+    drop(stream);
+    let _ = bounded(core.child.wait()).await;
+    let _ = std::fs::remove_dir_all(dir);
 }
