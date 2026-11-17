@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # soak-report.sh を繰り返し実行したログ（tee -a soak.log）の、最初と最後のスナップショットを比べる。
-# 読み取り専用。秘密は扱わない。使い方: soak-diff.sh [LOG=/home/ubuntu/soak.log]
+# 読み取り専用。秘密は扱わない。使い方: soak-diff.sh [LOG=/home/ubuntu/soak.log] [SINCE=2026-11-16T12:00]
+# SINCE を指定すると、その時刻（UTC。ISO 形式の同じ書式どうしの文字列比較）以降のスナップショットだけを比べる。
+# 更新（botd の入れ替え）をまたぐと pid の変化がすべて WATCH になるので、更新の後だけを見たいときに使う。
 # 役割（botd / core / gateway）ごとに pid の昇順で「役割#番号」を振る。pid が変われば再起動として WATCH。
 # Core が複数あると再起動で番号が入れ替わり得る。soak-report.sh は cmd を 90 文字で切るため、
 # --core-listen / --core-dir が切れると役割を判定できない（その場合は行が数えられない）。
@@ -9,6 +11,13 @@ LOG=${1:-/home/ubuntu/soak.log}
 if [ ! -r "$LOG" ]; then echo "cannot read: $LOG" >&2; exit 2; fi
 T=$(mktemp -d) || exit 2
 trap 'rm -rf "$T"' EXIT
+SINCE=${2:-}
+if [ -n "$SINCE" ]; then
+  # ヘッダの時刻（"=== soak snapshot 2026-11-16T12:00:01+00:00 ..."）が SINCE 以上のものから後を残す。
+  awk -v S="$SINCE" '/^=== soak snapshot /{ keep = ($4 >= S) } keep { print }' "$LOG" > "$T/since.log"
+  LOG="$T/since.log"
+  if [ ! -s "$LOG" ]; then echo "no snapshots at or after $SINCE" >&2; exit 1; fi
+fi
 V="$T/verdict"; : > "$V"
 add() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$V"; }
 isnum() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
@@ -17,7 +26,7 @@ N=$(grep -c '^=== soak snapshot ' "$LOG")
 if [ "$N" -eq 0 ]; then echo "no snapshots in $LOG" >&2; exit 1; fi
 FIRST_T=$(grep -m1 '^=== soak snapshot ' "$LOG" | awk '{print $4}')
 LAST_T=$(grep '^=== soak snapshot ' "$LOG" | tail -n 1 | awk '{print $4}')
-echo "log: $LOG"; echo "snapshots: $N"; echo "span: $FIRST_T .. $LAST_T"
+echo "log: ${1:-/home/ubuntu/soak.log}${SINCE:+ (since $SINCE)}"; echo "snapshots: $N"; echo "span: $FIRST_T .. $LAST_T"
 if [ "$N" -lt 2 ]; then echo "only one snapshot: nothing to compare yet"; exit 0; fi
 e1=$(date -d "$FIRST_T" +%s 2>/dev/null); e2=$(date -d "$LAST_T" +%s 2>/dev/null)
 HOURS=$(awk -v a="${e1:-0}" -v b="${e2:-0}" 'BEGIN { if (a > 0 && b > a) printf "%.4f", (b - a) / 3600; else printf "0" }')
