@@ -594,3 +594,12 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
   - **新規の Identify は 0 回。** 合計 13 回で、約 1.7 時間に 1 回。間隔は 35 分〜3.5 時間でバラバラ（周期的でない）。旧版（17.7 時間で 10 回）とほぼ同じ頻度。
 - 切断の時刻を JST に直すと、夜中や朝（06:25、08:26、09:02、10:37 など）にも起きており、**ユーザーの操作と無関係の可能性が高い**（ユーザーの操作の時刻との突き合わせは未了）。
 - **`soak-diff.sh` の取り違え：** ユーザーが実行したのは、Oracle の古い checkout（e61d8d4）の `soak-diff.sh` で、既定の `$HOME/soak.log`（root では `/root/soak.log`）を読み、手動の 5 件（11-15 13:10 〜 11-16 11:41）だけを比べた（今回の放置の毎時の記録は含まれず、更新をまたぐ `restarts`・`generations`・`closes` の WATCH はすべて見かけの差）。対策：`soak-diff.sh` の既定を絶対パスにし（先に対応済み）、更新後だけを比べる `SINCE` 引数を追加（a2434af）。
+
+### 追記（2026-11-17）：Oracle 放置（最新版 e61d8d4、約 21 時間）の `soak-diff`（更新後のみ、22 件）
+
+出典：ユーザーが貼った `soak-diff.sh /home/ubuntu/soak.log 2026-11-16T12:00` の出力。
+- **botd と Core**：RSS は botd 7,872→7,960 kB（+88、+4 kB/h）、Core 6,380→6,404／6,356→6,368 kB（約 +1 kB/h）。fd は 16／11／11 で不変。PID は不変、`NRestarts` 0、`worker_unavailable` 0、journal の警告 0。**メモリ・fd・再起動の面では、増加の傾向なし。**
+- **Gateway の行は出力になかった**（`soak-report` がコマンドを 90 文字で切るため、更新後の Gateway では `--core-dir` が切れて Gateway と判定されなかった）。**Gateway のメモリ・fd は、この結果に含まれない。** 以前の個別の記録では、Gateway の RSS は 10.2〜11.4 MB（fd 12〜13）で、傾向は小さかった（旧世代の 3 点のみ）。
+- `files: WATCH`（`gateway-candidate.log` が 573→2,452 バイト、+1.9 KB）と `closes: WATCH`（11→22）は過剰な警告だった。前者は切断のたびに数行増えるだけの小さい増加、後者は Discord の Reconnect 要求で、増えた切断はすべて Resume で復帰（直前の記録）。
+- ツール側の修正（main 7d7f844）：Gateway を `--shard-id` でも判定／小さいログの増加（100 KiB 未満）は警告しない／`soak-report` に `resumed=`（Resume 成功の件数）を追加し、`soak-diff` は「増えた切断がすべて Resume で復帰」なら `closes` を OK にする（`resumed` を含む記録が 2 件以上たまってから有効。古い形式の記録では従来の規則）。合成のログ 4 種で、OK／WATCH／従来の規則／大きな増加の判定を確認。Oracle への反映と再実行は、ユーザーの出力待ち。
+- **「シングルの完成条件」の 1（最新版の放置 6 時間以上、再起動 0、メモリと fd に増加なし）：** botd と Core については満たしている。Gateway は、再実行の結果で確認する。
