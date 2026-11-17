@@ -634,3 +634,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 再起動 15 秒後（ユーザーの出力）：`active`、NRestarts 0、botd＋Core 2＋Gateway 1 が起動、Core の failures 0、journal の警告 0。
 - P1（`--core-status-dir`）は**有効にしていない**（オプトイン）。
 - **未確認：** Discord での `!ping`・`!count`・`!workers` の応答（ユーザーの確認待ち）、新版の 6 時間以上の放置、OS 再起動後の自動起動。
+
+## 2026-11-17 Oracle 新版の放置 8 時間の結果（ユーザーの出力。起点 13:51Z、最終 22:00Z）
+- 実測（`soak-diff`、スナップショット 9 件、8.0 時間）：botd RSS +12 kB/h、Core 2 つ +0 / +1 kB/h、**Gateway RSS 11296→11428 kB（+16 kB/h）**、fd は全プロセスで増減 0、NRestarts 0、世代 4 のまま、worker_unavailable 0、journal の警告 0。判定はすべて OK（`closes` も OK）。
+- `closes` 25→27（+2）、`resumed` 18→22（+4）。**両者の増分が一致しない理由は未確認**（集計の対象が異なる可能性。ログの個別確認はしていない）。Identify が増えたかは、この数値からは断定しない。
+- 「新版の放置 6 時間以上、異常なし」の条件は満たした（1 Shard・1 Bot・Oracle のみ）。`!ping`・`!count`・`!workers` の Discord での応答は、ユーザーの確認結果がまだ記録されていない。
+- **未確認のまま：** OS 再起動後の自動起動（Oracle は「System restart required」。カーネルの更新待ち）、`!workers` の更新中の実機確認、Interaction の重複、複数 Bot・3 Shard 以上の実機、P1 の Oracle での有効化。
