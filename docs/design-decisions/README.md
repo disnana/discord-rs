@@ -8,10 +8,11 @@
 |---|---|
 | [decisions-needed.md](decisions-needed.md) | **ユーザーの判断が必要なもの**の一覧と、私の推奨 |
 | [unverified-items.md](unverified-items.md) | 「未確認」「不明」のもの、確認の方法、誰が行うか |
-| [discussion-records/](discussion-records/) | **ChatGPT との議論で合意した方針（DDR-0001〜0005）**。実装済みの意味ではない |
+| [discussion-records/](discussion-records/) | **ChatGPT との議論で合意した方針（DDR-0001〜0005）**。実装済みの意味ではない | 最新：[DDR-0006](discussion-records/0006-proposals-accepted-2026-11-17.md)（提案の了承）、[DDR-0007](discussion-records/0007-p1-tmpfs-and-cutover-order.md)（**P1 は tmpfs 方式、Core 切り替えの順序と失敗時の中止、作業の優先順位**） |
 | [reconciliation-with-ddr.md](reconciliation-with-ddr.md) | DDR と、この `design-decisions/` の資料・現在のコードとの**食い違いの一覧**と、次に決めること |
 | [proposals-2026-11-17.md](proposals-2026-11-17.md) | **DDR で残った 3 つの判断への Claude の提案**（基盤の状態の引き継ぎ、止まったハンドラの段階的な対処、03 の書き換え骨子）。**2026-11-17 にユーザーが了承**（[DDR-0006](discussion-records/0006-proposals-accepted-2026-11-17.md)）。未実装 |
 | [p1-stalled-diagnostics-design.md](p1-stalled-diagnostics-design.md) | **P1（停滞の診断を daemon から照会できる）の設計案**。Core が状態を小さなファイルに書き、botd が読む方式（botd が Core の IPC に接続すると Gateway を締め出す危険があるため）。方向は了承済み、具体的な方式はユーザーの確認前。未実装 |
+| [review-2026-11-17-astra-sol.md](review-2026-11-17-astra-sol.md) | **Astra と Sol の設計レビュー（ウェブ検索つき、独立）**。2 人が一致した指摘：P1 は tmpfs と単調時計に、差し替えは受け付けの壁と最終の重複排除の引き継ぎに、nonce は操作ごとに固定して本文全体の JSON で、Identify は Bot ごとに調整。私の I/O の実測も記載 |
 
 ## テーマ別の設計・対応案
 
