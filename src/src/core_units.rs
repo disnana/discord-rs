@@ -265,26 +265,24 @@ impl CoreUnits {
             {
                 let _ = std::fs::remove_file(&path);
             }
-            let id = loop {
-                let id =
-                    getrandom::u64().map_err(|_| std::io::Error::other("core status random"))?;
-                if id != 0 {
-                    break id;
-                }
-            };
-            status_id = Some(id);
-            command
-                .arg("--core-status-file")
-                .arg(path)
-                .arg("--core-status-id")
-                .arg(id.to_string());
-            if self.status_allow_non_tmpfs {
-                command.arg("--core-status-allow-non-tmpfs");
-            }
-            if let Some(interval) = self.status_interval_ms {
+            // The diagnostic must never gate Core recovery: if the random draw fails, this launch
+            // simply has no status file (the view reports it as unsupported) and the Core starts.
+            let id = (0..4).find_map(|_| getrandom::u64().ok().filter(|id| *id != 0));
+            if let Some(id) = id {
+                status_id = Some(id);
                 command
-                    .arg("--core-status-interval-ms")
-                    .arg(interval.to_string());
+                    .arg("--core-status-file")
+                    .arg(path)
+                    .arg("--core-status-id")
+                    .arg(id.to_string());
+                if self.status_allow_non_tmpfs {
+                    command.arg("--core-status-allow-non-tmpfs");
+                }
+                if let Some(interval) = self.status_interval_ms {
+                    command
+                        .arg("--core-status-interval-ms")
+                        .arg(interval.to_string());
+                }
             }
         }
         if self.epoch_floor > 0 {

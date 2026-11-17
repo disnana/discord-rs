@@ -604,24 +604,14 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - ツール側の修正（main 7d7f844）：Gateway を `--shard-id` でも判定／小さいログの増加（100 KiB 未満）は警告しない／`soak-report` に `resumed=`（Resume 成功の件数）を追加し、`soak-diff` は「増えた切断がすべて Resume で復帰」なら `closes` を OK にする（`resumed` を含む記録が 2 件以上たまってから有効。古い形式の記録では従来の規則）。合成のログ 4 種で、OK／WATCH／従来の規則／大きな増加の判定を確認。Oracle への反映と再実行は、ユーザーの出力待ち。
 - **「シングルの完成条件」の 1（最新版の放置 6 時間以上、再起動 0、メモリと fd に増加なし）：** botd と Core については満たしている。Gateway は、再実行の結果で確認する。
 
-## P1 停滞診断 Step 2
+## 2026-11-17 P1（停滞の診断）の実装を、ブランチ work/p1 で完成（main へは統合前。Astra の再監査の結果次第）
 
-Core は要求の要約を `core-N.status` に最小頻度で上書きし、待機中も生存情報を更新する。botd による読み取りは未実装（Step 3）。I/O 負荷の実測は未実施。Cargo と実プロセス試験は今回未実行。
+詳細な仕様・保証の範囲・未対応は `docs/known-limitations.md` の「P1 停滞診断」に書いた。ここは、作業の記録。
 
-
-P1 STEP 2b: Core status is opt-in via `--core-status-file <absolute path>` and requires tmpfs (the non-tmpfs override is test-only). Records use CLOCK_BOOTTIME, a per-process generation and a write sequence. botd does not read these records yet. Disk I/O must be measured again on the new build; zero writeback has not been verified. Cargo tests were not run for this change.
-
-
-## 2026-11-17 P1 botd status diagnostics
-
-botd now supplies tmpfs status paths to separate Cores and adds PID-checked status and `suspected_stalled` to control responses. Status reads are synchronous and can stall the control path; a bounded background reader with cached results is not implemented. Unit and real-process integration tests were added but Cargo was not run as requested. Real Discord, Oracle, systemd RuntimeDirectory on a real server, and zero disk writeback measurements remain unverified. botd does not connect to the Core socket for diagnostics.
-
-
-## 2026-11-17 P1 audit round 19 (incomplete)
-
-The writer checks the opened file descriptor with `fstatfs` before changing file contents, length, or permissions; created status directories are also checked by descriptor. Test-only argument parsing is rejected in release builds, and the writer skips a tick if CLOCK_BOOTTIME fails. These changes have not been built or tested. Launch incarnation and sequence regression checks and their integration tests are still missing. Reader-side tmpfs and clock checks were added in STEP 4b-1 but have not been built or tested. The reader uses synchronous 64-byte reads of tmpfs files behind parent and opened-descriptor checks; a hostile replacement of the status directory by an unreachable hard-mounted network filesystem could stall the control path in theory (requiring root-level control of `/run/discord-rs`). A bounded background reader with cached results is not implemented.
-
-The intended guarantee is no file data written to a disk-backed filesystem: the status file lives on tmpfs, whose pages can be swapped under memory pressure because the kernel `noswap` option is not enforced. This is zero file writeback in normal operation, not an absolute zero. The recorded idle 300 s measurement was `write_bytes` 0; the present changes have not been remeasured.
-
-Work in progress: botd assigns a nonzero incarnation ID, attempts stale-file removal, and reports a generation mismatch as `stale_generation`; Core writer integration is still missing.
-A decreasing seq or boot_ms within the same incarnation is reported as `regressed`; this change has not been verified against a real server.
+- **経緯：** Astra と Sol の設計レビューと、私の実測（ディスク上の状態ファイルは、アイドルの Core 300 秒で書き込み 84 回・ディスクへ 98,304 バイト）により、DDR-0007 で tmpfs 方式に決まった。Terra が段階 1（`core_status` モジュール）、2・2b（Core の書き込み、tmpfs、単調時計、世代、連番）、3（botd の読み取り、`status` への表示）を実装。大きな依頼は「未完了」と報告されたので、小さい段階に分けた。
+- **Astra 第 19 回の監査（7 件）と対応：** 書き込み側の記述子への `fstatfs`、読み取り側の tmpfs・記述子の確認、時計の失敗と未来の時刻、世代・連番の検証（botd が Core の起動ごとの識別子を決める、古いファイルの削除、後退の検出）、tmpfs の swap の保証の限定、試験専用の旗を debug のみに、`O_NOFOLLOW` を `libc` の定数に（aarch64 で誤りだった）。
+- **Astra 第 20 回の監査（6 件）と対応：** (1) **診断をオプトインに**（`--core-status-dir` の明示指定のみ。`/run/discord-rs` があるだけでは有効にしない。botd だけを先に更新すると、古い Core が新しい引数を拒否して起動・復旧が壊れるため）、(5) 乱数の取得失敗は、診断を無効にして Core を通常どおり起動（診断が復旧を止めない）、(4) ユニットテストが debug 専用の関数に依存していた点を修正（`cargo test --release --lib` が通ることを確認）、(6) 文書を現状に合わせて書き直した。**対応しない（既知の限界として文書化）：** (2) 作成時の、親の記述子を固定した相対作成、(3) 拒否したファイルの確認と削除の隙（どちらも、サービスのユーザー自身による意図的な差し替えが必要）。
+- **検証（私が実行）：** clippy 警告なし。lib 236、botd 22、`botd_separate_cores` 8、2 シャード 3、`core_attach` 28 が成功（debug、WSL）。リリースビルドに警告なし、リリースの `src`・`botd` が試験専用の旗を拒否することを確認。
+- **実機に近い確認（WSL、リリースビルド、実 Discord の別 Bot、2 シャード、4 つの Core）：** 全 Core が `pending=0`・`suspected_stalled=False`・`seq` が進む。Core 1 本への `SIGSTOP` の 40 秒後に、**その Core だけ** `suspected_stalled=True`、`SIGCONT` で回復。Core の `SIGKILL` の後、botd の再起動で**世代が変わり**、`stale_generation`・`regressed` は出ない。ディスクへの書き出し `write_bytes` は 0。残りのプロセス 0。
+- **未確認：** Oracle・実サーバーの systemd（`RuntimeDirectory`）、実際の長時間運用、本物の「固まったハンドラ」での検知（`SIGSTOP` による Core 全体の停止で代用した）、Astra の第 21 回の再監査。
+- **私の誤り（記録）：** 試験スクリプトで `/tmp` の権限を `0755` に変え、WSL の一般ユーザーがコンパイルできなくなった（`1777` に復旧。本番に影響なし）。`cargo` を root で実行して失敗した（一般ユーザーで再実行）。

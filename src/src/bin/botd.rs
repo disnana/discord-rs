@@ -760,12 +760,12 @@ async fn run() -> Result<(), &'static str> {
         daemon
             .enable_separate_cores()
             .map_err(|_| "cannot enable separate Cores")?;
-        let default_dir = std::path::Path::new("/run/discord-rs");
-        let root = options.core_status_dir.as_deref().or_else(|| {
-            (default_dir.is_dir() && src::core_status::is_tmpfs(default_dir)).then_some(default_dir)
-        });
+        // Opt-in: the diagnostics are enabled ONLY by an explicit --core-status-dir. Nothing is
+        // enabled automatically from the presence of /run/discord-rs: a botd updated before its
+        // Core executable would otherwise pass an argument an older Core rejects (Core startup
+        // and recovery must never depend on an optional diagnostic).
         daemon.configure_core_status(
-            root,
+            options.core_status_dir.as_deref(),
             options.core_status_allow_non_tmpfs,
             options.core_status_interval_ms,
         );

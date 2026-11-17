@@ -875,11 +875,10 @@ async fn status_restart_replaces_incarnation_and_preplanted_record() {
 }
 
 #[tokio::test]
-async fn absent_default_directory_disables_status() {
-    if Path::new("/run/discord-rs").exists() {
-        eprintln!("skipping: /run/discord-rs exists");
-        return;
-    }
+async fn diagnostics_are_opt_in_even_when_run_discord_rs_exists() {
+    // Without an explicit --core-status-dir nothing is enabled, whether or not /run/discord-rs
+    // exists: a botd updated before its Core executable must not pass an argument an older Core
+    // rejects.
     let fixture = Fixture::start().await;
     let gateway = fixture.accept().await;
     for pid in worker_pids(&gateway.ready) {

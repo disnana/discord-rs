@@ -517,7 +517,7 @@ mod tests {
                 file_io::read_status_at(&path, || Some(9000)),
                 StatusRead::Missing
             );
-            let mut writer = StatusWriter::open(&path).unwrap();
+            let mut writer = StatusWriter::open_checked(&path, false).unwrap();
             let before = fs::metadata(&path).unwrap();
             assert_eq!(before.len(), 64);
             assert_eq!(before.mode() & 0o777, 0o600);
@@ -575,7 +575,7 @@ mod tests {
             );
             let link = d.0.join("link");
             symlink(&path, &link).unwrap();
-            assert!(StatusWriter::open(&link).is_none());
+            assert!(StatusWriter::open_checked(&link, false).is_none());
             assert_eq!(
                 file_io::read_status_at(&link, || Some(0)),
                 StatusRead::Unreadable
@@ -583,7 +583,7 @@ mod tests {
             let fifo = d.0.join("fifo");
             let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
             assert_eq!(unsafe { mkfifo(c.as_ptr(), 0o600) }, 0);
-            assert!(StatusWriter::open(&fifo).is_none());
+            assert!(StatusWriter::open_checked(&fifo, false).is_none());
             assert_eq!(
                 file_io::read_status_at(&fifo, || Some(0)),
                 StatusRead::Unreadable
@@ -594,7 +594,7 @@ mod tests {
                 file_io::read_status_at(&short, || Some(0)),
                 StatusRead::Unreadable
             );
-            assert!(StatusWriter::open(&short).is_some());
+            assert!(StatusWriter::open_checked(&short, false).is_some());
             assert_eq!(fs::metadata(short).unwrap().len(), 64);
         }
     }
