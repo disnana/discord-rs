@@ -966,52 +966,97 @@ async fn run() -> Result<(), AppError> {
     if args == [OsString::from("--worker")] {
         return worker::run().await;
     }
-    // Connection-oriented Core (stage 1-B1 of the Gateway/Core separation): listens on a
-    // Unix socket instead of using stdin/stdout. Never combined with other arguments.
     #[cfg(unix)]
-    if let [flag, socket] = args.as_slice()
-        && flag == "--core-listen"
-    {
-        return src::core_server::run(
-            PathBuf::from(socket),
-            src::core_server::Lifetime::OneConnection,
-            0,
-        )
-        .await;
-    }
-    // Same, but the Core outlives its connections (a restarted Gateway reconnects to it).
-    #[cfg(unix)]
-    if let [flag, socket, persist] = args.as_slice()
-        && flag == "--core-listen"
-        && persist == "--core-persist"
-    {
-        return src::core_server::run(
-            PathBuf::from(socket),
-            src::core_server::Lifetime::UntilStopped,
-            0,
-        )
-        .await;
-    }
-    #[cfg(unix)]
-    if let [flag, socket, persist, floor_flag, value] = args.as_slice()
-        && flag == "--core-listen"
-        && persist == "--core-persist"
-        && floor_flag == "--epoch-floor"
-    {
-        let value = value.to_str().ok_or(StartupFailure::InvalidArguments)?;
-        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+    if args.first().is_some_and(|arg| arg == "--core-listen") {
+        let socket = args.get(1).ok_or(StartupFailure::InvalidArguments)?;
+        let mut lifetime = src::core_server::Lifetime::OneConnection;
+        let mut floor = 0;
+        let mut status_path = None;
+        let mut status_id = None;
+        let mut require_tmpfs = true;
+        let mut interval = None;
+        let mut i = 2;
+        while i < args.len() {
+            if args[i] == "--core-persist" && lifetime == src::core_server::Lifetime::OneConnection
+            {
+                lifetime = src::core_server::Lifetime::UntilStopped;
+                i += 1;
+            } else if args[i] == "--epoch-floor" && floor == 0 {
+                let value = args
+                    .get(i + 1)
+                    .and_then(|v| v.to_str())
+                    .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .ok_or(StartupFailure::InvalidArguments)?;
+                floor = value;
+                i += 2;
+            } else if args[i] == "--core-status-file" && status_path.is_none() {
+                let path = PathBuf::from(args.get(i + 1).ok_or(StartupFailure::InvalidArguments)?);
+                if !path.is_absolute() {
+                    return Err(StartupFailure::InvalidArguments.into());
+                }
+                status_path = Some(path);
+                i += 2;
+            } else if args[i] == "--core-status-id" && status_id.is_none() {
+                status_id = Some(
+                    args.get(i + 1)
+                        .and_then(|v| v.to_str())
+                        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v != 0)
+                        .ok_or(StartupFailure::InvalidArguments)?,
+                );
+                i += 2;
+            } else if cfg!(debug_assertions)
+                && args[i] == "--core-status-allow-non-tmpfs"
+                && require_tmpfs
+            {
+                // Test-only: allow the status file on a non-tmpfs filesystem.
+                require_tmpfs = false;
+                i += 1;
+            } else if cfg!(debug_assertions)
+                && args[i] == "--core-status-interval-ms"
+                && interval.is_none()
+            {
+                // Test-only: shorten the status check and heartbeat intervals.
+                interval = Some(
+                    args.get(i + 1)
+                        .and_then(|v| v.to_str())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v > 0)
+                        .ok_or(StartupFailure::InvalidArguments)?,
+                );
+                i += 2;
+            } else {
+                return Err(StartupFailure::InvalidArguments.into());
+            }
+        }
+        if status_id.is_some() && status_path.is_none() {
             return Err(StartupFailure::InvalidArguments.into());
         }
-        let floor = value
-            .parse::<u64>()
-            .map_err(|_| StartupFailure::InvalidArguments)?;
-        if floor == 0 {
+        if floor > 0 && lifetime != src::core_server::Lifetime::UntilStopped {
             return Err(StartupFailure::InvalidArguments.into());
+        }
+        if let Some(ms) = interval {
+            return src::core_server::run_with_status_interval(
+                PathBuf::from(socket),
+                lifetime,
+                floor,
+                status_path,
+                status_id,
+                require_tmpfs,
+                std::time::Duration::from_millis(ms),
+            )
+            .await;
         }
         return src::core_server::run(
             PathBuf::from(socket),
-            src::core_server::Lifetime::UntilStopped,
+            lifetime,
             floor,
+            status_path,
+            status_id,
+            require_tmpfs,
         )
         .await;
     }

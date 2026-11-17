@@ -32,6 +32,9 @@ struct Options {
     stop_children_on_exit: bool,
     /// Run each Shard Cores in botd (separated layout, Linux). Default: embedded.
     separate_cores: bool,
+    core_status_dir: Option<PathBuf>,
+    core_status_allow_non_tmpfs: bool,
+    core_status_interval_ms: Option<u64>,
     mock_discord: Option<SocketAddr>,
     allow_test_quorum: bool,
     raft: Option<RaftRuntimeOptions>,
@@ -51,6 +54,9 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut no_autostart = false;
     let mut stop_children_on_exit = false;
     let mut separate_cores = false;
+    let mut core_status_dir = None;
+    let mut core_status_allow_non_tmpfs = false;
+    let mut core_status_interval_ms = None;
     let mut mock_discord = None;
     let mut allow_test_quorum = false;
     let mut allow_raft_quorum = false;
@@ -66,6 +72,29 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut control_port = None;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
+            Some("--core-status-dir") if core_status_dir.is_none() => &mut core_status_dir,
+            // Test overrides must be rejected by release binaries.
+            Some("--core-status-allow-non-tmpfs")
+                if cfg!(debug_assertions) && !core_status_allow_non_tmpfs =>
+            {
+                core_status_allow_non_tmpfs = true;
+                continue;
+            }
+            Some("--core-status-interval-ms")
+                if cfg!(debug_assertions) && core_status_interval_ms.is_none() =>
+            {
+                let value = args.next().ok_or(USAGE)?;
+                let value = value
+                    .to_str()
+                    .ok_or(USAGE)?
+                    .parse::<u64>()
+                    .map_err(|_| USAGE)?;
+                if value == 0 {
+                    return Err(USAGE);
+                }
+                core_status_interval_ms = Some(value);
+                continue;
+            }
             Some("--file") if file.is_none() => &mut file,
             Some("--runtime-root") if runtime_root.is_none() => &mut runtime_root,
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
@@ -234,6 +263,9 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         no_autostart,
         stop_children_on_exit,
         separate_cores,
+        core_status_dir,
+        core_status_allow_non_tmpfs,
+        core_status_interval_ms,
         mock_discord,
         allow_test_quorum,
         raft,
@@ -243,6 +275,13 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         secret_file,
         control_port: control_port.unwrap_or(0),
     };
+    if options
+        .core_status_dir
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err("core status directory must be absolute");
+    }
     if bootstrap && options.secret_file.is_some() {
         return Err("--bootstrap-stdin and --secret-file are mutually exclusive");
     }
@@ -721,6 +760,15 @@ async fn run() -> Result<(), &'static str> {
         daemon
             .enable_separate_cores()
             .map_err(|_| "cannot enable separate Cores")?;
+        // Opt-in: the diagnostics are enabled ONLY by an explicit --core-status-dir. Nothing is
+        // enabled automatically from the presence of /run/discord-rs: a botd updated before its
+        // Core executable would otherwise pass an argument an older Core rejects (Core startup
+        // and recovery must never depend on an optional diagnostic).
+        daemon.configure_core_status(
+            options.core_status_dir.as_deref(),
+            options.core_status_allow_non_tmpfs,
+            options.core_status_interval_ms,
+        );
     }
     if let Some(address) = options.mock_discord {
         daemon

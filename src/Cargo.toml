@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.2"
 getrandom = "0.4"
+libc = "0.2"
 subtle = "2"
 tokio-rustls = "0.26"
 openraft = { version = "=0.9.26", features = ["serde", "storage-v2", "generic-snapshot-data"] }

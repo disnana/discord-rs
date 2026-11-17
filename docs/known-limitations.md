@@ -110,3 +110,29 @@
 - **低**：再接続バックオフにジッターなし（上限約 255 秒、回数の上限なし）。Identify 枠が尽きていると起動後に最大 `reset_after`（最長 24 時間）黙って待つ。単体起動は SIGTERM 未処理。DM の prefix コマンドは動かない（DIRECT_MESSAGES Intent なし）。`register` の説明文が固定。Gateway 子の環境に token があり、`/proc/PID/environ` から同一ユーザーまたは root が読める。HTTP プロキシ非対応（twilight 側）。
 - **実 Discord の Gateway 自動復旧（ローカル Identify 許可）**：実 Discord の Gateway 自動復旧は、単一ホスト・単一 botd 専用のローカル Identify 許可（Bot 単位。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回。超えると `IdentifyUnavailable` で `Degraded`）の下で有効です。初回起動と手動 start は常に許可して記録します。複数プロセス・複数ホスト間の調整は未実装、botd 再起動で履歴は消えます。セッションの Resume は未実装で、再起動のたびに Identify を 1 回消費します。ローカル未ビルドで GitHub Actions の検証待ちで、実 Discord・実機では未検証です。
 - **未実装（再掲）**：プロセス再起動をまたぐ Resume（session はメモリのみ。再起動は毎回新規 Identify）、複数プロセス・複数ホスト間の Identify 調整（プロセス内のみ）。
+
+## P1 停滞診断（Core の状態ファイルと、botd からの照会）
+
+**状態：** 実装済み（ブランチ work/p1）。**実機（実 Discord の別 Bot、WSL、2 シャード）で動作を確認した。Oracle・実サーバーの systemd では未確認。** 設計は [DDR-0007](design-decisions/discussion-records/0007-p1-tmpfs-and-cutover-order.md)、[p1-stalled-diagnostics-design.md](design-decisions/p1-stalled-diagnostics-design.md)。
+
+**何をするか：** 分離モードで、Core が要求の要約（未完了の数、最も古い経過秒、警告の件数）を、**tmpfs 上の固定長 64 バイトの状態ファイル**に、**同じ位置へ上書き**で書く（アイドルなら 10 秒おきの生存の印、要求があれば 5 秒おき）。botd がそれを読み、`botctl status` の各 Core に `status`（`pending`、`oldest_age_s`、`status_age_s`、`seq`、`generation`、`suspected_stalled`）を足す。**停滞の「疑い」**（記録が 30 秒以上更新されない）であり、原因や完全な固まりの証明ではない。表示できないときは、`status` が `null` で、理由（`unsupported`＝ファイルなし、`unreadable`、`corrupt`、`stale_generation`、`regressed`、`clock_unavailable`）を `status_reason` に出す。内容に、要求の内容・ID・ユーザー情報・秘密は含まない。botd は Core のソケットに**接続しない**（高い epoch の接続が Gateway を締め出すため）。
+
+**有効にする方法（オプトイン）：** `botd --core-status-dir <絶対パス>`（tmpfs のディレクトリ。本番は、systemd の `RuntimeDirectory=discord-rs` が作る `/run/discord-rs`）を**明示的に指定したときだけ**有効になる。**`/run/discord-rs` があるだけでは、自動で有効にしない。** 理由：botd だけを先に更新すると、古い Core が新しい引数を拒否し、Core の起動・復旧が壊れるため（Astra 第 20 回の指摘 1）。**診断を使う運用では、Core のバイナリ（`src`）を先に更新してから、`--core-status-dir` を指定する。** tmpfs でないディレクトリを指定すると、**何も書かず**、機能は無効になる（ディスクには書かない）。
+
+**確認済み（実測）：**
+- ディスクへの書き出し：アイドルの Core で 300 秒、**`write_bytes` が 0**（WSL、ext4、デバッグビルド）。旧方式（ディスク上のファイル）は 98,304 バイト、状態ファイルなしの制御実験は 0。tmpfs でない場所を指定すると、ファイルは作られず、書き込みも 0。
+- 実機に近い確認（リリースビルド、2 シャード、4 つの Core）：アイドルで全 Core が `pending=0`・`suspected_stalled=False`、`seq` が進む。Core 1 本に `SIGSTOP` を送ると、40 秒後に**その Core だけ** `suspected_stalled=True`、`SIGCONT` で回復。Core を `SIGKILL` して botd が再起動すると、**世代が変わり**、`stale_generation`・`regressed` は出ない。botd は応答し続けた。
+- テスト：lib 236 件、`botd` 22 件、`botd_separate_cores` 8 件（SIGSTOP の検知、世代の確認を含む）、`core_attach` 28 件、2 シャード 3 件、clippy 警告なし。リリースビルドに警告なし、`cargo test --release --lib` は通る。リリースの `src`・`botd` は、試験専用の旗（`--core-status-allow-non-tmpfs`、`--core-status-interval-ms`）を**拒否**する。
+
+**保証の範囲（正確に）：**
+- 「ファイルのデータを、ディスク上のファイルシステムに書かない」。**tmpfs のページは、メモリ逼迫時に swap され得る**（カーネルの `noswap` は強制していない）ので、**通常の運用で書き出しがゼロ**であり、絶対のゼロではない。
+- 読み取りは、tmpfs 上の 64 バイトの同期読み取り（親・記述子の tmpfs 確認、`O_NOFOLLOW|O_NONBLOCK`、通常ファイル・サイズ・所有者・リンク数・dev/ino の確認）。**サービスのユーザー自身が、状態ディレクトリを、到達できない NFS 等への symlink やマウントに差し替えた場合、botd の制御経路が止まり得る**（理論上。最初のパスの `statfs` がブロックし得る）。有界のバックグラウンド読み取り（結果のキャッシュつき）は**未実装**。
+- 64 バイトの上書きは、並行する読み取りに対して、原子的な 1 つのスナップショットになる保証はない。CRC は破損を確率的に検出するだけで、原子性も鮮度も証明しない。読み取りは CRC の不一致で 1 回だけ再試行し、それでも合わなければ `corrupt`（一時的）として扱う。
+- 時刻は単調時計（`CLOCK_BOOTTIME`）。時計の取得失敗は「取得不能」として扱い、鮮度 0 にしない。1 秒を超える未来の時刻の記録は拒否する。世代は botd が Core の起動ごとに決める非ゼロの乱数で、botd は世代と PID を照合し、連番・時刻の後退（`regressed`）を検出する（同じ連番の繰り返し＝固まった Core は、後退ではなく、経過時間で停滞の疑いにする）。Core の（再）起動の前に、そのスロットの古い状態ファイルを削除する。
+
+**既知の限界・未対応（Astra 第 20 回の指摘のうち、対応しないもの）：**
+- ファイル・ディレクトリの**作成は、親の記述子を固定してからの相対作成**になっていない。親が `is_tmpfs` の確認の後に差し替えられると、**ディスク上に inode やディレクトリができ得る**。作成した**ファイル**は、直後の `fstatfs` で tmpfs でないと分かれば拒否して削除を試みるが、**削除は最善努力で、失敗しても無視する**（残り得る）。作成した**ディレクトリ**は、拒否するだけで、**削除しない**（残る）。ファイルシステムやジャーナルへの書き込みは取り消せない。この競合は、**サービスのユーザー自身による、状態ディレクトリの意図的な差し替えが必要**で、「信頼できる非公開のパス、単一の botd」という前提の範囲外。親の記述子を固定した `openat2` による作成は、将来の課題。
+- 拒否したファイルの**削除は、確認と削除が別の操作**（置き換えられたパスを消し得る）。同じく、サービスのユーザー自身による差し替えが必要。通常の起動（単一の botd が、Core の起動の前に削除する）では、直列化されている。
+- **統合テストは、debug ビルド（`cargo test`）を前提**とする（試験専用の旗が、リリースで拒否されるため）。`cargo test --release` の統合テストは、サポートしない。
+- Oracle・実サーバーの systemd（`RuntimeDirectory`）での確認は未実施。
+

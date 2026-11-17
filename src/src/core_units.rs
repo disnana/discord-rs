@@ -128,6 +128,7 @@ struct Slot {
     started_at: Option<Instant>,
     failures: u32,
     next_start: Option<Instant>,
+    status_id: Option<u64>,
 }
 
 impl Slot {
@@ -138,6 +139,7 @@ impl Slot {
             started_at: None,
             failures: 0,
             next_start: None,
+            status_id: None,
         }
     }
 }
@@ -150,13 +152,19 @@ pub struct CoreUnits {
     prepared: bool,
     log_checked: Option<Instant>,
     epoch_floor: u64,
+    status_dir: Option<PathBuf>,
+    status_allow_non_tmpfs: bool,
+    status_interval_ms: Option<u64>,
 }
 
 /// What an operator may be told about a Core, never a path, secret or argument.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreStatus {
     pub running: bool,
     pub failures: u32,
+    pub pid: Option<u32>,
+    pub status_path: Option<PathBuf>,
+    pub status_id: Option<u64>,
 }
 
 impl CoreUnits {
@@ -169,7 +177,21 @@ impl CoreUnits {
             prepared: false,
             log_checked: None,
             epoch_floor: 0,
+            status_dir: None,
+            status_allow_non_tmpfs: false,
+            status_interval_ms: None,
         }
+    }
+
+    pub fn configure_status(
+        &mut self,
+        dir: Option<PathBuf>,
+        allow_non_tmpfs: bool,
+        interval_ms: Option<u64>,
+    ) {
+        self.status_dir = dir;
+        self.status_allow_non_tmpfs = allow_non_tmpfs;
+        self.status_interval_ms = interval_ms;
     }
 
     pub fn set_epoch_floor(&mut self, floor: u64) {
@@ -183,9 +205,16 @@ impl CoreUnits {
     pub fn status(&self) -> Vec<CoreStatus> {
         self.slots
             .iter()
-            .map(|slot| CoreStatus {
+            .enumerate()
+            .map(|(index, slot)| CoreStatus {
                 running: slot.child.is_some(),
                 failures: slot.failures,
+                pid: slot.child.as_ref().map(Child::id),
+                status_id: slot.status_id,
+                status_path: self
+                    .status_dir
+                    .as_ref()
+                    .map(|dir| dir.join(format!("core-{index}.status"))),
             })
             .collect()
     }
@@ -223,6 +252,39 @@ impl CoreUnits {
             .arg("--core-listen")
             .arg(socket_path(&self.dir, index))
             .arg("--core-persist");
+        let mut status_id = None;
+        if let Some(dir) = self
+            .status_dir
+            .as_ref()
+            .filter(|dir| self.status_allow_non_tmpfs || crate::core_status::is_tmpfs(dir))
+        {
+            let path = dir.join(format!("core-{index}.status"));
+            if let Ok(meta) = std::fs::symlink_metadata(&path)
+                && meta.file_type().is_file()
+                && meta.uid() == unsafe { libc::geteuid() }
+            {
+                let _ = std::fs::remove_file(&path);
+            }
+            // The diagnostic must never gate Core recovery: if the random draw fails, this launch
+            // simply has no status file (the view reports it as unsupported) and the Core starts.
+            let id = (0..4).find_map(|_| getrandom::u64().ok().filter(|id| *id != 0));
+            if let Some(id) = id {
+                status_id = Some(id);
+                command
+                    .arg("--core-status-file")
+                    .arg(path)
+                    .arg("--core-status-id")
+                    .arg(id.to_string());
+                if self.status_allow_non_tmpfs {
+                    command.arg("--core-status-allow-non-tmpfs");
+                }
+                if let Some(interval) = self.status_interval_ms {
+                    command
+                        .arg("--core-status-interval-ms")
+                        .arg(interval.to_string());
+                }
+            }
+        }
         if self.epoch_floor > 0 {
             command
                 .arg("--epoch-floor")
@@ -247,6 +309,7 @@ impl CoreUnits {
             return Err(std::io::Error::other("core secret delivery"));
         }
         let slot = &mut self.slots[index];
+        slot.status_id = status_id;
         slot.child = Some(child);
         slot.stdin = Some(stdin);
         slot.started_at = Some(now);

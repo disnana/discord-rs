@@ -793,10 +793,182 @@ pub struct ShardKey {
 /// Local administration state. Authentication and bounded framing belong to the
 /// listener; only authenticated commands may be passed to this module.
 pub mod control {
+    #[cfg(unix)]
+    fn core_status_view(
+        core: &crate::core_units::CoreStatus,
+        read: crate::core_status::StatusRead,
+        last: &mut Option<(u64, u64, u64)>,
+    ) -> serde_json::Value {
+        use crate::core_status::StatusRead;
+        use serde_json::json;
+        let mut view = json!({"running": core.running, "failures": core.failures, "status": null});
+        if last.is_some_and(|(id, _, _)| Some(id) != core.status_id) {
+            *last = None;
+        }
+        let reason = match read {
+            StatusRead::Fresh {
+                record,
+                status_age_s,
+            } if Some(record.pid) == core.pid && Some(record.generation) == core.status_id => {
+                if last
+                    .is_some_and(|(_, seq, boot_ms)| record.seq < seq || record.boot_ms < boot_ms)
+                {
+                    view["status_reason"] = json!("regressed");
+                    return view;
+                }
+                *last = Some((record.generation, record.seq, record.boot_ms));
+                view["status"] = json!({"pending": record.pending, "oldest_age_s": record.oldest_age_s, "warned": record.warned, "threshold_s": record.threshold_s, "status_age_s": status_age_s, "suspected_stalled": status_age_s >= 30, "generation": record.generation, "seq": record.seq});
+                return view;
+            }
+            StatusRead::Fresh { .. } => "stale_generation",
+            StatusRead::Missing => "unsupported",
+            StatusRead::Unreadable => "unreadable",
+            StatusRead::Corrupt => "corrupt",
+            StatusRead::ClockUnavailable => "clock_unavailable",
+        };
+        view["status_reason"] = json!(reason);
+        view
+    }
+
     use super::*;
     use crate::{botref, placement::BotPlacement};
     use serde_json::{Value, json};
     use std::time::Instant;
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn status_view_classifies_read_results() {
+        use crate::core_status::{StatusRead, StatusRecord};
+        let core = crate::core_units::CoreStatus {
+            running: true,
+            failures: 3,
+            pid: Some(42),
+            status_path: None,
+            status_id: Some(7),
+        };
+        let mut last = None;
+        let record = StatusRecord {
+            pending: 2,
+            oldest_age_s: 4,
+            warned: 1,
+            threshold_s: 30,
+            boot_ms: 1,
+            pid: 42,
+            generation: 7,
+            seq: 9,
+        };
+        for (age, suspected) in [(29, false), (30, true)] {
+            let view = core_status_view(
+                &core,
+                StatusRead::Fresh {
+                    record,
+                    status_age_s: age,
+                },
+                &mut last,
+            );
+            assert_eq!(view["status"]["suspected_stalled"], suspected);
+            assert_eq!(view["status"]["pending"], 2);
+            assert_eq!(view["status"]["generation"], 7);
+            assert_eq!(view["status"]["seq"], 9);
+            assert_eq!(view["failures"], 3);
+        }
+        for (read, reason) in [
+            (StatusRead::Missing, "unsupported"),
+            (StatusRead::Unreadable, "unreadable"),
+            (StatusRead::Corrupt, "corrupt"),
+            (StatusRead::ClockUnavailable, "clock_unavailable"),
+            (
+                StatusRead::Fresh {
+                    record: StatusRecord { pid: 43, ..record },
+                    status_age_s: 0,
+                },
+                "stale_generation",
+            ),
+        ] {
+            let view = core_status_view(&core, read, &mut last);
+            assert!(view["status"].is_null());
+            assert_eq!(view["status_reason"], reason);
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn status_view_checks_incarnation_and_monotonicity() {
+        use crate::core_status::{StatusRead, StatusRecord};
+        let mut core = crate::core_units::CoreStatus {
+            running: true,
+            failures: 0,
+            pid: Some(42),
+            status_path: None,
+            status_id: Some(7),
+        };
+        let record = StatusRecord {
+            pending: 0,
+            oldest_age_s: 0,
+            warned: 0,
+            threshold_s: 30,
+            boot_ms: 100,
+            pid: 42,
+            generation: 7,
+            seq: 9,
+        };
+        let mut last = None;
+        let read = |record, status_age_s| StatusRead::Fresh {
+            record,
+            status_age_s,
+        };
+        assert_eq!(
+            core_status_view(&core, read(record, 0), &mut last)["status"]["seq"],
+            9
+        );
+        assert_eq!(
+            core_status_view(
+                &core,
+                read(
+                    StatusRecord {
+                        generation: 8,
+                        ..record
+                    },
+                    0
+                ),
+                &mut last
+            )["status_reason"],
+            "stale_generation"
+        );
+        assert_eq!(
+            core_status_view(&core, read(StatusRecord { seq: 8, ..record }, 0), &mut last)["status_reason"],
+            "regressed"
+        );
+        assert_eq!(
+            core_status_view(&core, read(record, 30), &mut last)["status"]["suspected_stalled"],
+            true
+        );
+        assert_eq!(
+            core_status_view(
+                &core,
+                read(
+                    StatusRecord {
+                        boot_ms: 99,
+                        ..record
+                    },
+                    0
+                ),
+                &mut last
+            )["status_reason"],
+            "regressed"
+        );
+        core.status_id = Some(8);
+        let next = StatusRecord {
+            generation: 8,
+            seq: 1,
+            boot_ms: 1,
+            ..record
+        };
+        assert_eq!(
+            core_status_view(&core, read(next, 0), &mut last)["status"]["seq"],
+            1
+        );
+    }
 
     pub const NOTE: &str = "Local process status only; Discord readiness, Core drain, ownership and leases are not verified.";
     pub const OPERATION_LIMIT: usize = 1024;
@@ -972,6 +1144,11 @@ pub mod control {
         update_stage: UpdateStage,
     }
 
+    /// Per Core slot: the last accepted status record as (incarnation id, seq, boot_ms), used to
+    /// reject regressions within one incarnation (see `core_status_view`).
+    #[cfg(unix)]
+    type CoreStatusHistory = std::sync::Mutex<BTreeMap<(ShardKey, usize), Option<(u64, u64, u64)>>>;
+
     /// One owner serializes admissions; independent Bot operations advance on
     /// ticks while clients may read status. History never evicts accepted IDs:
     /// at capacity new operations fail before any side effect. It is not durable.
@@ -991,6 +1168,8 @@ pub mod control {
         // Shared across records: a failed truncate must not quarantine the same tail again
         // when a different request or pending record next tries to append.
         audit_tail: std::sync::Mutex<Option<AuditTailRepair>>,
+        #[cfg(unix)]
+        core_status_history: CoreStatusHistory,
     }
 
     const AUDIT_SCAN_BYTES: usize = 8 * 1024;
@@ -1367,6 +1546,8 @@ pub mod control {
                 pending_audit: Vec::new(),
                 audit_retry_at: None,
                 audit_tail: std::sync::Mutex::new(None),
+                #[cfg(unix)]
+                core_status_history: std::sync::Mutex::new(BTreeMap::new()),
             }
         }
 
@@ -1397,7 +1578,23 @@ pub mod control {
                 Value::Array(
                     cores
                         .iter()
-                        .map(|core| json!({"running": core.running, "failures": core.failures}))
+                        .enumerate()
+                        .map(|(index, core)| {
+                            let read = core
+                                .status_path
+                                .as_ref()
+                                .map(|path| crate::core_status::read_status(path))
+                                .unwrap_or(crate::core_status::StatusRead::Missing);
+                            let mut history = self
+                                .core_status_history
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            core_status_view(
+                                core,
+                                read,
+                                history.entry((key.clone(), index)).or_default(),
+                            )
+                        })
                         .collect(),
                 )
             })
@@ -3697,6 +3894,54 @@ pub enum UpdateProgress {
     Failed(DaemonError),
 }
 
+#[cfg(unix)]
+fn prepare_status_dir(
+    root: &Path,
+    bot_id: &str,
+    shard: u32,
+    allow_non_tmpfs: bool,
+) -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        || !root.is_dir()
+        || (!allow_non_tmpfs && !crate::core_status::is_tmpfs(root))
+    {
+        return None;
+    }
+    let bot = bot_id
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let mut dir = root.to_path_buf();
+    for part in [format!("bot-{bot}"), format!("shard-{shard}")] {
+        dir.push(part);
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&dir)
+            .ok()?;
+        let meta = opened.metadata().ok()?;
+        if (!allow_non_tmpfs && !crate::core_status::file_is_tmpfs(&opened))
+            || !meta.file_type().is_dir()
+            || meta.mode() & 0o7777 != 0o700
+            || meta.uid() != unsafe { libc::geteuid() }
+            || (!allow_non_tmpfs && !crate::core_status::is_tmpfs(&dir))
+        {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
 pub struct Daemon<C = MonotonicClock> {
     entries: BTreeMap<ShardKey, Entry>,
     recovery: ChildRecovery<RecoveryClock<C>>,
@@ -4142,6 +4387,29 @@ impl<C: Clock> Daemon<C> {
             entry.cores = Some(cores);
         }
         Ok(())
+    }
+
+    /// Configure optional, best-effort status files before starting any shard.
+    #[cfg(unix)]
+    pub fn configure_core_status(
+        &mut self,
+        root: Option<&Path>,
+        allow_non_tmpfs: bool,
+        interval_ms: Option<u64>,
+    ) {
+        for entry in self.entries.values_mut() {
+            if let Some(cores) = &mut entry.cores {
+                let dir = root.and_then(|root| {
+                    prepare_status_dir(
+                        root,
+                        &entry.spec.bot_id,
+                        entry.spec.shard_id,
+                        allow_non_tmpfs,
+                    )
+                });
+                cores.configure_status(dir, allow_non_tmpfs, interval_ms);
+            }
+        }
     }
 
     /// Whether this daemon runs the Cores (separated layout).

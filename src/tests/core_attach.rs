@@ -5,7 +5,7 @@
 use serde_json::Value;
 use std::{
     future::Future,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
@@ -67,6 +67,19 @@ impl Core {
         persistent: bool,
         floor: Option<u64>,
     ) -> Self {
+        Self::start_mode_with_interval(socket, secret, identity, persistent, floor, None, None)
+            .await
+    }
+
+    async fn start_mode_with_interval(
+        socket: &Path,
+        secret: &str,
+        identity: Option<&str>,
+        persistent: bool,
+        floor: Option<u64>,
+        interval_ms: Option<u64>,
+        status: Option<(&Path, bool)>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_src"));
         command.arg("--core-listen").arg(socket).env_clear();
         if persistent {
@@ -74,6 +87,17 @@ impl Core {
         }
         if let Some(floor) = floor {
             command.arg("--epoch-floor").arg(floor.to_string());
+        }
+        if let Some((path, allow_non_tmpfs)) = status {
+            command.arg("--core-status-file").arg(path);
+            if allow_non_tmpfs {
+                command.arg("--core-status-allow-non-tmpfs");
+            }
+        }
+        if let Some(interval) = interval_ms {
+            command
+                .arg("--core-status-interval-ms")
+                .arg(interval.to_string());
         }
         if let Some(identity) = identity {
             command.env("BOT_WORKER_IPC_IDENTITY", identity);
@@ -1123,4 +1147,155 @@ async fn invalid_epoch_floor_exits_nonzero() {
         .unwrap();
         assert!(!status.success(), "accepted {value}");
     }
+}
+
+#[tokio::test]
+async fn core_status_heartbeat_is_in_place_and_nonstandard_socket_still_works() {
+    use src::core_status::{StatusRead, read_status};
+    // The reader only reads files on tmpfs (an ext4 file is Unreadable), so the status file lives
+    // on /dev/shm; the test is skipped where /dev/shm is not tmpfs.
+    let shm = Path::new("/dev/shm");
+    if !src::core_status::is_tmpfs(shm) {
+        eprintln!("skipping: /dev/shm is absent or not tmpfs");
+        return;
+    }
+    let dir = private_dir();
+    let socket = dir.join("core-42.sock");
+    let status_dir = shm.join(dir.file_name().unwrap());
+    std::fs::create_dir(&status_dir).unwrap();
+    std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = status_dir.join("core-42.status");
+    let mut core = Core::start_mode_with_interval(
+        &socket,
+        SECRET,
+        None,
+        false,
+        None,
+        Some(100),
+        Some((&path, false)),
+    )
+    .await;
+    let first = bounded(async {
+        loop {
+            if let StatusRead::Fresh { record, .. } = read_status(&path) {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert_eq!(first.pending, 0);
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.len(), 64);
+    bounded(async {
+        loop {
+            if let StatusRead::Fresh { record, .. } = read_status(&path)
+                && record.seq > first.seq
+            {
+                assert_eq!(record.pending, 0);
+                assert_eq!(record.generation, first.generation);
+                assert_ne!(record.generation, 0);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!((metadata.dev(), metadata.ino()), (after.dev(), after.ino()));
+    let mut stream = attach(&socket, SECRET).await;
+    assert_eq!(
+        bounded(exchange(&mut stream, r#"{"type":"health"}"#))
+            .await
+            .unwrap()["type"],
+        "ready"
+    );
+    drop(stream);
+    let _ = bounded(core.child.wait()).await;
+
+    let other = dir.join("other.sock");
+    let mut core =
+        Core::start_mode_with_interval(&other, SECRET, None, false, None, Some(100), None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!dir.join("other.status").exists());
+    assert!(!status_dir.join("other.status").exists());
+    let mut stream = attach(&other, SECRET).await;
+    assert_eq!(
+        bounded(exchange(&mut stream, r#"{"type":"health"}"#))
+            .await
+            .unwrap()["type"],
+        "ready"
+    );
+    drop(stream);
+    let _ = bounded(core.child.wait()).await;
+    let _ = std::fs::remove_dir_all(status_dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn core_status_rejects_non_tmpfs() {
+    let dir = private_dir();
+    if src::core_status::is_tmpfs(&dir) {
+        eprintln!("skipping non-tmpfs guard test: temporary directory is tmpfs");
+        let _ = std::fs::remove_dir_all(dir);
+        return;
+    }
+    let socket = dir.join("core.sock");
+    let path = dir.join("status");
+    let mut core = Core::start_mode_with_interval(
+        &socket,
+        SECRET,
+        None,
+        false,
+        None,
+        Some(100),
+        Some((&path, false)),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(!path.exists());
+    let stream = attach(&socket, SECRET).await;
+    drop(stream);
+    let _ = bounded(core.child.wait()).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn core_status_accepts_tmpfs() {
+    let shm = Path::new("/dev/shm");
+    if !src::core_status::is_tmpfs(shm) {
+        eprintln!("skipping tmpfs test: /dev/shm is absent or not tmpfs");
+        return;
+    }
+    let dir = private_dir();
+    let socket = dir.join("core.sock");
+    let name = dir.file_name().unwrap();
+    let status_dir = shm.join(name);
+    std::fs::create_dir(&status_dir).unwrap();
+    let path = status_dir.join("status");
+    let mut core = Core::start_mode_with_interval(
+        &socket,
+        SECRET,
+        None,
+        false,
+        None,
+        Some(100),
+        Some((&path, false)),
+    )
+    .await;
+    bounded(async {
+        while !matches!(
+            src::core_status::read_status(&path),
+            src::core_status::StatusRead::Fresh { .. }
+        ) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let stream = attach(&socket, SECRET).await;
+    drop(stream);
+    let _ = bounded(core.child.wait()).await;
+    let _ = std::fs::remove_dir_all(status_dir);
+    let _ = std::fs::remove_dir_all(dir);
 }

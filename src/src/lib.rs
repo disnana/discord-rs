@@ -9,6 +9,7 @@ pub mod core_attach;
 #[cfg(unix)]
 pub mod core_server;
 pub mod core_state;
+pub mod core_status;
 #[cfg(unix)]
 pub mod core_units;
 pub mod daemon;

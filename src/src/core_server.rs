@@ -197,7 +197,25 @@ pub async fn serve(
     lifetime: Lifetime,
     initial_floor: u64,
 ) -> Result<(), AppError> {
+    serve_with_status(listener, secret, backend, lifetime, initial_floor, None).await
+}
+
+async fn serve_with_status(
+    listener: UnixListener,
+    secret: Secret<[u8; SECRET_BYTES]>,
+    backend: Option<std::sync::Arc<dyn crate::state_store::StateStore>>,
+    lifetime: Lifetime,
+    initial_floor: u64,
+    status: Option<(crate::core_status::StatusWriter, Duration)>,
+) -> Result<(), AppError> {
     let mut life = CoreLife::new(backend)?;
+    let _status_task = status.map(|(writer, interval)| {
+        StatusTask(tokio::spawn(write_status_periodically(
+            writer,
+            life.request_summary(),
+            interval,
+        )))
+    });
     let failed = std::sync::atomic::AtomicU32::new(0);
     if lifetime == Lifetime::OneConnection {
         let (stream, _) = accept_authenticated(&listener, &secret, &failed).await?;
@@ -300,8 +318,70 @@ async fn read_secret_from_stdin() -> Result<Secret<[u8; SECRET_BYTES]>, CoreServ
     parse_hex_secret(&frame[..ATTACH_FRAME_BYTES - 1]).map_err(|_| CoreServerError::Secret)
 }
 
+struct StatusTask(tokio::task::JoinHandle<()>);
+
+impl Drop for StatusTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn write_status_periodically(
+    mut writer: crate::core_status::StatusWriter,
+    summary: crate::worker::SharedRequestSummary,
+    check_every: Duration,
+) {
+    let mut policy =
+        crate::core_status::WritePolicy::new(check_every, check_every.saturating_mul(2));
+    let mut ticks = tokio::time::interval(check_every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let now = tokio::time::Instant::now();
+        let snapshot = *summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(boot_ms) = crate::core_status::try_boot_ms() else {
+            continue;
+        };
+        let record = snapshot.record(now, boot_ms);
+        if policy.should_write(now.into_std(), &record) {
+            writer.write(&record);
+        }
+    }
+}
+
 /// Process entry for `src --core-listen <absolute socket path>`.
-pub async fn run(socket: PathBuf, lifetime: Lifetime, floor: u64) -> Result<(), AppError> {
+pub async fn run(
+    socket: PathBuf,
+    lifetime: Lifetime,
+    floor: u64,
+    status_path: Option<PathBuf>,
+    status_id: Option<u64>,
+    require_tmpfs: bool,
+) -> Result<(), AppError> {
+    run_with_status_interval(
+        socket,
+        lifetime,
+        floor,
+        status_path,
+        status_id,
+        require_tmpfs,
+        Duration::from_secs(5),
+    )
+    .await
+}
+
+#[doc(hidden)]
+pub async fn run_with_status_interval(
+    socket: PathBuf,
+    lifetime: Lifetime,
+    floor: u64,
+    status_path: Option<PathBuf>,
+    status_id: Option<u64>,
+    require_tmpfs: bool,
+    interval: Duration,
+) -> Result<(), AppError> {
     let secret = read_secret_from_stdin().await?;
     let listener = bind_socket(&socket)?;
     if lifetime == Lifetime::UntilStopped {
@@ -315,7 +395,13 @@ pub async fn run(socket: PathBuf, lifetime: Lifetime, floor: u64) -> Result<(), 
             std::process::exit(0);
         });
     }
-    let result = serve(listener, secret, None, lifetime, floor).await;
+    let status = status_path
+        .filter(|path| path.is_absolute() && !interval.is_zero())
+        .and_then(|path| {
+            crate::core_status::StatusWriter::open_checked_with_id(&path, require_tmpfs, status_id)
+        })
+        .map(|writer| (writer, interval));
+    let result = serve_with_status(listener, secret, None, lifetime, floor, status).await;
     if lifetime == Lifetime::UntilStopped {
         // The stdin watcher above is a blocking read that cannot be cancelled, so returning
         // would leave the runtime waiting on it: a live process with no listener, which botd
