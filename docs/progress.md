@@ -343,7 +343,7 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - C：保存の印を、プロセス間の排他ロック下で耐久的に採番（サイドファイル `core-state.writer`、桁あふれは検査、失敗時は保存を無効化して警告 1 回）。B：永続 Core が `--epoch-floor N` を受けて起動（下限を持った状態から）、バックログ再生中もシャードを poll し停止要求を観測（最大 512 件）。B3（Core の要求の期限）は、`WorkerTasks::request` の取り消しが安全でないため追加せず、理由をコードに記載。A：更新の前に Identify の履歴で 2 回分の余裕を確認、終端の監査を保留リストに保持して再試行しステータスに `gateway_update_audit` を追加、監査・候補ログを安全に開く（シンボリックリンク拒否、所有者・リンク数・0600 を記述子で確認）、再起動する Core に `--epoch-floor` を渡す。
 - 運用メモ：`src.zip`（配布用）が誤ってコミットされていたので追跡から外し、.gitignore に追加した。
 - 11:30 Astra 再監査 第5回（7 件、すべて P2/P3）に対応（Codex `gpt-6.1-terra` D/E/F が執筆、私が統合・修正）：#1 Identify のクールダウン中は更新を待機し、枯渇のときだけ失敗／#4 監査の再試行は同じバイト列を使い、部分行を改行で区切ってから追記／#3 aarch64 で誤っていた O_NOFOLLOW のハードコードをやめ、path の事前確認と開いた記述子の (dev, ino)・所有者・リンク数の照合に変更／#5 保存の印のロックに 5 秒の期限／#7 警告の文字化けを修正（Codex の書き込みで日本語が `?` になる事故を発見して私が直した）／#2 再生中に完了済みタスクを回収／#6 再生の上限超過でも通常の排出を通ってから終了。
-- 注意：Codex（Windows の書き込み）が日本語を `?` に化かす事故が 2 回あった。今後、Codex の成果物は `grep -rn '????' src tests` で必ず確認する。
+- 注意：Codex（Windows の書き込み）が日本語を `?` に化かす事故が 2 回あった。今後、Codex の成果物は `grep -rn four question marks src tests` で必ず確認する。
 - 11:58 Astra 第6回（9 件）への対応。**Codex E/F（Terra）の報告のうち、main.rs・core_units.rs の変更が実際には書き込まれていなかった**（Astra が差分で発見）。再依頼して差分で確認：#2 再生中の完了タスク回収／#6 再生の超過時も共通の排出を通る／#3 aarch64 の O_NOFOLLOW をやめ、事前の symlink_metadata と開いた記述子の (dev, ino)・所有者・リンク数の照合に（read+append ヘルパーの open は FIFO に塞がれない。後続の read-only open までは保証しない）／#5 ロックを try_lock の 5 秒再試行に／R6-1 更新の期限を Shard 数に応じて（120 秒 + 45 秒 × Shard 数）／R6-2 更新済みの Shard の再起動抑止を直ちに解除／R6-8 監査の不完全な末尾は `.corrupt` に退避して切り詰める／R6-9 同期のみの再試行はファイルの同一性と長さを確認。教訓：Codex の報告は差分で必ず確認する。
 - 第7回の5件を実装：同じ Bot の他 Shard の起動を候補／失敗後の復旧許可まで待たせて Identify 枠を保護。監査の読込は検証済み記述子を再利用し、末尾検索は 8 KiB 単位、退避は 64 KiB／`.corrupt` 全体は 1 MiB まで。退避の進捗を保持して重複コピーを避け、保留監査の再試行失敗後は 1 秒空ける。同期だけの再試行でも保存位置のバイト列を照合。チェックポイントは read-only と開いた記述子の検査を併用し、open 前の FIFO 差替え競合は未解消として明記した。単体試験を追加したが、依頼に従ってビルド・cargo・試験は実行していない。差分と UTF-8 の読戻しのみ確認し、WSL での検証は統合担当へ引き継ぐ。コミット・push はしていない。
 - 第8回の指摘に対応：同じ Bot に復旧用 Identify の予約が残る間は、新規 `gateway-update` を操作登録・再起動抑止より前に拒否する。復旧の予約を維持し、復旧待ちと再起動抑止の循環を避ける。ControlPlane の回帰試験に、反復拒否で抑止が漏れないこと、別 Bot の独立性、予約解除後の再受付を追加した。差分と UTF-8 の読戻しを確認。依頼に従い cargo・ビルド・試験は未実行、WSL での検証は統合担当へ引き継ぐ。コミット・push はしていない。
@@ -567,7 +567,7 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 - `!workers` に返信する前に、各 Core 接続へ `Health` を送り、`Ready` なら返信、エラーなら返信しない（fence・切断・通常の障害を区別しない）。ロックの取得に 2 秒の期限があり、取れなければ従来どおり返信する。取得後の交換はキャンセルしない（Astra 第 17 回の指摘 1：期限内の途中キャンセルは接続を壊す）。停止中は返信しない、embedded は従来どおり。
 - **保証ではない**：fence 前の二重返信、確認と HTTP 送信の間の競合、Core の通常の障害中の無返信、タイムアウト時の返信は残る。exactly-once ではない。単体テストと `core_attach` の統合テストのみで、実 Discord での更新中の確認は未実施。
-- 経緯：この節と `docs/design-workers-dedupe.md` の追記は、Codex（Terra）が日本語を `?` に化かしていたため、私が書き直した（第 17 回の指摘 2。`grep '????'` の検査範囲に別 worktree の文書が入っていなかった見落とし）。
+- 経緯：この節と `docs/design-workers-dedupe.md` の追記は、Codex（Terra）が日本語を `?` に化かしていたため、私が書き直した（第 17 回の指摘 2。`grep four question marks` の検査範囲に別 worktree の文書が入っていなかった見落とし）。
 
 ### 2026-11-16 22 時：main = 6b7c559（Astra 第 18 回で指摘なし、CI green）
 
@@ -610,3 +610,8 @@ Core は要求の要約を `core-N.status` に最小頻度で上書きし、待�
 
 
 P1 STEP 2b: Core status is opt-in via `--core-status-file <absolute path>` and requires tmpfs (the non-tmpfs override is test-only). Records use CLOCK_BOOTTIME, a per-process generation and a write sequence. botd does not read these records yet. Disk I/O must be measured again on the new build; zero writeback has not been verified. Cargo tests were not run for this change.
+
+
+## 2026-11-17 P1 botd status diagnostics
+
+botd now supplies tmpfs status paths to separate Cores and adds PID-checked status and `suspected_stalled` to control responses. Failure to prepare or read a status file does not stop supervision. Unit and real-process integration tests were added but Cargo was not run as requested. Real Discord, Oracle, systemd RuntimeDirectory on a real server, and zero disk writeback measurements remain unverified. botd does not connect to the Core socket for diagnostics.

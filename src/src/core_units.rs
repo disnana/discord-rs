@@ -150,13 +150,18 @@ pub struct CoreUnits {
     prepared: bool,
     log_checked: Option<Instant>,
     epoch_floor: u64,
+    status_dir: Option<PathBuf>,
+    status_allow_non_tmpfs: bool,
+    status_interval_ms: Option<u64>,
 }
 
 /// What an operator may be told about a Core, never a path, secret or argument.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreStatus {
     pub running: bool,
     pub failures: u32,
+    pub pid: Option<u32>,
+    pub status_path: Option<PathBuf>,
 }
 
 impl CoreUnits {
@@ -169,7 +174,21 @@ impl CoreUnits {
             prepared: false,
             log_checked: None,
             epoch_floor: 0,
+            status_dir: None,
+            status_allow_non_tmpfs: false,
+            status_interval_ms: None,
         }
+    }
+
+    pub fn configure_status(
+        &mut self,
+        dir: Option<PathBuf>,
+        allow_non_tmpfs: bool,
+        interval_ms: Option<u64>,
+    ) {
+        self.status_dir = dir;
+        self.status_allow_non_tmpfs = allow_non_tmpfs;
+        self.status_interval_ms = interval_ms;
     }
 
     pub fn set_epoch_floor(&mut self, floor: u64) {
@@ -183,9 +202,15 @@ impl CoreUnits {
     pub fn status(&self) -> Vec<CoreStatus> {
         self.slots
             .iter()
-            .map(|slot| CoreStatus {
+            .enumerate()
+            .map(|(index, slot)| CoreStatus {
                 running: slot.child.is_some(),
                 failures: slot.failures,
+                pid: slot.child.as_ref().map(Child::id),
+                status_path: self
+                    .status_dir
+                    .as_ref()
+                    .map(|dir| dir.join(format!("core-{index}.status"))),
             })
             .collect()
     }
@@ -223,6 +248,23 @@ impl CoreUnits {
             .arg("--core-listen")
             .arg(socket_path(&self.dir, index))
             .arg("--core-persist");
+        if let Some(dir) = self
+            .status_dir
+            .as_ref()
+            .filter(|dir| self.status_allow_non_tmpfs || crate::core_status::is_tmpfs(dir))
+        {
+            command
+                .arg("--core-status-file")
+                .arg(dir.join(format!("core-{index}.status")));
+            if self.status_allow_non_tmpfs {
+                command.arg("--core-status-allow-non-tmpfs");
+            }
+            if let Some(interval) = self.status_interval_ms {
+                command
+                    .arg("--core-status-interval-ms")
+                    .arg(interval.to_string());
+            }
+        }
         if self.epoch_floor > 0 {
             command
                 .arg("--epoch-floor")

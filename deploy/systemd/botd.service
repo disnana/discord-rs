@@ -51,7 +51,7 @@ EnvironmentFile=/etc/discord-rs/botd.env
 # 状態は /var/lib/discord-rs（0700, discord-rs 所有）。runtime-root はその配下。
 StateDirectory=discord-rs discord-rs/runtime
 StateDirectoryMode=0700
-# /run/discord-rs（現状 botd は使用しない。将来の socket 等のために確保）
+# Private tmpfs runtime directory for Core status diagnostics.
 RuntimeDirectory=discord-rs
 RuntimeDirectoryMode=0700
 UMask=0077

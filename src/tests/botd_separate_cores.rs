@@ -118,6 +118,10 @@ impl Fixture {
 
     /// `stub`: a script used as the Gateway program instead of the real binary.
     async fn start_with(stub: Option<&dyn Fn(&Path) -> PathBuf>) -> Self {
+        Self::start_options(stub, &[]).await
+    }
+
+    async fn start_options(stub: Option<&dyn Fn(&Path) -> PathBuf>, extra: &[&str]) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // Short: Unix socket paths are limited to about 100 bytes.
         let root = std::env::temp_dir().join(format!(
@@ -155,6 +159,7 @@ impl Fixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        command.args(extra);
         let mut daemon = command.spawn().unwrap();
         let mut bootstrap = serde_json::to_vec(&json!({"secret": SECRET})).unwrap();
         bootstrap.push(b'\n');
@@ -688,4 +693,128 @@ async fn unconfirmed_update(old_exits_cleanly: bool) {
     })
     .await;
     let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+// Resume a stopped child even if an assertion fails, so fixture shutdown cannot hang.
+struct ResumeOnDrop(u32);
+impl Drop for ResumeOnDrop {
+    fn drop(&mut self) {
+        signal(self.0, "CONT");
+    }
+}
+
+async fn daemon_core_views(port: u16) -> Vec<Value> {
+    let reply = control(port, json!({"command": "status"})).await;
+    reply["status"]["processes"][0]["cores"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[tokio::test]
+async fn status_heartbeat_detects_a_stopped_core() {
+    let shm = Path::new("/dev/shm");
+    if !src::core_status::is_tmpfs(shm) {
+        eprintln!("skipping: /dev/shm is not tmpfs");
+        return;
+    }
+    let dir = shm.join(format!(
+        "botd-status-{}-{}",
+        std::process::id(),
+        src::core_status::boot_ms()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let dir_arg = dir.to_str().unwrap();
+    let fixture = Fixture::start_options(
+        None,
+        &[
+            "--core-status-dir",
+            dir_arg,
+            "--core-status-interval-ms",
+            "100",
+        ],
+    )
+    .await;
+    let gateway = fixture.accept().await;
+    let pids = worker_pids(&gateway.ready);
+    let first = bounded(async {
+        loop {
+            let views = daemon_core_views(fixture.port).await;
+            if views
+                .iter()
+                .all(|v| v["status"]["pending"] == 0 && v["status"]["suspected_stalled"] == false)
+            {
+                break views;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    bounded(async {
+        loop {
+            let views = daemon_core_views(fixture.port).await;
+            if (0..2).all(|i| {
+                views[i]["status"]["seq"].as_u64().unwrap_or(0)
+                    > first[i]["status"]["seq"].as_u64().unwrap()
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    signal(pids[0], "STOP");
+    let resume = ResumeOnDrop(pids[0]);
+    bounded(async {
+        loop {
+            let views = daemon_core_views(fixture.port).await;
+            if views[0]["status"]["suspected_stalled"] == true
+                && views[1]["status"]["suspected_stalled"] == false
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    drop(resume);
+    bounded(async {
+        loop {
+            let views = daemon_core_views(fixture.port).await;
+            if views
+                .iter()
+                .all(|v| v["status"]["suspected_stalled"] == false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    signal(fixture.daemon.id().unwrap(), "TERM");
+    drop(fixture);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn absent_default_directory_disables_status() {
+    if Path::new("/run/discord-rs").exists() {
+        eprintln!("skipping: /run/discord-rs exists");
+        return;
+    }
+    let fixture = Fixture::start().await;
+    let gateway = fixture.accept().await;
+    for pid in worker_pids(&gateway.ready) {
+        let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        assert!(
+            !args
+                .split(|b| *b == 0)
+                .any(|arg| arg == b"--core-status-file")
+        );
+    }
+    for view in daemon_core_views(fixture.port).await {
+        assert!(view["status"].is_null());
+        assert_eq!(view["status_reason"], "unsupported");
+    }
+    signal(fixture.daemon.id().unwrap(), "TERM");
 }

@@ -116,4 +116,11 @@
 Core は要求の要約を `core-N.status` に最小頻度で上書きし、待機中も生存情報を更新する。botd による読み取りは未実装（Step 3）。I/O 負荷の実測は未実施。Cargo と実プロセス試験は今回未実行。
 
 
-P1 STEP 2b: Core status is opt-in via `--core-status-file <absolute path>` and requires tmpfs (the non-tmpfs override is test-only). Records use CLOCK_BOOTTIME, a per-process generation and a write sequence. botd does not read these records yet. Disk I/O must be measured again on the new build; zero writeback has not been verified. Cargo tests were not run for this change.
+P1 STEP 2b: Core status is opt-in via `--core-status-file <absolute path>` and requires tmpfs (the non-tmpfs override is test-only). Records use CLOCK_BOOTTIME, a per-process generation and a write sequence. botd reads these records in separate Core mode. Disk I/O must be measured again on the new build; zero writeback has not been verified. Cargo tests were not run for this change.
+
+
+## P1 Core status diagnostics
+
+In separate Core mode, botd reads status files from tmpfs and reports `suspected_stalled` when the record is at least 30 seconds old. This is a suspicion, not proof of a cause or a complete hang. Missing files report `unsupported`; unreadable, corrupt, and PID-mismatched records have separate reasons. `--core-status-dir` names an existing absolute directory. By default `/run/discord-rs` is used only if it exists and is tmpfs. `--core-status-allow-non-tmpfs` and `--core-status-interval-ms` are test-only; the former permits disk writes and must not be used in production.
+
+Cargo build and tests, real Discord, Oracle, systemd RuntimeDirectory on a real server, and zero disk writeback measurements remain unverified.

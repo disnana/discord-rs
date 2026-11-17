@@ -793,10 +793,87 @@ pub struct ShardKey {
 /// Local administration state. Authentication and bounded framing belong to the
 /// listener; only authenticated commands may be passed to this module.
 pub mod control {
+    #[cfg(unix)]
+    fn core_status_view(
+        core: &crate::core_units::CoreStatus,
+        read: crate::core_status::StatusRead,
+    ) -> serde_json::Value {
+        use crate::core_status::StatusRead;
+        use serde_json::json;
+        let mut view = json!({"running": core.running, "failures": core.failures, "status": null});
+        let reason = match read {
+            StatusRead::Fresh {
+                record,
+                status_age_s,
+            } if Some(record.pid) == core.pid => {
+                view["status"] = json!({"pending": record.pending, "oldest_age_s": record.oldest_age_s, "warned": record.warned, "threshold_s": record.threshold_s, "status_age_s": status_age_s, "suspected_stalled": status_age_s >= 30, "generation": record.generation, "seq": record.seq});
+                return view;
+            }
+            StatusRead::Fresh { .. } => "stale_generation",
+            StatusRead::Missing => "unsupported",
+            StatusRead::Unreadable => "unreadable",
+            StatusRead::Corrupt => "corrupt",
+        };
+        view["status_reason"] = json!(reason);
+        view
+    }
+
     use super::*;
     use crate::{botref, placement::BotPlacement};
     use serde_json::{Value, json};
     use std::time::Instant;
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn status_view_classifies_read_results() {
+        use crate::core_status::{StatusRead, StatusRecord};
+        let core = crate::core_units::CoreStatus {
+            running: true,
+            failures: 3,
+            pid: Some(42),
+            status_path: None,
+        };
+        let record = StatusRecord {
+            pending: 2,
+            oldest_age_s: 4,
+            warned: 1,
+            threshold_s: 30,
+            boot_ms: 1,
+            pid: 42,
+            generation: 7,
+            seq: 9,
+        };
+        for (age, suspected) in [(29, false), (30, true)] {
+            let view = core_status_view(
+                &core,
+                StatusRead::Fresh {
+                    record,
+                    status_age_s: age,
+                },
+            );
+            assert_eq!(view["status"]["suspected_stalled"], suspected);
+            assert_eq!(view["status"]["pending"], 2);
+            assert_eq!(view["status"]["generation"], 7);
+            assert_eq!(view["status"]["seq"], 9);
+            assert_eq!(view["failures"], 3);
+        }
+        for (read, reason) in [
+            (StatusRead::Missing, "unsupported"),
+            (StatusRead::Unreadable, "unreadable"),
+            (StatusRead::Corrupt, "corrupt"),
+            (
+                StatusRead::Fresh {
+                    record: StatusRecord { pid: 43, ..record },
+                    status_age_s: 0,
+                },
+                "stale_generation",
+            ),
+        ] {
+            let view = core_status_view(&core, read);
+            assert!(view["status"].is_null());
+            assert_eq!(view["status_reason"], reason);
+        }
+    }
 
     pub const NOTE: &str = "Local process status only; Discord readiness, Core drain, ownership and leases are not verified.";
     pub const OPERATION_LIMIT: usize = 1024;
@@ -1397,7 +1474,19 @@ pub mod control {
                 Value::Array(
                     cores
                         .iter()
-                        .map(|core| json!({"running": core.running, "failures": core.failures}))
+                        .map(|core| {
+                            let read = core
+                                .status_path
+                                .as_ref()
+                                .map(|path| {
+                                    crate::core_status::read_status(
+                                        path,
+                                        crate::core_status::boot_ms(),
+                                    )
+                                })
+                                .unwrap_or(crate::core_status::StatusRead::Missing);
+                            core_status_view(core, read)
+                        })
                         .collect(),
                 )
             })
@@ -3697,6 +3786,47 @@ pub enum UpdateProgress {
     Failed(DaemonError),
 }
 
+#[cfg(unix)]
+fn prepare_status_dir(
+    root: &Path,
+    bot_id: &str,
+    shard: u32,
+    allow_non_tmpfs: bool,
+) -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        || !root.is_dir()
+        || (!allow_non_tmpfs && !crate::core_status::is_tmpfs(root))
+    {
+        return None;
+    }
+    let bot = bot_id
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let mut dir = root.to_path_buf();
+    for part in [format!("bot-{bot}"), format!("shard-{shard}")] {
+        dir.push(part);
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+        let meta = std::fs::symlink_metadata(&dir).ok()?;
+        if !meta.file_type().is_dir()
+            || meta.mode() & 0o7777 != 0o700
+            || meta.uid() != unsafe { libc::geteuid() }
+            || (!allow_non_tmpfs && !crate::core_status::is_tmpfs(&dir))
+        {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
 pub struct Daemon<C = MonotonicClock> {
     entries: BTreeMap<ShardKey, Entry>,
     recovery: ChildRecovery<RecoveryClock<C>>,
@@ -4142,6 +4272,29 @@ impl<C: Clock> Daemon<C> {
             entry.cores = Some(cores);
         }
         Ok(())
+    }
+
+    /// Configure optional, best-effort status files before starting any shard.
+    #[cfg(unix)]
+    pub fn configure_core_status(
+        &mut self,
+        root: Option<&Path>,
+        allow_non_tmpfs: bool,
+        interval_ms: Option<u64>,
+    ) {
+        for entry in self.entries.values_mut() {
+            if let Some(cores) = &mut entry.cores {
+                let dir = root.and_then(|root| {
+                    prepare_status_dir(
+                        root,
+                        &entry.spec.bot_id,
+                        entry.spec.shard_id,
+                        allow_non_tmpfs,
+                    )
+                });
+                cores.configure_status(dir, allow_non_tmpfs, interval_ms);
+            }
+        }
     }
 
     /// Whether this daemon runs the Cores (separated layout).
