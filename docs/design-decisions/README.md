@@ -8,6 +8,8 @@
 |---|---|
 | [decisions-needed.md](decisions-needed.md) | **ユーザーの判断が必要なもの**の一覧と、私の推奨 |
 | [unverified-items.md](unverified-items.md) | 「未確認」「不明」のもの、確認の方法、誰が行うか |
+| [discussion-records/](discussion-records/) | **ChatGPT との議論で合意した方針（DDR-0001〜0005）**。実装済みの意味ではない |
+| [reconciliation-with-ddr.md](reconciliation-with-ddr.md) | DDR と、この `design-decisions/` の資料・現在のコードとの**食い違いの一覧**と、次に決めること |
 
 ## テーマ別の設計・対応案
 

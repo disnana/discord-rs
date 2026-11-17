@@ -1,5 +1,7 @@
 # 03. Core の無停止差し替え（分離モード）
 
+> **2026-11-17 の注記：** 骨子の「キーごとに状態を必ず渡す」手順は、DDR-0001 の合意（**状態の引き継ぎは任意。正常な更新では旧 Core が受け付けた処理を完了し、新 Core が新規を担当する**）と調整が必要。DDR-0005 も同じ指摘をしている。差分と提案は [reconciliation-with-ddr.md](reconciliation-with-ddr.md) を参照（本文は未修正）。
+
 ## 現状（確認済み）
 
 - Gateway の更新は無停止（`botctl gateway-update`。待機 Gateway を起動して引き継ぐ）。
