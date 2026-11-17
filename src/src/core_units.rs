@@ -298,9 +298,7 @@ impl CoreUnits {
                     } else {
                         None
                     };
-                    if reason.is_none() {
-                        return None;
-                    }
+                    reason?;
                     reason
                 }
             };
