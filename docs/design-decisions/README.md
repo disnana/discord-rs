@@ -10,7 +10,7 @@
 | [unverified-items.md](unverified-items.md) | 「未確認」「不明」のもの、確認の方法、誰が行うか |
 | [discussion-records/](discussion-records/) | **ChatGPT との議論で合意した方針（DDR-0001〜0005）**。実装済みの意味ではない |
 | [reconciliation-with-ddr.md](reconciliation-with-ddr.md) | DDR と、この `design-decisions/` の資料・現在のコードとの**食い違いの一覧**と、次に決めること |
-| [proposals-2026-11-17.md](proposals-2026-11-17.md) | **DDR で残った 3 つの判断への Claude の提案**（基盤の状態の引き継ぎ、止まったハンドラの段階的な対処、03 の書き換え骨子）。未合意・未実装 |
+| [proposals-2026-11-17.md](proposals-2026-11-17.md) | **DDR で残った 3 つの判断への Claude の提案**（基盤の状態の引き継ぎ、止まったハンドラの段階的な対処、03 の書き換え骨子）。**2026-11-17 にユーザーが了承**（[DDR-0006](discussion-records/0006-proposals-accepted-2026-11-17.md)）。未実装 |
 
 ## テーマ別の設計・対応案
 
