@@ -326,17 +326,8 @@ impl Drop for StatusTask {
     }
 }
 
-fn status_path(socket: &Path) -> Option<PathBuf> {
-    let name = socket.file_name()?.to_str()?;
-    let digits = name.strip_prefix("core-")?.strip_suffix(".sock")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(socket.with_file_name(format!("core-{digits}.status")))
-}
-
 async fn write_status_periodically(
-    writer: crate::core_status::StatusWriter,
+    mut writer: crate::core_status::StatusWriter,
     summary: crate::worker::SharedRequestSummary,
     check_every: Duration,
 ) {
@@ -350,12 +341,7 @@ async fn write_status_periodically(
         let snapshot = *summary
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let updated_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
-        let record = snapshot.record(now, updated_at_ms);
+        let record = snapshot.record(now, crate::core_status::boot_ms());
         if policy.should_write(now.into_std(), &record) {
             writer.write(&record);
         }
@@ -363,8 +349,22 @@ async fn write_status_periodically(
 }
 
 /// Process entry for `src --core-listen <absolute socket path>`.
-pub async fn run(socket: PathBuf, lifetime: Lifetime, floor: u64) -> Result<(), AppError> {
-    run_with_status_interval(socket, lifetime, floor, Duration::from_secs(5)).await
+pub async fn run(
+    socket: PathBuf,
+    lifetime: Lifetime,
+    floor: u64,
+    status_path: Option<PathBuf>,
+    require_tmpfs: bool,
+) -> Result<(), AppError> {
+    run_with_status_interval(
+        socket,
+        lifetime,
+        floor,
+        status_path,
+        require_tmpfs,
+        Duration::from_secs(5),
+    )
+    .await
 }
 
 #[doc(hidden)]
@@ -372,6 +372,8 @@ pub async fn run_with_status_interval(
     socket: PathBuf,
     lifetime: Lifetime,
     floor: u64,
+    status_path: Option<PathBuf>,
+    require_tmpfs: bool,
     interval: Duration,
 ) -> Result<(), AppError> {
     let secret = read_secret_from_stdin().await?;
@@ -387,9 +389,9 @@ pub async fn run_with_status_interval(
             std::process::exit(0);
         });
     }
-    let status = status_path(&socket)
-        .and_then(|path| crate::core_status::StatusWriter::open(&path))
-        .filter(|_| !interval.is_zero())
+    let status = status_path
+        .filter(|path| path.is_absolute() && !interval.is_zero())
+        .and_then(|path| crate::core_status::StatusWriter::open_checked(&path, require_tmpfs))
         .map(|writer| (writer, interval));
     let result = serve_with_status(listener, secret, None, lifetime, floor, status).await;
     if lifetime == Lifetime::UntilStopped {

@@ -114,3 +114,6 @@
 ## P1 停滞診断 Step 2
 
 Core は要求の要約を `core-N.status` に最小頻度で上書きし、待機中も生存情報を更新する。botd による読み取りは未実装（Step 3）。I/O 負荷の実測は未実施。Cargo と実プロセス試験は今回未実行。
+
+
+P1 STEP 2b: Core status is opt-in via `--core-status-file <absolute path>` and requires tmpfs (the non-tmpfs override is test-only). Records use CLOCK_BOOTTIME, a per-process generation and a write sequence. botd does not read these records yet. Disk I/O must be measured again on the new build; zero writeback has not been verified. Cargo tests were not run for this change.

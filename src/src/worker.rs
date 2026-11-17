@@ -3747,7 +3747,7 @@ impl RequestSummary {
     pub(crate) fn record(
         self,
         now: tokio::time::Instant,
-        updated_at_ms: u64,
+        boot_ms: u64,
     ) -> crate::core_status::StatusRecord {
         crate::core_status::StatusRecord {
             pending: self.pending.min(u32::MAX as usize) as u32,
@@ -3758,7 +3758,9 @@ impl RequestSummary {
             }),
             warned: self.warned.min(u32::MAX as usize) as u32,
             threshold_s: REQUEST_WARN_AFTER.as_secs() as u32,
-            updated_at_ms,
+            boot_ms,
+            generation: 0,
+            seq: 0,
             pid: std::process::id(),
         }
     }
