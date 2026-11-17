@@ -603,3 +603,14 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `files: WATCH`（`gateway-candidate.log` が 573→2,452 バイト、+1.9 KB）と `closes: WATCH`（11→22）は過剰な警告だった。前者は切断のたびに数行増えるだけの小さい増加、後者は Discord の Reconnect 要求で、増えた切断はすべて Resume で復帰（直前の記録）。
 - ツール側の修正（main 7d7f844）：Gateway を `--shard-id` でも判定／小さいログの増加（100 KiB 未満）は警告しない／`soak-report` に `resumed=`（Resume 成功の件数）を追加し、`soak-diff` は「増えた切断がすべて Resume で復帰」なら `closes` を OK にする（`resumed` を含む記録が 2 件以上たまってから有効。古い形式の記録では従来の規則）。合成のログ 4 種で、OK／WATCH／従来の規則／大きな増加の判定を確認。Oracle への反映と再実行は、ユーザーの出力待ち。
 - **「シングルの完成条件」の 1（最新版の放置 6 時間以上、再起動 0、メモリと fd に増加なし）：** botd と Core については満たしている。Gateway は、再実行の結果で確認する。
+
+## 2026-11-17 夕：P1（停滞の診断）の実装の進捗（ブランチ work/p1、main には未統合）
+
+DDR-0007 に従い、P1 を tmpfs 方式で実装中。**main にはまだ入っていない**（監査の指摘を直している途中）。以下は work/p1 での事実。
+
+- **実装（commit 済み）：** 段階 1（`core_status` モジュール：固定長 64 バイトの記録、CRC-32、書き込みの方針、安全な書き込みと読み取り）、段階 2・2b（Core が `--core-status-file` に書く。tmpfs でなければ書かない。`CLOCK_BOOTTIME`、世代、連番）、段階 3（botd が `--core-status-dir`〔既定 `/run/discord-rs`、tmpfs のときだけ〕を決めて Core に渡し、`status` の各 Core に `status`〔`pending`、`oldest_age_s`、`status_age_s`、`seq`、`suspected_stalled`〕を足す。PID を照合）、段階 4a（Astra の指摘の一部：書き込み側の記述子への `fstatfs`、試験用の旗は debug のみ、`libc` の open フラグ、時計の失敗を `None`）。
+- **測定（WSL、ext4、デバッグビルド）：** アイドルの Core 300 秒で、ディスクへの書き出し（`write_bytes`）は、旧方式（ディスク上のファイル）が 98,304 バイト、**tmpfs 方式が 0**、状態ファイルなしの制御実験が 0。ディスク上の場所を指定すると、ファイルは作られず、書き込みも 0。
+- **実機に近い確認（WSL、リリースビルド、実 Discord の別 Bot、2 シャード、4 つの Core）：** 全 Core が `pending=0`、`suspected_stalled=False`、`seq` が進む。Core 1 本に `SIGSTOP` を送ると、40 秒後に**その Core だけ** `suspected_stalled=True`（age 52 秒、seq 停止）、他の 3 本は `False`。`SIGCONT` で回復。固まって回復した Core の `write_bytes` は 0。botd は応答し続けた。1 回の確認で、systemd・Oracle では未確認。
+- **Astra 第 19 回の監査（7 件）：** (1) tmpfs の確認の隙（bind mount、親の差し替え）、(2) 読み取りが監視を止め得る（NFS 等）、(3) 時計の失敗が「時刻 0」で新しく見える／未来の時刻が停止を隠す、(4) 世代・連番を検証していない（PID の再利用）、(5) tmpfs は swap し得る（「ディスク書き込みゼロ」の保証を狭める）、(6) 「試験専用」の旗が本番にも残る、(7) `O_NOFOLLOW` の値の固定が aarch64 で誤り（以前の監査で直した種類の間違いの再発）。4a で (1)(5 の一部)(6)(7)、時計の失敗の一部を直し、残り（読み取り側 2・3、世代の検証 4）を段階 4b で実装中。**修正の完了と再監査は未了。**
+- **気づき（私の誤り）：** 実機の試験スクリプトで `chmod 0755 /tmp` を実行し、WSL の開発環境の一般ユーザーが `/tmp` に書けなくなった（コンパイルが失敗）。`1777` に戻して復旧。本番（Oracle）には影響なし。
+- **気づき（推測、未確認）：** botd をセッションの終了で強制終了した試験で、Gateway が 2 つ取り残された。systemd の制御グループ下では起きにくいと考えているが、確認していない。
