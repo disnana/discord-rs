@@ -5,7 +5,7 @@
 # 更新（botd の入れ替え）をまたぐと pid の変化がすべて WATCH になるので、更新の後だけを見たいときに使う。
 # 役割（botd / core / gateway）ごとに pid の昇順で「役割#番号」を振る。pid が変われば再起動として WATCH。
 # Core が複数あると再起動で番号が入れ替わり得る。soak-report.sh は cmd を 90 文字で切るため、
-# --core-listen / --core-dir が切れると役割を判定できない（その場合は行が数えられない）。
+# --core-listen / --core-dir が切れても、Gateway は --shard-id（Core には無い）でも判定する。
 set -u
 LOG=${1:-/home/ubuntu/soak.log}
 if [ ! -r "$LOG" ]; then echo "cannot read: $LOG" >&2; exit 2; fi
@@ -43,7 +43,7 @@ procs() { awk -v tag="$2" '
   s && $1 ~ /^[0-9]+$/ && NF >= 5 {
     role = ""
     if (index($0, "--core-listen")) role = "core"
-    else if (index($0, "--core-dir")) role = "gateway"
+    else if (index($0, "--core-dir") || index($0, "--shard-id")) role = "gateway"
     else if (index($0, "bin/botd")) role = "botd"
     if (role == "") next
     n[role]++; print tag, role "#" n[role], $1, $4, $5
@@ -86,7 +86,8 @@ fl() { awk -v tag="$2" '
       st = "OK"
       if (p in sz1) {
         d = sz2[p] - sz1[p]
-        if (sz1[p] > 0 && d * 100 / sz1[p] > 20) st = "WATCH"
+        # 小さいログが数行増えただけ（20% 超でも 100 KiB 未満）は警告しない。ローテーションは 8 MiB。
+        if (sz1[p] > 0 && d * 100 / sz1[p] > 20 && d > 102400) st = "WATCH"
         printf "  %s  %s -> %s (%+d)\n", p, sz1[p], sz2[p], d
       } else printf "  %s  new in last snapshot (%s)\n", p, sz2[p]
       printf "files\t%s\t%s\n", st, p >> V
@@ -106,12 +107,19 @@ jw() { awk '/^--- journal since boot/ { getline x; if (x ~ /^[0-9]+$/) print x; 
 echo "--- counters: first -> last ---"
 a=$(nr "$T/first"); b=$(nr "$T/last")
 echo "NRestarts: ${a:-n/a} -> ${b:-n/a}"
+rx=$(gw "$T/first" resumed); ry=$(gw "$T/last" resumed)
 for K in generations closes worker_unavailable; do
   x=$(gw "$T/first" "$K"); y=$(gw "$T/last" "$K"); echo "$K (sum over gateway.log): $x -> $y"
   if isnum "$x" && isnum "$y"; then
-    if [ "$y" -gt "$x" ]; then add "$K" WATCH "$x->$y"; else add "$K" OK "$x->$y"; fi
+    if [ "$K" = closes ] && isnum "$rx" && isnum "$ry"; then
+      # 切断が増えても、増えた分がすべて Resume で復帰していれば異常ではない（Discord の Reconnect 要求など）。
+      dc=$((y - x)); dr=$((ry - rx))
+      if [ "$dc" -gt "$dr" ]; then add "$K" WATCH "closes +$dc but resumed +$dr (a disconnect without a resume)"
+      else add "$K" OK "closes +$dc, resumed +$dr (every disconnect resumed)"; fi
+    elif [ "$y" -gt "$x" ]; then add "$K" WATCH "$x->$y"; else add "$K" OK "$x->$y"; fi
   else add "$K" NA "n/a"; fi
 done
+echo "resumed (sum over gateway.log): ${rx:-n/a} -> ${ry:-n/a}"
 ja=$(jw "$T/first"); jb=$(jw "$T/last"); echo "journal warnings since boot: $ja -> $jb"
 if isnum "$a" && isnum "$b"; then
   if [ "$b" -gt "$a" ]; then add restarts WATCH "NRestarts $a->$b"; else add restarts OK "NRestarts $a->$b"; fi

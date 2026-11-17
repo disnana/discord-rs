@@ -36,7 +36,7 @@ echo "--- gateway.log signals (counts) ---"
 # name is still counted together with gateway.log.
 for f in $(find "$ROOT" -name gateway.log 2>/dev/null); do
   d=$(dirname "$f"); logs="$f"; [ -f "$d/gateway-candidate.log" ] && logs="$f $d/gateway-candidate.log"
-  echo "$(basename "$d"): generations=$(cat $logs | grep -c 'gateway generation')"        "login=$(cat $logs | grep -c 'ログイン成功') closes=$(cat $logs | grep -c 'Gateway 切断')"        "worker_unavailable=$(cat $logs | grep -c 'unavailable') rest_unknown=$(cat $logs | grep -c '結果不明')"
+  echo "$(basename "$d"): generations=$(cat $logs | grep -c 'gateway generation')"        "login=$(cat $logs | grep -c 'ログイン成功') closes=$(cat $logs | grep -c 'Gateway 切断')"        "worker_unavailable=$(cat $logs | grep -c 'unavailable') rest_unknown=$(cat $logs | grep -c '結果不明') resumed=$(cat $logs | grep -c 'Resume 成功')"
 done
 echo "core duplicates dropped (last): $(grep -h '重複したメッセージ' "$ROOT"/*/*/ipc/core-*.log 2>/dev/null | tail -n 1)"
 
