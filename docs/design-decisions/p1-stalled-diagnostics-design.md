@@ -1,6 +1,7 @@
 # P1 の設計案：停滞の診断を daemon から照会できるようにする
 
 - 日付: 2026-11-17
+- **2026-11-17 の更新（[DDR-0007](discussion-records/0007-p1-tmpfs-and-cutover-order.md)）：Astra と Sol のレビューと、私の実測（アイドルの Core、300 秒で書き込み 84 回・ディスクへ 98,304 バイト。状態ファイルなしの制御実験は 0）により、「ディスク上のファイルで I/O を最低限にする」方式は、条件を満たさないと分かった。ユーザーが、`tmpfs`（`/run/discord-rs/`）方式への変更を了承した。** 下の「ディスク上のファイル」「1 ファイルあたり 30 秒に最大 1 ページ」「CRC がすべての破損を検出」「壁時計（UNIX ミリ秒）」「PID だけで照合」の記述は、**置き換えられた**。新しい方式：**tmpfs 上のファイル（起動時に `statfs` で tmpfs を確認し、違えば機能を無効にする。ディスクには書かない）、単調時計（`CLOCK_BOOTTIME`）、Core の起動ごとの識別子（世代）と連番を記録に入れる、botd は自分が起動した Core の PID と一致するかも確認、表示は「停滞の疑い」（確定ではない）。** 下の本文は、当初の設計のまま残している。
 - 状態: **設計案（方向は DDR-0002・DDR-0006 で了承済み）。具体的な方式について、ユーザーは 2026-11-17 に「I/O 負荷が最低限なら可能」と回答（条件つきの了承）。その条件を満たすため、下の「I/O 負荷の予算」の方式に改めた。それ以外の細部（判定の秒数、名前）は提案のまま（異論があれば変更する）。未実装。**
 - 関連: [DDR-0002](discussion-records/0002-stalled-core-management.md)、[DDR-0003](discussion-records/0003-old-core-timeout-diagnostics.md)、[DDR-0006](discussion-records/0006-proposals-accepted-2026-11-17.md)、[proposals-2026-11-17.md](proposals-2026-11-17.md)（提案 2 の P1）、[01-stuck-handler.md](01-stuck-handler.md)
 
