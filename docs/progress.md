@@ -640,3 +640,5 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `closes` 25→27（+2）、`resumed` 18→22（+4）。**両者の増分が一致しない理由は未確認**（集計の対象が異なる可能性。ログの個別確認はしていない）。Identify が増えたかは、この数値からは断定しない。
 - 「新版の放置 6 時間以上、異常なし」の条件は満たした（1 Shard・1 Bot・Oracle のみ）。`!ping`・`!count`・`!workers` の Discord での応答は、ユーザーの確認結果がまだ記録されていない。
 - **未確認のまま：** OS 再起動後の自動起動（Oracle は「System restart required」。カーネルの更新待ち）、`!workers` の更新中の実機確認、Interaction の重複、複数 Bot・3 Shard 以上の実機、P1 の Oracle での有効化。
+
+- **2026-11-18（ユーザーの報告）：** Oracle 新版での Discord のコマンドは動作した（ユーザーが「コマンドは行けた」と報告。どのコマンドか個別には記録されていない。`!workers` の内容と、更新中の挙動は別途未確認）。
