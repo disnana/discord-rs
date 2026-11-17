@@ -128,6 +128,7 @@ struct Slot {
     started_at: Option<Instant>,
     failures: u32,
     next_start: Option<Instant>,
+    status_id: Option<u64>,
 }
 
 impl Slot {
@@ -138,6 +139,7 @@ impl Slot {
             started_at: None,
             failures: 0,
             next_start: None,
+            status_id: None,
         }
     }
 }
@@ -162,6 +164,7 @@ pub struct CoreStatus {
     pub failures: u32,
     pub pid: Option<u32>,
     pub status_path: Option<PathBuf>,
+    pub status_id: Option<u64>,
 }
 
 impl CoreUnits {
@@ -207,6 +210,7 @@ impl CoreUnits {
                 running: slot.child.is_some(),
                 failures: slot.failures,
                 pid: slot.child.as_ref().map(Child::id),
+                status_id: slot.status_id,
                 status_path: self
                     .status_dir
                     .as_ref()
@@ -248,14 +252,32 @@ impl CoreUnits {
             .arg("--core-listen")
             .arg(socket_path(&self.dir, index))
             .arg("--core-persist");
+        let mut status_id = None;
         if let Some(dir) = self
             .status_dir
             .as_ref()
             .filter(|dir| self.status_allow_non_tmpfs || crate::core_status::is_tmpfs(dir))
         {
+            let path = dir.join(format!("core-{index}.status"));
+            if let Ok(meta) = std::fs::symlink_metadata(&path)
+                && meta.file_type().is_file()
+                && meta.uid() == unsafe { libc::geteuid() }
+            {
+                let _ = std::fs::remove_file(&path);
+            }
+            let id = loop {
+                let id =
+                    getrandom::u64().map_err(|_| std::io::Error::other("core status random"))?;
+                if id != 0 {
+                    break id;
+                }
+            };
+            status_id = Some(id);
             command
                 .arg("--core-status-file")
-                .arg(dir.join(format!("core-{index}.status")));
+                .arg(path)
+                .arg("--core-status-id")
+                .arg(id.to_string());
             if self.status_allow_non_tmpfs {
                 command.arg("--core-status-allow-non-tmpfs");
             }
@@ -289,6 +311,7 @@ impl CoreUnits {
             return Err(std::io::Error::other("core secret delivery"));
         }
         let slot = &mut self.slots[index];
+        slot.status_id = status_id;
         slot.child = Some(child);
         slot.stdin = Some(stdin);
         slot.started_at = Some(now);

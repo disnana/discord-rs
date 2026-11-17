@@ -797,15 +797,26 @@ pub mod control {
     fn core_status_view(
         core: &crate::core_units::CoreStatus,
         read: crate::core_status::StatusRead,
+        last: &mut Option<(u64, u64, u64)>,
     ) -> serde_json::Value {
         use crate::core_status::StatusRead;
         use serde_json::json;
         let mut view = json!({"running": core.running, "failures": core.failures, "status": null});
+        if last.is_some_and(|(id, _, _)| Some(id) != core.status_id) {
+            *last = None;
+        }
         let reason = match read {
             StatusRead::Fresh {
                 record,
                 status_age_s,
-            } if Some(record.pid) == core.pid => {
+            } if Some(record.pid) == core.pid && Some(record.generation) == core.status_id => {
+                if last
+                    .is_some_and(|(_, seq, boot_ms)| record.seq < seq || record.boot_ms < boot_ms)
+                {
+                    view["status_reason"] = json!("regressed");
+                    return view;
+                }
+                *last = Some((record.generation, record.seq, record.boot_ms));
                 view["status"] = json!({"pending": record.pending, "oldest_age_s": record.oldest_age_s, "warned": record.warned, "threshold_s": record.threshold_s, "status_age_s": status_age_s, "suspected_stalled": status_age_s >= 30, "generation": record.generation, "seq": record.seq});
                 return view;
             }
@@ -833,7 +844,9 @@ pub mod control {
             failures: 3,
             pid: Some(42),
             status_path: None,
+            status_id: Some(7),
         };
+        let mut last = None;
         let record = StatusRecord {
             pending: 2,
             oldest_age_s: 4,
@@ -851,6 +864,7 @@ pub mod control {
                     record,
                     status_age_s: age,
                 },
+                &mut last,
             );
             assert_eq!(view["status"]["suspected_stalled"], suspected);
             assert_eq!(view["status"]["pending"], 2);
@@ -871,10 +885,89 @@ pub mod control {
                 "stale_generation",
             ),
         ] {
-            let view = core_status_view(&core, read);
+            let view = core_status_view(&core, read, &mut last);
             assert!(view["status"].is_null());
             assert_eq!(view["status_reason"], reason);
         }
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn status_view_checks_incarnation_and_monotonicity() {
+        use crate::core_status::{StatusRead, StatusRecord};
+        let mut core = crate::core_units::CoreStatus {
+            running: true,
+            failures: 0,
+            pid: Some(42),
+            status_path: None,
+            status_id: Some(7),
+        };
+        let record = StatusRecord {
+            pending: 0,
+            oldest_age_s: 0,
+            warned: 0,
+            threshold_s: 30,
+            boot_ms: 100,
+            pid: 42,
+            generation: 7,
+            seq: 9,
+        };
+        let mut last = None;
+        let read = |record, status_age_s| StatusRead::Fresh {
+            record,
+            status_age_s,
+        };
+        assert_eq!(
+            core_status_view(&core, read(record, 0), &mut last)["status"]["seq"],
+            9
+        );
+        assert_eq!(
+            core_status_view(
+                &core,
+                read(
+                    StatusRecord {
+                        generation: 8,
+                        ..record
+                    },
+                    0
+                ),
+                &mut last
+            )["status_reason"],
+            "stale_generation"
+        );
+        assert_eq!(
+            core_status_view(&core, read(StatusRecord { seq: 8, ..record }, 0), &mut last)["status_reason"],
+            "regressed"
+        );
+        assert_eq!(
+            core_status_view(&core, read(record, 30), &mut last)["status"]["suspected_stalled"],
+            true
+        );
+        assert_eq!(
+            core_status_view(
+                &core,
+                read(
+                    StatusRecord {
+                        boot_ms: 99,
+                        ..record
+                    },
+                    0
+                ),
+                &mut last
+            )["status_reason"],
+            "regressed"
+        );
+        core.status_id = Some(8);
+        let next = StatusRecord {
+            generation: 8,
+            seq: 1,
+            boot_ms: 1,
+            ..record
+        };
+        assert_eq!(
+            core_status_view(&core, read(next, 0), &mut last)["status"]["seq"],
+            1
+        );
     }
 
     pub const NOTE: &str = "Local process status only; Discord readiness, Core drain, ownership and leases are not verified.";
@@ -1051,6 +1144,11 @@ pub mod control {
         update_stage: UpdateStage,
     }
 
+    /// Per Core slot: the last accepted status record as (incarnation id, seq, boot_ms), used to
+    /// reject regressions within one incarnation (see `core_status_view`).
+    #[cfg(unix)]
+    type CoreStatusHistory = std::sync::Mutex<BTreeMap<(ShardKey, usize), Option<(u64, u64, u64)>>>;
+
     /// One owner serializes admissions; independent Bot operations advance on
     /// ticks while clients may read status. History never evicts accepted IDs:
     /// at capacity new operations fail before any side effect. It is not durable.
@@ -1070,6 +1168,8 @@ pub mod control {
         // Shared across records: a failed truncate must not quarantine the same tail again
         // when a different request or pending record next tries to append.
         audit_tail: std::sync::Mutex<Option<AuditTailRepair>>,
+        #[cfg(unix)]
+        core_status_history: CoreStatusHistory,
     }
 
     const AUDIT_SCAN_BYTES: usize = 8 * 1024;
@@ -1446,6 +1546,8 @@ pub mod control {
                 pending_audit: Vec::new(),
                 audit_retry_at: None,
                 audit_tail: std::sync::Mutex::new(None),
+                #[cfg(unix)]
+                core_status_history: std::sync::Mutex::new(BTreeMap::new()),
             }
         }
 
@@ -1476,13 +1578,22 @@ pub mod control {
                 Value::Array(
                     cores
                         .iter()
-                        .map(|core| {
+                        .enumerate()
+                        .map(|(index, core)| {
                             let read = core
                                 .status_path
                                 .as_ref()
                                 .map(|path| crate::core_status::read_status(path))
                                 .unwrap_or(crate::core_status::StatusRead::Missing);
-                            core_status_view(core, read)
+                            let mut history = self
+                                .core_status_history
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            core_status_view(
+                                core,
+                                read,
+                                history.entry((key.clone(), index)).or_default(),
+                            )
                         })
                         .collect(),
                 )

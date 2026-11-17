@@ -129,3 +129,6 @@ Cargo build and tests, real Discord, Oracle, systemd RuntimeDirectory on a real 
 P1 audit round 19 is incomplete: launch incarnation and sequence regression checks and their tests remain outstanding. Reader-side tmpfs and clock checks were added in STEP 4b-1 but have not been built or tested. Status reads are synchronous 64-byte reads of tmpfs files behind parent and opened-descriptor checks; a hostile replacement of the status directory by an unreachable hard-mounted network filesystem could stall the control path in theory (requiring root-level control of `/run/discord-rs`). A bounded background reader with cached results is not implemented.
 
 The intended guarantee is no file data written to a disk-backed filesystem: the status file lives on tmpfs, whose pages can be swapped under memory pressure because the kernel `noswap` option is not enforced. This is zero file writeback in normal operation, not an absolute zero. The recorded idle 300 s measurement was `write_bytes` 0; the present changes have not been remeasured.
+
+Work in progress: botd assigns a nonzero incarnation ID, attempts stale-file removal, and reports a generation mismatch as `stale_generation`; Core writer integration is still missing.
+A decreasing seq or boot_ms within the same incarnation is reported as `regressed`; this change has not been verified against a real server.

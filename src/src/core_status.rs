@@ -203,22 +203,37 @@ mod file_io {
         }
 
         pub fn open_checked(path: &Path, require_tmpfs: bool) -> Option<StatusWriter> {
-            Self::open_checked_inner(path, require_tmpfs, true)
+            Self::open_checked_with_id(path, require_tmpfs, None)
+        }
+
+        /// Like `open_checked`, but the record's `generation` is the incarnation id botd chose
+        /// for this Core launch (`--core-status-id`). `None` or `Some(0)` falls back to a random
+        /// non-zero id (old botd, tests), so a Core never publishes generation 0.
+        pub fn open_checked_with_id(
+            path: &Path,
+            require_tmpfs: bool,
+            incarnation: Option<u64>,
+        ) -> Option<StatusWriter> {
+            Self::open_checked_inner(path, require_tmpfs, true, incarnation)
         }
 
         fn open_checked_inner(
             path: &Path,
             require_tmpfs: bool,
             check_parent: bool,
+            incarnation: Option<u64>,
         ) -> Option<StatusWriter> {
             if require_tmpfs && check_parent && !is_tmpfs(path.parent()?) {
                 return None;
             }
-            let generation = loop {
-                let value = getrandom::u64().ok()?;
-                if value != 0 {
-                    break value;
-                }
+            let generation = match incarnation.filter(|value| *value != 0) {
+                Some(value) => value,
+                None => loop {
+                    let value = getrandom::u64().ok()?;
+                    if value != 0 {
+                        break value;
+                    }
+                },
             };
             let mut options = OpenOptions::new();
             options
@@ -291,7 +306,7 @@ mod file_io {
                 getrandom::u64().unwrap()
             ));
             assert!(!path.exists());
-            assert!(StatusWriter::open_checked_inner(&path, true, false).is_none());
+            assert!(StatusWriter::open_checked_inner(&path, true, false, None).is_none());
             assert!(!path.exists());
         }
 

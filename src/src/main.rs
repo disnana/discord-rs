@@ -972,6 +972,7 @@ async fn run() -> Result<(), AppError> {
         let mut lifetime = src::core_server::Lifetime::OneConnection;
         let mut floor = 0;
         let mut status_path = None;
+        let mut status_id = None;
         let mut require_tmpfs = true;
         let mut interval = None;
         let mut i = 2;
@@ -997,6 +998,16 @@ async fn run() -> Result<(), AppError> {
                 }
                 status_path = Some(path);
                 i += 2;
+            } else if args[i] == "--core-status-id" && status_id.is_none() {
+                status_id = Some(
+                    args.get(i + 1)
+                        .and_then(|v| v.to_str())
+                        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v != 0)
+                        .ok_or(StartupFailure::InvalidArguments)?,
+                );
+                i += 2;
             } else if cfg!(debug_assertions)
                 && args[i] == "--core-status-allow-non-tmpfs"
                 && require_tmpfs
@@ -1021,6 +1032,9 @@ async fn run() -> Result<(), AppError> {
                 return Err(StartupFailure::InvalidArguments.into());
             }
         }
+        if status_id.is_some() && status_path.is_none() {
+            return Err(StartupFailure::InvalidArguments.into());
+        }
         if floor > 0 && lifetime != src::core_server::Lifetime::UntilStopped {
             return Err(StartupFailure::InvalidArguments.into());
         }
@@ -1030,6 +1044,7 @@ async fn run() -> Result<(), AppError> {
                 lifetime,
                 floor,
                 status_path,
+                status_id,
                 require_tmpfs,
                 std::time::Duration::from_millis(ms),
             )
@@ -1040,6 +1055,7 @@ async fn run() -> Result<(), AppError> {
             lifetime,
             floor,
             status_path,
+            status_id,
             require_tmpfs,
         )
         .await;

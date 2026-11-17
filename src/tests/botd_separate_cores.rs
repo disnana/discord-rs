@@ -797,6 +797,84 @@ async fn status_heartbeat_detects_a_stopped_core() {
 }
 
 #[tokio::test]
+async fn status_restart_replaces_incarnation_and_preplanted_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let shm = Path::new("/dev/shm");
+    if !src::core_status::is_tmpfs(shm) {
+        return;
+    }
+    let dir = shm.join(format!(
+        "botd-status-restart-{}-{}",
+        std::process::id(),
+        src::core_status::boot_ms()
+    ));
+    let slot_dir = dir.join("bot-313031").join("shard-0");
+    std::fs::create_dir_all(&slot_dir).unwrap();
+    for path in [&dir, &dir.join("bot-313031"), &slot_dir] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let foreign = src::core_status::StatusRecord {
+        pending: 0,
+        oldest_age_s: 0,
+        warned: 0,
+        threshold_s: 30,
+        boot_ms: src::core_status::boot_ms(),
+        pid: std::process::id(),
+        generation: u64::MAX,
+        seq: 1,
+    };
+    let stale = slot_dir.join("core-0.status");
+    std::fs::write(&stale, foreign.encode()).unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let fixture = Fixture::start_options(
+        None,
+        &[
+            "--core-status-dir",
+            dir.to_str().unwrap(),
+            "--core-status-interval-ms",
+            "100",
+        ],
+    )
+    .await;
+    let gateway = fixture.accept().await;
+    let pids = worker_pids(&gateway.ready);
+    let first = bounded(async {
+        loop {
+            let views = daemon_core_views(fixture.port).await;
+            assert_ne!(views[0]["status"]["generation"], foreign.generation);
+            if let Some(id) = views[0]["status"]["generation"].as_u64() {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    signal(pids[0], "KILL");
+    bounded(async {
+        loop {
+            let views = daemon_core_views(fixture.port).await;
+            if let Some(id) = views[0]["status"]["generation"].as_u64()
+                && id != first
+            {
+                assert!(views[0]["status"]["seq"].as_u64().unwrap() < 100);
+                assert!(views[0].get("status_reason").is_none());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let view = &daemon_core_views(fixture.port).await[0];
+    assert_ne!(view["status"]["generation"], first);
+    assert!(view["status"]["generation"].as_u64().is_some());
+    assert!(view.get("status_reason").is_none());
+    signal(fixture.daemon.id().unwrap(), "TERM");
+    drop(fixture);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn absent_default_directory_disables_status() {
     if Path::new("/run/discord-rs").exists() {
         eprintln!("skipping: /run/discord-rs exists");

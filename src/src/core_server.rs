@@ -357,6 +357,7 @@ pub async fn run(
     lifetime: Lifetime,
     floor: u64,
     status_path: Option<PathBuf>,
+    status_id: Option<u64>,
     require_tmpfs: bool,
 ) -> Result<(), AppError> {
     run_with_status_interval(
@@ -364,6 +365,7 @@ pub async fn run(
         lifetime,
         floor,
         status_path,
+        status_id,
         require_tmpfs,
         Duration::from_secs(5),
     )
@@ -376,6 +378,7 @@ pub async fn run_with_status_interval(
     lifetime: Lifetime,
     floor: u64,
     status_path: Option<PathBuf>,
+    status_id: Option<u64>,
     require_tmpfs: bool,
     interval: Duration,
 ) -> Result<(), AppError> {
@@ -394,7 +397,9 @@ pub async fn run_with_status_interval(
     }
     let status = status_path
         .filter(|path| path.is_absolute() && !interval.is_zero())
-        .and_then(|path| crate::core_status::StatusWriter::open_checked(&path, require_tmpfs))
+        .and_then(|path| {
+            crate::core_status::StatusWriter::open_checked_with_id(&path, require_tmpfs, status_id)
+        })
         .map(|writer| (writer, interval));
     let result = serve_with_status(listener, secret, None, lifetime, floor, status).await;
     if lifetime == Lifetime::UntilStopped {
