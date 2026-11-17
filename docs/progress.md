@@ -622,3 +622,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `closes` は 11→24（判定 WATCH）。増分 13 件は、先の分析（Resume のみ、Identify 0、平均約 1.7 時間間隔）と件数が一致する。ただしこの版のログには `resumed=` がなく、今回の集計では Resume か Identify かを**確認していない**（先の分析は個別ログの読みによる）。
 - Gateway RSS は +28 kB/h と微増。25 時間で +0.7 MB であり、リークの断定も否定もできない（要・さらに長い観測）。
 - **未確認のまま：** Oracle は最新 main（ログ統一・B3・`!workers`・P1）を受け取っていない。OS 再起動後の自動起動は未検証。
+
+## 2026-11-17 P3（手動復旧）の設計案を作成
+- `docs/design-decisions/p3-manual-core-recovery-design.md`（**設計案のみ。未承認・未実装**）。`botctl core restart`（仮名）：対象を incarnation id で固定、`admin`＋shard の scope、シャード単位の排他（更新中は拒否）、スロットごとの回数制限（60 秒・15 分に 3 回、初期値案）、「最後の稼働中の Core」の確認、要求を先に監査に記録、botd 自身の `Child` のハンドルで終了（外部の PID 指定の `kill` はしない）。
+- 保証しないこと（文書に明記）：強制終了した Core の処理中イベントは完了しない、未受領の REST は結果不明になり得る、再起動後の重複排除の記憶は空。
+- **未確認：** 停滞した Core が stdin の EOF に反応するか（猶予の長さ）、既存の `operation` 照会に載せられるか。実装・試験・実機検証は未着手。
+- 決めてほしい項目は設計書の 9 章（D-P3-0〜5）。

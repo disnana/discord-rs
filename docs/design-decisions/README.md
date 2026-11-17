@@ -12,6 +12,7 @@
 | [reconciliation-with-ddr.md](reconciliation-with-ddr.md) | DDR と、この `design-decisions/` の資料・現在のコードとの**食い違いの一覧**と、次に決めること |
 | [proposals-2026-11-17.md](proposals-2026-11-17.md) | **DDR で残った 3 つの判断への Claude の提案**（基盤の状態の引き継ぎ、止まったハンドラの段階的な対処、03 の書き換え骨子）。**2026-11-17 にユーザーが了承**（[DDR-0006](discussion-records/0006-proposals-accepted-2026-11-17.md)）。未実装 |
 | [p1-stalled-diagnostics-design.md](p1-stalled-diagnostics-design.md) | **P1（停滞の診断を daemon から照会できる）の設計案**。Core が状態を小さなファイルに書き、botd が読む方式（botd が Core の IPC に接続すると Gateway を締め出す危険があるため）。方向は了承済み、具体的な方式はユーザーの確認前。未実装 |
+| [p3-manual-core-recovery-design.md](p3-manual-core-recovery-design.md) | **P3（認証・監査つきの Core 手動復旧）の設計案**。incarnation 固定・排他・回数制限・退役世代の上限・監査。**未承認・未実装**。決めてほしい項目あり（9 章） |
 | [review-2026-11-17-astra-sol.md](review-2026-11-17-astra-sol.md) | **Astra と Sol の設計レビュー（ウェブ検索つき、独立）**。2 人が一致した指摘：P1 は tmpfs と単調時計に、差し替えは受け付けの壁と最終の重複排除の引き継ぎに、nonce は操作ごとに固定して本文全体の JSON で、Identify は Bot ごとに調整。私の I/O の実測も記載 |
 
 ## テーマ別の設計・対応案
