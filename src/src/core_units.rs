@@ -28,6 +28,8 @@ const STABLE_AFTER: Duration = Duration::from_secs(60);
 const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// How often a running Core log is checked for size.
 const LOG_CHECK_EVERY: Duration = Duration::from_secs(60);
+const MANUAL_STOP_GRACE: Duration = Duration::from_secs(5);
+const MANUAL_REAP_GRACE: Duration = Duration::from_secs(5);
 
 /// Keeps a log that processes append to from growing without bound: when it is over
 /// `max_bytes`, its content is copied to `<path>.1` (replacing an older copy) and the file is
@@ -93,7 +95,11 @@ pub fn open_append_private(path: &Path) -> std::io::Result<std::fs::File> {
         fn geteuid() -> u32;
     }
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).append(true).mode(0o600);
+    options
+        .read(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let (file, before) = match options.create_new(true).open(path) {
         Ok(file) => (file, None),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -129,6 +135,22 @@ struct Slot {
     failures: u32,
     next_start: Option<Instant>,
     status_id: Option<u64>,
+    manual_restart: Option<ManualRestart>,
+    // 起動失敗などで回収できていない Child は、終了を確認するまで保持する。
+    reap_only: bool,
+}
+
+struct ManualRestart {
+    kill_at: Instant,
+    reap_by: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualRestartError {
+    KillFailed,
+    ReapFailed,
+    ReapTimedOut,
+    LaunchFailed,
 }
 
 impl Slot {
@@ -140,6 +162,8 @@ impl Slot {
             failures: 0,
             next_start: None,
             status_id: None,
+            manual_restart: None,
+            reap_only: false,
         }
     }
 }
@@ -207,7 +231,7 @@ impl CoreUnits {
             .iter()
             .enumerate()
             .map(|(index, slot)| CoreStatus {
-                running: slot.child.is_some(),
+                running: slot.child.is_some() && !slot.reap_only,
                 failures: slot.failures,
                 pid: slot.child.as_ref().map(Child::id),
                 status_id: slot.status_id,
@@ -217,6 +241,81 @@ impl CoreUnits {
                     .map(|dir| dir.join(format!("core-{index}.status"))),
             })
             .collect()
+    }
+
+    pub(crate) fn prepared(&self) -> bool {
+        self.prepared
+    }
+
+    pub(crate) fn manual_restart_status(&mut self) -> std::io::Result<Vec<CoreStatus>> {
+        let mut statuses = self.status();
+        for (slot, status) in self.slots.iter_mut().zip(&mut statuses) {
+            if let Some(child) = &mut slot.child {
+                // try_wait の結果は Child にも保持される。通常の回収や失敗回数の更新は
+                // スーパーバイザーに任せ、ここでは稼働中かどうかだけを判定する。
+                status.running &= child.try_wait()?.is_none();
+            }
+        }
+        Ok(statuses)
+    }
+
+    pub(crate) fn begin_manual_restart(&mut self, index: usize, now: Instant) {
+        let slot = &mut self.slots[index];
+        debug_assert!(slot.manual_restart.is_none());
+        slot.manual_restart = Some(ManualRestart {
+            kill_at: now + MANUAL_STOP_GRACE,
+            reap_by: None,
+        });
+        slot.stdin = None;
+        slot.next_start = None;
+    }
+
+    pub(crate) fn cancel_manual_restart(&mut self, index: usize) {
+        let slot = &mut self.slots[index];
+        slot.manual_restart = None;
+        slot.reap_only = slot.child.is_some();
+    }
+
+    /// 終了を確認してから新しいプロセスを起動する。子の終了を待つ呼び出しは行わない。
+    pub(crate) fn poll_manual_restart(
+        &mut self,
+        index: usize,
+        program: &Path,
+        now: Instant,
+    ) -> Option<Result<(), ManualRestartError>> {
+        let slot = &mut self.slots[index];
+        let restart = slot.manual_restart.as_mut().expect("manual restart active");
+        if let Some(child) = &mut slot.child {
+            let failure = match child.try_wait() {
+                Ok(Some(_)) => None,
+                Err(_) => Some(ManualRestartError::ReapFailed),
+                Ok(None) => {
+                    let reason = if let Some(deadline) = restart.reap_by {
+                        (now >= deadline).then_some(ManualRestartError::ReapTimedOut)
+                    } else if now >= restart.kill_at {
+                        restart.reap_by = Some(now + MANUAL_REAP_GRACE);
+                        child.kill().err().map(|_| ManualRestartError::KillFailed)
+                    } else {
+                        None
+                    };
+                    if reason.is_none() {
+                        return None;
+                    }
+                    reason
+                }
+            };
+            if let Some(reason) = failure {
+                self.cancel_manual_restart(index);
+                return Some(Err(reason));
+            }
+        }
+        slot.child = None;
+        slot.manual_restart = None;
+        let result = self.start_slot(index, program, now).map_err(|_| {
+            self.slots[index].next_start = Some(now + restart_delay(self.slots[index].failures));
+            ManualRestartError::LaunchFailed
+        });
+        Some(result)
     }
 
     /// Starts every Core that is not running. The first call also prepares the private
@@ -230,7 +329,7 @@ impl CoreUnits {
         }
         let now = Instant::now();
         for index in 0..self.slots.len() {
-            if self.slots[index].child.is_none() {
+            if self.slots[index].child.is_none() && self.slots[index].manual_restart.is_none() {
                 self.start_slot(index, program, now)?;
             }
         }
@@ -267,7 +366,12 @@ impl CoreUnits {
             }
             // The diagnostic must never gate Core recovery: if the random draw fails, this launch
             // simply has no status file (the view reports it as unsupported) and the Core starts.
-            let id = (0..4).find_map(|_| getrandom::u64().ok().filter(|id| *id != 0));
+            let previous = self.slots[index].status_id;
+            let id = (0..4).find_map(|_| {
+                getrandom::u64()
+                    .ok()
+                    .filter(|id| *id != 0 && Some(*id) != previous)
+            });
             if let Some(id) = id {
                 status_id = Some(id);
                 command
@@ -299,19 +403,21 @@ impl CoreUnits {
             // Terminal Ctrl-C targets botd's foreground group; botd stops Cores itself.
             .process_group(0);
         let mut child = command.spawn()?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("core stdin"))?;
-        if write_secret(&mut stdin, &secret).is_err() {
+        let slot = &mut self.slots[index];
+        let stdin = child.stdin.take().and_then(|mut stdin| {
+            write_secret(&mut stdin, &secret).ok()?;
+            Some(stdin)
+        });
+        if stdin.is_none() {
             let _ = child.kill();
-            let _ = child.wait();
+            slot.child = Some(child);
+            slot.reap_only = true;
             return Err(std::io::Error::other("core secret delivery"));
         }
-        let slot = &mut self.slots[index];
+        slot.reap_only = false;
         slot.status_id = status_id;
         slot.child = Some(child);
-        slot.stdin = Some(stdin);
+        slot.stdin = stdin;
         slot.started_at = Some(now);
         slot.next_start = None;
         Ok(())
@@ -331,12 +437,23 @@ impl CoreUnits {
             }
         }
         for index in 0..self.slots.len() {
-            let exited = matches!(
-                self.slots[index].child.as_mut().map(Child::try_wait),
-                Some(Ok(Some(_)) | Err(_))
-            );
+            let slot = &mut self.slots[index];
+            if slot.manual_restart.is_some() {
+                continue;
+            }
+            if slot.reap_only {
+                if let Some(child) = &mut slot.child {
+                    if !matches!(child.try_wait(), Ok(Some(_))) {
+                        continue;
+                    }
+                    slot.child = None;
+                }
+                slot.reap_only = false;
+                slot.next_start
+                    .get_or_insert_with(|| now + restart_delay(slot.failures));
+            }
+            let exited = matches!(slot.child.as_mut().map(Child::try_wait), Some(Ok(Some(_))));
             if exited {
-                let slot = &mut self.slots[index];
                 slot.child = None;
                 slot.stdin = None;
                 let lived = slot.started_at.map_or(Duration::ZERO, |at| now - at);
@@ -345,10 +462,7 @@ impl CoreUnits {
                 } else {
                     slot.failures.saturating_add(1)
                 };
-                let delay = BASE_BACKOFF
-                    .saturating_mul(1u32 << slot.failures.saturating_sub(1).min(8))
-                    .min(MAX_BACKOFF);
-                slot.next_start = Some(now + delay);
+                slot.next_start = Some(now + restart_delay(slot.failures));
                 eprintln!("Coreが終了しました（slot {index}）。再起動を予定します");
             }
             let due = self.slots[index].child.is_none()
@@ -394,6 +508,7 @@ impl CoreUnits {
             }
             slot.child = None;
             slot.stdin = None;
+            slot.reap_only = false;
         }
     }
 
@@ -404,6 +519,12 @@ impl CoreUnits {
             self.prepared = false;
         }
     }
+}
+
+fn restart_delay(failures: u32) -> Duration {
+    BASE_BACKOFF
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(8))
+        .min(MAX_BACKOFF)
 }
 
 /// 64 hex digits and a newline from a fixed buffer that is wiped right after the write.
@@ -444,6 +565,86 @@ fn open_log(dir: &Path, index: usize) -> Option<std::fs::File> {
         .ok()?;
     writeln!(file, "--- core slot {index} start ---").ok()?;
     Some(file)
+}
+
+#[cfg(test)]
+mod manual_restart_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn manual_restart_kills_after_grace_and_preserves_failures() {
+        let dir = std::env::temp_dir().join(format!("cr-{:016x}", getrandom::u64().unwrap()));
+        std::fs::create_dir(&dir).unwrap();
+        let program = dir.join("child");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nIFS= read -r capability || exit 1\nwhile IFS= read -r line; do :; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let core_dir = dir.join("core");
+        let mut cores = CoreUnits::new(core_dir, BotId(7), Shard::new(0, 1).unwrap());
+        cores.configure_status(Some(dir.clone()), true, None);
+        cores.ensure(&program).unwrap();
+        let mut old = cores.slots[0].child.take().unwrap();
+        cores.slots[0].stdin = None;
+        old.wait().unwrap();
+        // sleep は stdin の EOF では止まらないため、猶予後の経路を試せる。
+        let mut old = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        cores.slots[0].stdin = old.stdin.take();
+        cores.slots[0].child = Some(old);
+        cores.slots[0].failures = 6;
+        let before = cores.status();
+        let now = Instant::now();
+        cores.begin_manual_restart(0, now);
+        assert!(cores.slots[0].stdin.is_none());
+        cores.poll(&program, true);
+        assert_eq!(cores.status(), before);
+        assert_eq!(
+            cores.poll_manual_restart(
+                0,
+                &program,
+                now + MANUAL_STOP_GRACE - Duration::from_millis(1)
+            ),
+            None
+        );
+        assert!(
+            cores.slots[0]
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        let due = now + MANUAL_STOP_GRACE;
+        assert_eq!(cores.poll_manual_restart(0, &program, due), None);
+        assert_eq!(
+            cores.slots[0].manual_restart.as_ref().unwrap().reap_by,
+            Some(due + MANUAL_REAP_GRACE)
+        );
+        let timeout = Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let Some(result) = cores.poll_manual_restart(0, &program, due) {
+                break result;
+            }
+            assert!(Instant::now() < timeout, "test child did not exit");
+            std::thread::yield_now();
+        };
+        let after = cores.status();
+        cores.kill();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(after[0].failures, 6);
+        assert_ne!(after[0].status_id, before[0].status_id);
+        assert!(after[0].running);
+        assert_eq!(after[1], before[1]);
+    }
 }
 
 #[cfg(test)]

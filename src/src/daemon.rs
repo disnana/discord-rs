@@ -801,7 +801,10 @@ pub mod control {
     ) -> serde_json::Value {
         use crate::core_status::StatusRead;
         use serde_json::json;
-        let mut view = json!({"running": core.running, "failures": core.failures, "status": null});
+        let mut view = json!({
+            "running": core.running, "failures": core.failures, "status": null,
+            "incarnation": core.status_id.map(|id| format!("{id:016x}")),
+        });
         if last.is_some_and(|(id, _, _)| Some(id) != core.status_id) {
             *last = None;
         }
@@ -1001,6 +1004,13 @@ pub mod control {
         /// Pin a selector resolved from a prior Bot listing to its exact identity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expect_bot_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shard: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub core: Option<u32>,
+        /// 16 桁の非ゼロの 16 進文字列。JSON の数値精度に依存しない。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expect_incarnation: Option<String>,
     }
 
     impl CommandRequest {
@@ -1021,11 +1031,22 @@ pub mod control {
 
         /// Sorted Shard filter, or `None` for the whole Bot.
         fn shard_filter(&self) -> Option<Vec<u32>> {
+            if self.command == "core-restart" {
+                return self.shard.map(|shard| vec![shard]);
+            }
             self.shards.as_ref().map(|list| {
                 let mut sorted = list.clone();
                 sorted.sort_unstable();
                 sorted
             })
+        }
+
+        fn incarnation(&self) -> Option<u64> {
+            let id = self.expect_incarnation.as_deref()?;
+            if id.len() != 16 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            u64::from_str_radix(id, 16).ok().filter(|&id| id != 0)
         }
 
         pub fn valid(&self) -> bool {
@@ -1055,11 +1076,25 @@ pub mod control {
                 "start" | "restart" | "gateway-prepare" | "gateway-update" => {
                     selector && id && !self.force && !self.yes
                 }
+                "core-restart" => {
+                    selector
+                        && id
+                        && !self.yes
+                        && self.shard.is_some()
+                        && self.core.is_some()
+                        && self.expect_bot_id.is_some()
+                        && self.expect_total_shards.is_some()
+                        && (self.expect_incarnation.is_none() || self.incarnation().is_some())
+                }
                 // Missing confirmation is diagnosed by the authenticated handler.
                 "stop" => selector && id && (!self.yes || self.force),
                 _ => false,
             };
             base && self.shards_valid()
+                && (self.command == "core-restart"
+                    || (self.shard.is_none()
+                        && self.core.is_none()
+                        && self.expect_incarnation.is_none()))
                 && self.expect_bot_id.as_ref().is_none_or(|bot_id| {
                     !bot_id.is_empty()
                         && bot_id.len() <= 64
@@ -1067,14 +1102,14 @@ pub mod control {
                         && !bot_id.chars().any(char::is_control)
                         && matches!(
                             self.command.as_str(),
-                            "start" | "stop" | "restart" | "gateway-update"
+                            "start" | "stop" | "restart" | "gateway-update" | "core-restart"
                         )
                 })
                 && self.expect_total_shards.is_none_or(|total| {
                     total > 0
                         && matches!(
                             self.command.as_str(),
-                            "start" | "stop" | "restart" | "gateway-update"
+                            "start" | "stop" | "restart" | "gateway-update" | "core-restart"
                         )
                 })
         }
@@ -1122,6 +1157,62 @@ pub mod control {
         Stopping,
         /// Gateway update (separated layout), one Shard at a time.
         Updating,
+        #[cfg(unix)]
+        CoreRestart,
+    }
+
+    #[cfg(unix)]
+    const CORE_RESTART_INTERVAL: Duration = Duration::from_secs(60);
+    #[cfg(unix)]
+    const CORE_RESTART_WINDOW: Duration = Duration::from_secs(15 * 60);
+    #[cfg(unix)]
+    const CORE_RESTART_LIMIT: usize = 3;
+    const CORE_RESTART_NOTE: &str = "成功は旧 Core の終了確認と新 Core の起動を示します。再起動中の対象宛ては worker_unavailable になります。処理中のイベントは中断され得ます。未受領の REST 結果は不明になり得て、再試行で重複することがあります。重複排除の記憶は空になります。";
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct CoreRestartTarget {
+        core: u32,
+        total_shards: u32,
+        expected: Option<u64>,
+    }
+
+    #[cfg(unix)]
+    struct CoreRestart {
+        target: CoreRestartTarget,
+        incarnation: Option<u64>,
+        actor: (String, String),
+        reason: Option<&'static str>,
+        pending: Option<PendingCoreRestart>,
+    }
+
+    #[cfg(unix)]
+    struct CoreRestartReply {
+        response: tokio::sync::oneshot::Sender<Value>,
+        recovery_audit: Value,
+    }
+
+    #[cfg(unix)]
+    impl CoreRestartReply {
+        fn send(self, mut value: Value) {
+            value["recovery_audit"] = self.recovery_audit;
+            let _ = self.response.send(value);
+        }
+
+        fn respond(reply: Option<Self>, value: Value) -> Option<Value> {
+            if let Some(reply) = reply {
+                reply.send(value);
+                None
+            } else {
+                Some(value)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct PendingCoreRestart {
+        audit: AuditResult,
+        reply: CoreRestartReply,
     }
 
     struct Operation {
@@ -1142,6 +1233,39 @@ pub mod control {
         finished: Option<OperationSnapshot>,
         /// `gateway-update`: where the Shard `targets[next]` is in its update.
         update_stage: UpdateStage,
+        #[cfg(unix)]
+        core_restart: Option<CoreRestart>,
+    }
+
+    impl Operation {
+        fn new(
+            request: &CommandRequest,
+            bot_id: String,
+            targets: Vec<ShardKey>,
+            waiting: HashSet<ShardKey>,
+            phase: Phase,
+            now: Instant,
+        ) -> Self {
+            Self {
+                id: request.operation_id.clone().expect("validated ID"),
+                command: request.command.clone(),
+                bot_id,
+                force: request.force,
+                shards: request.shard_filter(),
+                update_timeout: update_timeout(targets.len()),
+                targets,
+                phase,
+                next: 0,
+                started: now,
+                waiting,
+                generations: BTreeMap::new(),
+                errors: BTreeMap::new(),
+                finished: None,
+                update_stage: UpdateStage::Begin,
+                #[cfg(unix)]
+                core_restart: None,
+            }
+        }
     }
 
     /// Per Core slot: the last accepted status record as (incarnation id, seq, boot_ms), used to
@@ -1168,6 +1292,16 @@ pub mod control {
         // Shared across records: a failed truncate must not quarantine the same tail again
         // when a different request or pending record next tries to append.
         audit_tail: std::sync::Mutex<Option<AuditTailRepair>>,
+        #[cfg(all(test, unix))]
+        core_recovery_audit: Option<PathBuf>,
+        #[cfg(all(test, unix))]
+        core_audit_tail: std::sync::Mutex<Option<AuditTailRepair>>,
+        #[cfg(unix)]
+        core_audit_worker: Option<tokio::sync::mpsc::Sender<CoreAuditJob>>,
+        #[cfg(unix)]
+        core_audit_writes: Vec<AuditResult>,
+        #[cfg(unix)]
+        core_restart_history: BTreeMap<(ShardKey, u32), std::collections::VecDeque<Instant>>,
         #[cfg(unix)]
         core_status_history: CoreStatusHistory,
     }
@@ -1185,11 +1319,40 @@ pub mod control {
         copied: u64,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AuditKind {
+        GatewayUpdate,
+        CoreRecovery,
+    }
+
     struct PendingAudit {
+        kind: AuditKind,
         bytes: Vec<u8>,
         written: bool,
         // Device, inode, and the offset of the serialized record (not the file length).
         written_file: Option<(u64, u64, u64)>,
+    }
+
+    #[cfg(unix)]
+    type AuditResult = tokio::sync::oneshot::Receiver<(PendingAudit, bool)>;
+
+    #[cfg(unix)]
+    struct CoreAuditJob {
+        record: PendingAudit,
+        completion: Option<tokio::sync::oneshot::Sender<(PendingAudit, bool)>>,
+    }
+
+    impl PendingAudit {
+        fn new(kind: AuditKind, value: Value) -> std::io::Result<Self> {
+            let mut bytes = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
+            bytes.push(b'\n');
+            Ok(Self {
+                kind,
+                bytes,
+                written: false,
+                written_file: None,
+            })
+        }
     }
 
     impl ControlPlane {
@@ -1199,6 +1362,22 @@ pub mod control {
         /// fixed outcome word - never a secret, path, argument or error text.
         pub fn set_gateway_update_audit(&mut self, path: PathBuf) {
             self.gateway_update_audit = Some(path);
+        }
+
+        #[cfg(unix)]
+        pub fn set_core_recovery_audit(&mut self, path: PathBuf) {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<CoreAuditJob>(64);
+            // Gateway 更新と同じ追記処理を使う。Core の監査 I/O は所有者ループの外で直列化する。
+            tokio::task::spawn_blocking(move || {
+                let tail = std::sync::Mutex::new(None);
+                while let Some(mut job) = rx.blocking_recv() {
+                    let ok = Self::write_audit_file(&path, &tail, &mut job.record).is_ok();
+                    if let Some(completion) = job.completion {
+                        let _ = completion.send((job.record, ok));
+                    }
+                }
+            });
+            self.core_audit_worker = Some(tx);
         }
 
         fn audit_gateway_update(
@@ -1220,21 +1399,20 @@ pub mod control {
             actor: &(String, String),
             error: Option<DaemonError>,
         ) -> std::io::Result<PendingAudit> {
-            let at_ms = SystemTime::now()
+            PendingAudit::new(
+                AuditKind::GatewayUpdate,
+                json!({
+                    "at_ms": Self::audit_timestamp(), "event": event, "operation_id": operation_id,
+                    "bot": bot, "subject": actor.0, "role": actor.1,
+                    "error": error.map(|e| format!("{e:?}")),
+                }),
+            )
+        }
+
+        fn audit_timestamp() -> u128 {
+            SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis());
-            let mut bytes = serde_json::to_vec(&json!({
-                "at_ms": at_ms, "event": event, "operation_id": operation_id,
-                "bot": bot, "subject": actor.0, "role": actor.1,
-                "error": error.map(|e| format!("{e:?}")),
-            }))
-            .map_err(std::io::Error::other)?;
-            bytes.push(b'\n');
-            Ok(PendingAudit {
-                bytes,
-                written: false,
-                written_file: None,
-            })
+                .map_or(0, |d| d.as_millis())
         }
 
         fn audit_file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
@@ -1285,7 +1463,7 @@ pub mod control {
         }
 
         fn quarantine_audit_tail(
-            &self,
+            tail: &std::sync::Mutex<Option<AuditTailRepair>>,
             file: &mut std::fs::File,
             path: &std::path::Path,
             boundary: u64,
@@ -1294,8 +1472,7 @@ pub mod control {
             use std::io::{Read, Seek, SeekFrom, Write};
             let (dev, ino) = Self::audit_file_identity(&file.metadata()?);
             let source = (dev, ino, boundary, end);
-            let mut saved = self
-                .audit_tail
+            let mut saved = tail
                 .lock()
                 .map_err(|_| std::io::Error::other("audit repair state unavailable"))?;
             if saved.as_ref().is_none_or(|repair| repair.source != source) {
@@ -1315,9 +1492,7 @@ pub mod control {
                     .min(AUDIT_TAIL_LIMIT)
                     .min(AUDIT_CORRUPT_LIMIT.saturating_sub(corrupt.metadata()?.len()));
                 if repair.limit < end - boundary {
-                    eprintln!(
-                        "gateway update audit: corrupt tail quarantine capped; excess discarded"
-                    );
+                    eprintln!("監査ログの破損部分が隔離の上限を超えました（超過分は破棄）");
                 }
                 repair.corrupt = Some(corrupt);
             }
@@ -1386,9 +1561,31 @@ pub mod control {
         }
 
         fn write_audit(&self, record: &mut PendingAudit) -> std::io::Result<()> {
-            let Some(path) = &self.gateway_update_audit else {
-                return Ok(());
+            let (path, tail) = match record.kind {
+                AuditKind::GatewayUpdate => {
+                    let Some(path) = &self.gateway_update_audit else {
+                        return Ok(());
+                    };
+                    (path, &self.audit_tail)
+                }
+                #[cfg(all(test, unix))]
+                AuditKind::CoreRecovery => (
+                    self.core_recovery_audit
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("audit unavailable"))?,
+                    &self.core_audit_tail,
+                ),
+                #[cfg(not(all(test, unix)))]
+                AuditKind::CoreRecovery => return Err(std::io::Error::other("audit unavailable")),
             };
+            Self::write_audit_file(path, tail, record)
+        }
+
+        fn write_audit_file(
+            path: &Path,
+            tail: &std::sync::Mutex<Option<AuditTailRepair>>,
+            record: &mut PendingAudit,
+        ) -> std::io::Result<()> {
             use std::io::{Seek, SeekFrom, Write};
             // This verified descriptor is read/write + append. Never reopen the path for
             // reading: a FIFO replacement could block that second open before validation.
@@ -1401,12 +1598,11 @@ pub mod control {
                 let end = file.metadata()?.len();
                 let boundary = Self::audit_tail_boundary(&mut file, end)?;
                 if boundary < end {
-                    self.quarantine_audit_tail(&mut file, path, boundary, end)?;
+                    Self::quarantine_audit_tail(tail, &mut file, path, boundary, end)?;
                     // Keep repair progress on failure, including a failure of this truncate.
                     file.set_len(boundary)?;
                 }
-                *self
-                    .audit_tail
+                *tail
                     .lock()
                     .map_err(|_| std::io::Error::other("audit repair state unavailable"))? = None;
                 let (dev, ino) = Self::audit_file_identity(&file.metadata()?);
@@ -1418,15 +1614,63 @@ pub mod control {
             file.sync_data()
         }
 
+        #[cfg(unix)]
+        fn submit_core_audit(
+            &self,
+            record: PendingAudit,
+            tracked: bool,
+        ) -> Result<Option<AuditResult>, PendingAudit> {
+            let worker = self
+                .core_audit_worker
+                .as_ref()
+                .expect("configured Core audit worker");
+            let (completion, result) = if tracked {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            worker
+                .try_send(CoreAuditJob { record, completion })
+                .map_err(|error| error.into_inner().record)?;
+            Ok(result)
+        }
+
+        fn write_terminal_audit(&mut self, mut record: PendingAudit) {
+            #[cfg(unix)]
+            if record.kind == AuditKind::CoreRecovery && self.core_audit_worker.is_some() {
+                match self.submit_core_audit(record, true) {
+                    Ok(Some(result)) => self.core_audit_writes.push(result),
+                    Ok(None) => unreachable!("tracked audit write"),
+                    Err(record) => self.pending_audit.push(record),
+                }
+                return;
+            }
+            if self.write_audit(&mut record).is_err() {
+                self.pending_audit.push(record);
+            }
+        }
+
         fn retry_pending_audit(&mut self) {
+            #[cfg(unix)]
+            self.core_audit_writes.retain_mut(|result| {
+                use tokio::sync::oneshot::error::TryRecvError;
+                match result.try_recv() {
+                    Ok((record, false)) => self.pending_audit.push(record),
+                    Ok((_, true)) => {}
+                    Err(TryRecvError::Empty) => return true,
+                    Err(TryRecvError::Closed) => {
+                        eprintln!("Core 手動再起動の監査処理が終了しました")
+                    }
+                }
+                false
+            });
             if self.audit_retry_at.is_some_and(|at| Instant::now() < at) {
                 return;
             }
             let pending = std::mem::take(&mut self.pending_audit);
-            for mut record in pending {
-                if self.write_audit(&mut record).is_err() {
-                    self.pending_audit.push(record);
-                }
+            for record in pending {
+                self.write_terminal_audit(record);
             }
             self.audit_retry_at = if self.pending_audit.is_empty() {
                 None
@@ -1458,6 +1702,14 @@ pub mod control {
             request: &CommandRequest,
             access: &super::update_control::ControlAccess,
         ) -> Value {
+            if request.command == "core-restart" {
+                #[cfg(unix)]
+                return self
+                    .request_core_restart(request, access, Instant::now(), None)
+                    .unwrap_or_else(|| Self::error("audit_unavailable"));
+                #[cfg(not(unix))]
+                return Self::error("core restart requires separate Core mode on Linux");
+            }
             let target = if request.command == "operation" {
                 request
                     .operation_id
@@ -1534,6 +1786,285 @@ pub mod control {
             self.request(request)
         }
 
+        #[cfg(unix)]
+        pub fn dispatch_core_restart(
+            &mut self,
+            request: &CommandRequest,
+            access: &super::update_control::ControlAccess,
+            response: tokio::sync::oneshot::Sender<Value>,
+            recovery_audit: Value,
+        ) {
+            let reply = CoreRestartReply {
+                response,
+                recovery_audit,
+            };
+            // すぐ返せる拒否はここで応答する。追記中の要求の応答は操作が保持する。
+            let _ = self.request_core_restart(request, access, Instant::now(), Some(reply));
+        }
+
+        #[cfg(unix)]
+        fn request_core_restart(
+            &mut self,
+            request: &CommandRequest,
+            access: &super::update_control::ControlAccess,
+            now: Instant,
+            mut reply: Option<CoreRestartReply>,
+        ) -> Option<Value> {
+            if !request.valid() {
+                return CoreRestartReply::respond(reply, Self::error("invalid control request"));
+            }
+            if !access.valid() {
+                return CoreRestartReply::respond(reply, Self::error("permission_denied"));
+            }
+            let bot = request
+                .bot
+                .as_deref()
+                .and_then(|selector| botref::resolve(&self.config.bots, selector).ok());
+            let key = ShardKey {
+                bot_id: bot.map_or_else(String::new, |bot| bot.bot_id.clone()),
+                shard_id: request.shard.expect("validated shard"),
+            };
+            let core = request.core.expect("validated core");
+            let mut recovery = CoreRestart {
+                target: CoreRestartTarget {
+                    core,
+                    total_shards: request.expect_total_shards.expect("validated total_shards"),
+                    expected: request.incarnation(),
+                },
+                incarnation: request.incarnation(),
+                actor: (access.subject.clone(), access.role.clone()),
+                reason: None,
+                pending: None,
+            };
+            let id = request.operation_id.as_deref().expect("validated ID");
+            let force = request.force;
+            let reject =
+                |plane: &Self, reply, recovery: &CoreRestart, reason, retry: Option<Duration>| {
+                    plane.audit_core_rejection(id, &key, force, recovery, reason);
+                    let mut value = Self::error(reason);
+                    if let Some(retry) = retry {
+                        value["retry_after_ms"] = json!(retry.as_millis().max(1));
+                    }
+                    CoreRestartReply::respond(reply, value)
+                };
+            let local_keys = self
+                .daemon
+                .entries
+                .contains_key(&key)
+                .then(|| std::slice::from_ref(&key));
+            if !access.allows_command(
+                false,
+                bot.map(|bot| bot.bot_id.as_str()),
+                local_keys.unwrap_or_default(),
+            ) {
+                return reject(self, reply, &recovery, "permission_denied", None);
+            }
+            let Some(bot) = bot else {
+                return reject(self, reply, &recovery, "bot_not_found", None);
+            };
+            if request.expect_bot_id.as_deref() != Some(key.bot_id.as_str()) {
+                return reject(self, reply, &recovery, "bot_id_mismatch", None);
+            }
+            if bot.total_shards != crate::placement::ShardCount::Fixed(recovery.target.total_shards)
+            {
+                return reject(self, reply, &recovery, "total_shards_mismatch", None);
+            }
+            if let Some(old) = self.operations.get(id) {
+                if old.bot_id == key.bot_id
+                    && old.shards == request.shard_filter()
+                    && old.force == force
+                    && old
+                        .core_restart
+                        .as_ref()
+                        .is_some_and(|previous| previous.target == recovery.target)
+                {
+                    let value = self.operation_view(old);
+                    return CoreRestartReply::respond(reply, value);
+                }
+                return reject(self, reply, &recovery, "operation_id_conflict", None);
+            }
+            let Some(entry) = self.daemon.entries.get(&key) else {
+                return reject(self, reply, &recovery, "shard_not_local", None);
+            };
+            if entry.candidate.is_some()
+                || entry.retiring.is_some()
+                || entry.update_fallback_reserved
+                || entry.stop_since.is_some()
+                || self
+                    .operations
+                    .values()
+                    .any(|op| op.finished.is_none() && op.targets.contains(&key))
+            {
+                return reject(self, reply, &recovery, "busy", None);
+            }
+            if self.operations.len() >= OPERATION_LIMIT {
+                return reject(self, reply, &recovery, "operation_history_full", None);
+            }
+            recovery.incarnation = match self.check_core_restart(&key, recovery.target, force, now)
+            {
+                Ok(incarnation) => incarnation,
+                Err((reason, retry)) => {
+                    return reject(self, reply, &recovery, reason, retry);
+                }
+            };
+            let Ok(mut record) =
+                Self::core_restart_record("requested", id, &key, force, &recovery, None)
+            else {
+                return reject(self, reply, &recovery, "audit_unavailable", None);
+            };
+            if self.core_audit_worker.is_some() {
+                if reply.is_none() {
+                    return reject(self, reply, &recovery, "audit_unavailable", None);
+                }
+                let Ok(Some(audit)) = self.submit_core_audit(record, true) else {
+                    return reject(self, reply, &recovery, "audit_unavailable", None);
+                };
+                recovery.pending = Some(PendingCoreRestart {
+                    audit,
+                    reply: reply.take().unwrap(),
+                });
+            } else if self.write_audit(&mut record).is_err() {
+                return reject(self, reply, &recovery, "audit_unavailable", None);
+            } else {
+                self.begin_core_restart(&key, core, now);
+            }
+            let mut op = Operation::new(
+                request,
+                key.bot_id.clone(),
+                vec![key],
+                HashSet::new(),
+                Phase::CoreRestart,
+                now,
+            );
+            let pending = recovery.pending.is_some();
+            op.core_restart = Some(recovery);
+            let response = (!pending).then(|| self.operation_view(&op));
+            self.operations.insert(id.to_owned(), op);
+            response.and_then(|value| CoreRestartReply::respond(reply, value))
+        }
+
+        #[cfg(unix)]
+        fn begin_core_restart(&mut self, key: &ShardKey, core: u32, now: Instant) {
+            let entry = self.daemon.entries.get_mut(key).expect("validated shard");
+            entry
+                .cores
+                .as_mut()
+                .expect("validated Core units")
+                .begin_manual_restart(core as usize, now);
+            let history = self
+                .core_restart_history
+                .entry((key.clone(), core))
+                .or_default();
+            history.retain(|at| now.saturating_duration_since(*at) < CORE_RESTART_WINDOW);
+            history.push_back(now);
+        }
+
+        #[cfg(unix)]
+        fn audit_core_rejection(
+            &self,
+            id: &str,
+            key: &ShardKey,
+            force: bool,
+            recovery: &CoreRestart,
+            reason: &'static str,
+        ) {
+            if let Ok(mut record) =
+                Self::core_restart_record("rejected", id, key, force, recovery, Some(reason))
+            {
+                if self.core_audit_worker.is_some() {
+                    let _ = self.submit_core_audit(record, false);
+                } else {
+                    let _ = self.write_audit(&mut record);
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        fn check_core_restart(
+            &mut self,
+            key: &ShardKey,
+            target: CoreRestartTarget,
+            force: bool,
+            now: Instant,
+        ) -> Result<Option<u64>, (&'static str, Option<Duration>)> {
+            let entry = self.daemon.entries.get_mut(key).expect("validated shard");
+            let cores = entry
+                .cores
+                .as_mut()
+                .ok_or(("separate_cores_required", None))?;
+            if !entry.snapshot.desired_running || !cores.prepared() {
+                return Err(("shard_not_running", None));
+            }
+            let statuses = cores
+                .manual_restart_status()
+                .map_err(|_| ("core_status_unavailable", None))?;
+            let index = target.core as usize;
+            let core = statuses.get(index).ok_or(("core_out_of_range", None))?;
+            if target.expected.is_some() && target.expected != core.status_id {
+                return Err(("incarnation_mismatch", None));
+            }
+            if !force {
+                if target.expected.is_none() {
+                    return Err(("incarnation_required", None));
+                }
+                if core.running {
+                    if !statuses
+                        .iter()
+                        .enumerate()
+                        .any(|(i, status)| i != index && status.running)
+                    {
+                        return Err(("last_running_core", None));
+                    }
+                    if self.core_view(key, index, core)["status"]["suspected_stalled"] != true {
+                        return Err(("core_not_suspected_stalled", None));
+                    }
+                }
+            }
+            if let Some(history) = self.core_restart_history.get(&(key.clone(), target.core)) {
+                let mut in_window = history.iter().filter_map(|at| {
+                    CORE_RESTART_WINDOW
+                        .checked_sub(now.saturating_duration_since(*at))
+                        .filter(|remaining| !remaining.is_zero())
+                });
+                let window = in_window
+                    .next()
+                    .filter(|_| in_window.count() >= CORE_RESTART_LIMIT - 1);
+                let interval = history.back().and_then(|at| {
+                    CORE_RESTART_INTERVAL.checked_sub(now.saturating_duration_since(*at))
+                });
+                if let Some(remaining) = window
+                    .max(interval)
+                    .filter(|remaining| !remaining.is_zero())
+                {
+                    return Err(("rate_limited", Some(remaining)));
+                }
+            }
+            Ok(core.status_id)
+        }
+
+        #[cfg(unix)]
+        fn core_restart_record(
+            event: &'static str,
+            id: &str,
+            key: &ShardKey,
+            force: bool,
+            recovery: &CoreRestart,
+            reason: Option<&'static str>,
+        ) -> std::io::Result<PendingAudit> {
+            PendingAudit::new(
+                AuditKind::CoreRecovery,
+                json!({
+                    "ts": Self::audit_timestamp(), "event": event,
+                    "subject": recovery.actor.0, "role": recovery.actor.1,
+                    "bot_id": key.bot_id.parse::<u64>().ok().map(|id| id.to_string()),
+                    "shard": key.shard_id, "core": recovery.target.core,
+                    "operation_id": id, "force": force,
+                    "incarnation": recovery.incarnation.map(|id| format!("{id:016x}")),
+                    "reason": reason,
+                }),
+            )
+        }
+
         pub fn new(daemon: Daemon, config: Config, monitor_ok: bool) -> Self {
             Self {
                 daemon,
@@ -1546,6 +2077,16 @@ pub mod control {
                 pending_audit: Vec::new(),
                 audit_retry_at: None,
                 audit_tail: std::sync::Mutex::new(None),
+                #[cfg(all(test, unix))]
+                core_recovery_audit: None,
+                #[cfg(all(test, unix))]
+                core_audit_tail: std::sync::Mutex::new(None),
+                #[cfg(unix)]
+                core_audit_worker: None,
+                #[cfg(unix)]
+                core_audit_writes: Vec::new(),
+                #[cfg(unix)]
+                core_restart_history: BTreeMap::new(),
                 #[cfg(unix)]
                 core_status_history: std::sync::Mutex::new(BTreeMap::new()),
             }
@@ -1579,25 +2120,29 @@ pub mod control {
                     cores
                         .iter()
                         .enumerate()
-                        .map(|(index, core)| {
-                            let read = core
-                                .status_path
-                                .as_ref()
-                                .map(|path| crate::core_status::read_status(path))
-                                .unwrap_or(crate::core_status::StatusRead::Missing);
-                            let mut history = self
-                                .core_status_history
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            core_status_view(
-                                core,
-                                read,
-                                history.entry((key.clone(), index)).or_default(),
-                            )
-                        })
+                        .map(|(index, core)| self.core_view(key, index, core))
                         .collect(),
                 )
             })
+        }
+
+        #[cfg(unix)]
+        fn core_view(
+            &self,
+            key: &ShardKey,
+            index: usize,
+            core: &crate::core_units::CoreStatus,
+        ) -> Value {
+            let read = core
+                .status_path
+                .as_ref()
+                .map(|path| crate::core_status::read_status(path))
+                .unwrap_or(crate::core_status::StatusRead::Missing);
+            let mut history = self
+                .core_status_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            core_status_view(core, read, history.entry((key.clone(), index)).or_default())
         }
 
         #[cfg(not(unix))]
@@ -1665,7 +2210,20 @@ pub mod control {
 
         fn operation_view(&self, op: &Operation) -> Value {
             let snapshot = self.snapshot(op);
-            json!({"ok": snapshot.state != OperationState::Failed, "offline": false, "operation": snapshot, "note": NOTE})
+            let value = json!({"ok": snapshot.state != OperationState::Failed, "offline": false, "operation": snapshot, "note": if op.command == "core-restart" { CORE_RESTART_NOTE } else { NOTE }});
+            #[cfg(unix)]
+            if let Some(recovery) = &op.core_restart {
+                if recovery.pending.is_some() {
+                    return Self::error("audit_pending");
+                }
+                let mut value = value;
+                value["operation"]["core"] = json!(recovery.target.core);
+                value["operation"]["incarnation"] =
+                    json!(recovery.incarnation.map(|id| format!("{id:016x}")));
+                value["operation"]["reason"] = json!(recovery.reason);
+                return value;
+            }
+            value
         }
 
         fn finish(&mut self, op: &mut Operation) {
@@ -1678,8 +2236,10 @@ pub mod control {
             let failed = snapshot.state == OperationState::Failed;
             let first_error = op.errors.values().next().copied();
             op.finished = Some(snapshot);
-            for key in &op.targets {
-                self.daemon.hold_restart(key, false);
+            if op.command != "core-restart" {
+                for key in &op.targets {
+                    self.daemon.hold_restart(key, false);
+                }
             }
             if op.command == "gateway-update" && failed {
                 // A standby that was never activated must not outlive its operation.
@@ -1704,6 +2264,20 @@ pub mod control {
                     );
                 }
             }
+            #[cfg(unix)]
+            if let Some(recovery) = &op.core_restart {
+                let event = if failed { "failed" } else { "succeeded" };
+                if let Ok(record) = Self::core_restart_record(
+                    event,
+                    &op.id,
+                    &op.targets[0],
+                    op.force,
+                    recovery,
+                    recovery.reason,
+                ) {
+                    self.write_terminal_audit(record);
+                }
+            }
         }
 
         /// No mutation is performed on a malformed request, unknown/ambiguous
@@ -1711,6 +2285,9 @@ pub mod control {
         pub fn request(&mut self, request: &CommandRequest) -> Value {
             if !request.valid() {
                 return Self::error("invalid control request");
+            }
+            if request.command == "core-restart" {
+                return Self::error("permission_denied");
             }
             let separate_update =
                 request.command == "gateway-update" && self.daemon.separate_cores();
@@ -1769,7 +2346,23 @@ pub mod control {
                         .collect();
                     let mut value = json!({"ok": true, "offline": false, "note": NOTE,
                         "status": {"processes": self.process_views(&processes), "monitor_ok": self.monitor_ok}});
-                    value["status"]["gateway_update_audit"] = json!({"ok": self.pending_audit.is_empty(), "pending": self.pending_audit.len()});
+                    for (name, kind) in [
+                        ("gateway_update_audit", AuditKind::GatewayUpdate),
+                        ("core_recovery_audit", AuditKind::CoreRecovery),
+                    ] {
+                        let pending = self
+                            .pending_audit
+                            .iter()
+                            .filter(|record| record.kind == kind)
+                            .count();
+                        #[cfg(unix)]
+                        let pending = if kind == AuditKind::CoreRecovery {
+                            pending + self.core_audit_writes.len()
+                        } else {
+                            pending
+                        };
+                        value["status"][name] = json!({"ok": pending == 0, "pending": pending});
+                    }
                     // Advisory observations only; no labels beyond Bot/shard/generation.
                     value["status"]["metrics"] = self
                         .daemon
@@ -1847,10 +2440,19 @@ pub mod control {
             if targets.len() > OPERATION_SHARD_LIMIT {
                 return Self::error("operation exceeds local shard limit (64)");
             }
+            if self.operations.values().any(|op| {
+                op.command == "core-restart"
+                    && op.finished.is_none()
+                    && op.targets.iter().any(|key| targets.contains(key))
+            }) {
+                return Self::error("busy");
+            }
             let active: Vec<_> = self
                 .operations
                 .iter()
-                .filter(|(_, op)| op.bot_id == bot_id && op.finished.is_none())
+                .filter(|(_, op)| {
+                    op.bot_id == bot_id && op.finished.is_none() && op.command != "core-restart"
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             if !active.is_empty() && !request.force {
@@ -1898,29 +2500,20 @@ pub mod control {
                     .cloned()
                     .collect()
             };
-            let op = Operation {
-                id: id.clone(),
-                command: request.command.clone(),
+            let op = Operation::new(
+                request,
                 bot_id,
-                force: request.force,
-                shards: request.shard_filter(),
-                update_timeout: update_timeout(targets.len()),
                 targets,
-                phase: if request.command == "start" {
+                waiting,
+                if request.command == "start" {
                     Phase::Starting
                 } else if request.command == "gateway-update" {
                     Phase::Updating
                 } else {
                     Phase::Stopping
                 },
-                next: 0,
-                started: Instant::now(),
-                waiting,
-                generations: BTreeMap::new(),
-                errors: BTreeMap::new(),
-                finished: None,
-                update_stage: UpdateStage::Begin,
-            };
+                Instant::now(),
+            );
             for key in &op.targets {
                 self.daemon.hold_restart(key, true);
             }
@@ -1938,6 +2531,8 @@ pub mod control {
             credentials: &impl CredentialSource,
             deadline: Duration,
         ) -> Vec<ShardKey> {
+            #[cfg(unix)]
+            self.cancel_core_restarts();
             self.retry_pending_audit();
             let keys: Vec<ShardKey> = self.daemon.snapshots().into_iter().map(|s| s.key).collect();
             #[cfg(unix)]
@@ -1983,6 +2578,11 @@ pub mod control {
             let tick_started = Instant::now();
             for id in ids.into_iter().take(16) {
                 let mut op = self.operations.remove(&id).expect("operation exists");
+                #[cfg(unix)]
+                if !self.settle_core_restart_audit(&mut op, Instant::now()) {
+                    self.last_advanced.clone_from(&id);
+                    continue;
+                }
                 self.advance(&mut op, credentials).await;
                 self.last_advanced.clone_from(&id);
                 self.operations.insert(id, op);
@@ -2075,6 +2675,11 @@ pub mod control {
         }
 
         async fn advance(&mut self, op: &mut Operation, credentials: &impl CredentialSource) {
+            #[cfg(unix)]
+            if op.phase == Phase::CoreRestart {
+                self.advance_core_restart(op, Instant::now());
+                return;
+            }
             #[cfg(unix)]
             if op.phase == Phase::Updating {
                 self.advance_update(op, credentials).await;
@@ -2185,6 +2790,106 @@ pub mod control {
                 }
             }
             self.finish(op);
+        }
+
+        #[cfg(unix)]
+        fn settle_core_restart_audit(&mut self, op: &mut Operation, now: Instant) -> bool {
+            use tokio::sync::oneshot::error::TryRecvError;
+            let Some(recovery) = op.core_restart.as_mut() else {
+                return true;
+            };
+            let Some(mut pending) = recovery.pending.take() else {
+                return true;
+            };
+            let key = &op.targets[0];
+            let reason = match pending.audit.try_recv() {
+                Err(TryRecvError::Empty) => {
+                    recovery.pending = Some(pending);
+                    return true;
+                }
+                Ok((_, false)) | Err(TryRecvError::Closed) => "audit_unavailable",
+                Ok((_, true)) => {
+                    // 監査の追記を待つ間にも通常の監視は進む。世代や停止条件を再確認する。
+                    match self.check_core_restart(key, recovery.target, op.force, now) {
+                        Ok(incarnation) if incarnation == recovery.incarnation => {
+                            self.begin_core_restart(key, recovery.target.core, now);
+                            op.started = now;
+                            pending.reply.send(self.operation_view(op));
+                            return true;
+                        }
+                        Ok(_) => "incarnation_mismatch",
+                        Err((reason, _)) => reason,
+                    }
+                }
+            };
+            self.audit_core_rejection(&op.id, key, op.force, recovery, reason);
+            pending.reply.send(Self::error(reason));
+            false
+        }
+
+        #[cfg(unix)]
+        fn advance_core_restart(&mut self, op: &mut Operation, now: Instant) {
+            use crate::core_units::ManualRestartError;
+            let recovery = op.core_restart.as_mut().expect("Core restart operation");
+            if recovery.pending.is_some() {
+                return;
+            }
+            let key = &op.targets[0];
+            let entry = self.daemon.entries.get_mut(key).expect("owned shard");
+            let program = Path::new(&entry.spec.gateway.program);
+            let cores = entry.cores.as_mut().expect("owned Core units");
+            match cores.poll_manual_restart(recovery.target.core as usize, program, now) {
+                None => return,
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    let (reason, error) = match error {
+                        ManualRestartError::KillFailed => ("kill_failed", DaemonError::StopFailed),
+                        ManualRestartError::ReapFailed => {
+                            ("reap_failed", DaemonError::MonitorFailed)
+                        }
+                        ManualRestartError::ReapTimedOut => {
+                            ("reap_timed_out", DaemonError::StopTimedOut)
+                        }
+                        ManualRestartError::LaunchFailed => {
+                            ("launch_failed", DaemonError::SpawnFailed)
+                        }
+                    };
+                    recovery.reason = Some(reason);
+                    op.errors.insert(key.clone(), error);
+                }
+            }
+            self.finish(op);
+        }
+
+        #[cfg(unix)]
+        fn cancel_core_restarts(&mut self) {
+            let ids: Vec<_> = self
+                .operations
+                .values()
+                .filter(|op| op.phase == Phase::CoreRestart && op.finished.is_none())
+                .map(|op| op.id.clone())
+                .collect();
+            for id in ids {
+                let mut op = self.operations.remove(&id).expect("active operation");
+                let key = &op.targets[0];
+                let recovery = op.core_restart.as_mut().expect("Core restart operation");
+                if let Some(pending) = recovery.pending.take() {
+                    self.audit_core_rejection(&op.id, key, op.force, recovery, "daemon_shutdown");
+                    pending.reply.send(Self::error("daemon_shutdown"));
+                    continue;
+                }
+                let entry = self.daemon.entries.get_mut(key).expect("owned shard");
+                entry
+                    .cores
+                    .as_mut()
+                    .expect("owned Core units")
+                    .cancel_manual_restart(recovery.target.core as usize);
+                recovery.reason = Some("daemon_shutdown");
+                op.errors
+                    .insert(key.clone(), DaemonError::OperationSuperseded);
+                self.finish(&mut op);
+                self.operations.insert(id, op);
+            }
         }
     }
 
@@ -2297,6 +3002,550 @@ pub mod control {
                 command: "operation".into(),
                 operation_id: Some(format!("{id:032x}")),
                 ..Default::default()
+            }
+        }
+
+        #[cfg(unix)]
+        mod core_restart {
+            use super::*;
+            use crate::daemon::update_control::ControlAccess;
+            use std::os::unix::fs::{PermissionsExt, symlink};
+
+            struct Fixture {
+                plane: ControlPlane,
+                dir: PathBuf,
+                key: ShardKey,
+                now: Instant,
+            }
+
+            impl Fixture {
+                fn new(diagnostics: bool, exited_slot: Option<usize>) -> Self {
+                    let config: Config = toml::from_str(
+                        "[cluster]\nid='local'\nmode='standalone'\n[node]\nid='one'\n\
+                         [[bots]]\nname='private-selector'\nbot_id='7'\napplication_id='7'\n\
+                         token_env='PRIVATE_TOKEN_ENV'\ntotal_shards=2\n\
+                         [[bots.shard_placement]]\nshard_id=0\nprimary='one'\n\
+                         [[bots.shard_placement]]\nshard_id=1\nprimary='one'\n",
+                    )
+                    .unwrap();
+                    let dir = std::env::temp_dir()
+                        .join(format!("cr-test-{:016x}", getrandom::u64().unwrap()));
+                    std::fs::create_dir(&dir).unwrap();
+                    let program = dir.join("private-program");
+                    let exit = exited_slot.map_or_else(String::new, |slot| {
+                        format!("case \"$2\" in */core-{slot}.sock) exit 0;; esac\n")
+                    });
+                    std::fs::write(
+                        &program,
+                        format!("#!/bin/sh\nIFS= read -r capability || exit 1\n{exit}while IFS= read -r line; do :; done\n"),
+                    ).unwrap();
+                    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    let mut daemon = Daemon::from_config(
+                        &config,
+                        &HashMap::new(),
+                        &dir,
+                        RestartPolicy::default(),
+                    )
+                    .unwrap();
+                    daemon.set_gateway_program(&program).unwrap();
+                    daemon.enable_separate_cores().unwrap();
+                    let key = ShardKey {
+                        bot_id: "7".into(),
+                        shard_id: 0,
+                    };
+                    let entry = daemon.entries.get_mut(&key).unwrap();
+                    entry.snapshot.desired_running = true;
+                    let cores = entry.cores.as_mut().unwrap();
+                    if diagnostics {
+                        cores.configure_status(Some(dir.clone()), true, None);
+                    }
+                    cores.ensure(&program).unwrap();
+                    if let Some(slot) = exited_slot {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while cores.manual_restart_status().unwrap()[slot].running {
+                            assert!(Instant::now() < deadline, "test child did not exit");
+                            std::thread::yield_now();
+                        }
+                    }
+                    let mut plane = ControlPlane::new(daemon, config, true);
+                    plane.core_recovery_audit = Some(dir.join("core-recovery-audit.jsonl"));
+                    Self {
+                        plane,
+                        dir,
+                        key,
+                        now: Instant::now(),
+                    }
+                }
+
+                fn request(&self, id: usize, core: u32, force: bool) -> CommandRequest {
+                    CommandRequest {
+                        command: "core-restart".into(),
+                        bot: Some("private-selector".into()),
+                        operation_id: Some(format!("{id:032x}")),
+                        shard: Some(0),
+                        core: Some(core),
+                        expect_bot_id: Some("7".into()),
+                        expect_total_shards: Some(2),
+                        expect_incarnation: self
+                            .plane
+                            .daemon
+                            .core_status(&self.key)
+                            .unwrap()
+                            .get(core as usize)
+                            .and_then(|core| core.status_id)
+                            .map(|id| format!("{id:016x}")),
+                        force,
+                        ..Default::default()
+                    }
+                }
+
+                fn submit(&mut self, request: &CommandRequest, at: Duration) -> Value {
+                    self.plane
+                        .request_core_restart(
+                            request,
+                            &ControlAccess::default(),
+                            self.now + at,
+                            None,
+                        )
+                        .unwrap()
+                }
+
+                fn complete(&mut self, id: usize, at: Duration) -> Value {
+                    let id = format!("{id:032x}");
+                    let mut op = self.plane.operations.remove(&id).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while op.finished.is_none() {
+                        self.plane.advance_core_restart(&mut op, self.now + at);
+                        assert!(Instant::now() < deadline, "test restart did not finish");
+                        std::thread::yield_now();
+                    }
+                    let answer = self.plane.operation_view(&op);
+                    self.plane.operations.insert(id, op);
+                    answer
+                }
+            }
+
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    for entry in self.plane.daemon.entries.values_mut() {
+                        if let Some(cores) = entry.cores.as_mut() {
+                            cores.kill();
+                        }
+                    }
+                    let _ = std::fs::remove_dir_all(&self.dir);
+                }
+            }
+
+            #[test]
+            fn pinning_and_request_shape_are_fail_closed() {
+                let mut f = Fixture::new(true, None);
+                let valid = f.request(1, 0, true);
+                assert!(valid.valid());
+                for (field, value, reason) in [
+                    ("expect_bot_id", json!("8"), "bot_id_mismatch"),
+                    ("expect_total_shards", json!(3), "total_shards_mismatch"),
+                    (
+                        "expect_incarnation",
+                        json!("ffffffffffffffff"),
+                        "incarnation_mismatch",
+                    ),
+                    ("core", json!(2), "core_out_of_range"),
+                    ("shard", json!(2), "shard_not_local"),
+                ] {
+                    let mut req = serde_json::to_value(&valid).unwrap();
+                    req[field] = value;
+                    assert_eq!(
+                        f.submit(&serde_json::from_value(req).unwrap(), Duration::ZERO)["error"],
+                        reason
+                    );
+                }
+                for (field, value) in [
+                    ("command", json!("restart")),
+                    ("shards", json!([0])),
+                    ("yes", json!(true)),
+                    ("expect_incarnation", json!("0000000000000000")),
+                    ("expect_incarnation", json!("bad")),
+                    ("expect_bot_id", Value::Null),
+                    ("expect_total_shards", Value::Null),
+                    ("operation_id", json!("argument text")),
+                ] {
+                    let mut req = serde_json::to_value(&valid).unwrap();
+                    req[field] = value;
+                    assert!(
+                        !serde_json::from_value::<CommandRequest>(req)
+                            .unwrap()
+                            .valid(),
+                        "{field}"
+                    );
+                }
+                assert!(f.plane.operations.is_empty());
+                assert!(f.plane.core_restart_history.is_empty());
+            }
+
+            #[test]
+            fn requires_admin_and_scope_for_exactly_one_shard() {
+                let mut f = Fixture::new(true, None);
+                let req = f.request(1, 0, true);
+                let other = ShardKey {
+                    bot_id: "7".into(),
+                    shard_id: 1,
+                };
+                for (role, key) in [("viewer", &f.key), ("updater", &f.key), ("admin", &other)] {
+                    let access = ControlAccess {
+                        subject: "operator".into(),
+                        role: role.into(),
+                        scope: Some(vec![key.clone()]),
+                    };
+                    assert_eq!(
+                        f.plane.request_as(&req, &access)["error"],
+                        "permission_denied"
+                    );
+                }
+                assert_eq!(f.plane.request(&req)["error"], "permission_denied");
+                assert!(f.plane.operations.is_empty());
+                let allowed = ControlAccess {
+                    scope: Some(vec![f.key.clone()]),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    f.plane.request_as(&req, &allowed)["operation"]["state"],
+                    "running"
+                );
+                let denied = ControlAccess {
+                    scope: Some(vec![other]),
+                    ..Default::default()
+                };
+                assert_eq!(f.plane.request_as(&query(1), &denied)["ok"], false);
+                assert_eq!(
+                    f.plane.request_as(&query(1), &allowed)["operation"]["core"],
+                    0
+                );
+            }
+
+            #[test]
+            fn force_is_required_for_unpinned_healthy_or_last_running_core() {
+                let mut f = Fixture::new(false, None);
+                let mut req = f.request(1, 0, false);
+                assert_eq!(
+                    f.submit(&req, Duration::ZERO)["error"],
+                    "incarnation_required"
+                );
+                req.force = true;
+                req.expect_incarnation = Some("0000000000000001".into());
+                assert_eq!(
+                    f.submit(&req, Duration::ZERO)["error"],
+                    "incarnation_mismatch"
+                );
+                req.expect_incarnation = None;
+                assert_eq!(
+                    f.submit(&req, Duration::ZERO)["operation"]["state"],
+                    "running"
+                );
+
+                let mut f = Fixture::new(true, None);
+                let mut req = f.request(1, 0, false);
+                assert_eq!(
+                    f.submit(&req, Duration::ZERO)["error"],
+                    "core_not_suspected_stalled"
+                );
+                req.expect_incarnation = None;
+                assert_eq!(
+                    f.submit(&req, Duration::ZERO)["error"],
+                    "incarnation_required"
+                );
+
+                let mut f = Fixture::new(true, Some(1));
+                let mut req = f.request(1, 0, false);
+                let down = f.request(2, 1, false);
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "last_running_core");
+                assert_eq!(
+                    f.submit(&down, Duration::ZERO)["operation"]["state"],
+                    "running"
+                );
+                assert_eq!(
+                    f.complete(2, Duration::ZERO)["operation"]["state"],
+                    "succeeded"
+                );
+                req.force = true;
+                assert_eq!(
+                    f.submit(&req, Duration::ZERO)["operation"]["state"],
+                    "running"
+                );
+            }
+
+            #[test]
+            fn rate_limits_include_failed_attempts_and_apply_to_force() {
+                let mut f = Fixture::new(true, None);
+                let seconds = Duration::from_secs;
+                let millis = Duration::from_millis;
+                let old = f.request(1, 0, true);
+                assert_eq!(f.submit(&old, seconds(0))["operation"]["state"], "running");
+                assert_eq!(f.complete(1, seconds(0))["operation"]["state"], "succeeded");
+                let stale = f.request(9, 0, true);
+                let stale = CommandRequest {
+                    expect_incarnation: old.expect_incarnation,
+                    ..stale
+                };
+                assert_eq!(
+                    f.submit(&stale, seconds(0))["error"],
+                    "incarnation_mismatch"
+                );
+                let req = f.request(2, 0, true);
+                assert_eq!(f.submit(&req, millis(59_999))["retry_after_ms"], 1);
+                assert_eq!(f.submit(&req, seconds(60))["operation"]["state"], "running");
+                let missing = f.dir.join("missing-program");
+                f.plane
+                    .daemon
+                    .entries
+                    .get_mut(&f.key)
+                    .unwrap()
+                    .spec
+                    .gateway
+                    .program = missing.into_os_string();
+                assert_eq!(
+                    f.complete(2, seconds(60))["operation"]["reason"],
+                    "launch_failed"
+                );
+                let program = f.dir.join("private-program");
+                f.plane
+                    .daemon
+                    .entries
+                    .get_mut(&f.key)
+                    .unwrap()
+                    .spec
+                    .gateway
+                    .program = program.into_os_string();
+                let req = f.request(3, 0, true);
+                assert_eq!(
+                    f.submit(&req, seconds(120))["operation"]["state"],
+                    "running"
+                );
+                assert_eq!(
+                    f.complete(3, seconds(120))["operation"]["state"],
+                    "succeeded"
+                );
+                let req = f.request(4, 0, true);
+                assert_eq!(f.submit(&req, seconds(180))["retry_after_ms"], 720_000);
+                assert_eq!(f.submit(&req, millis(899_999))["retry_after_ms"], 1);
+                let other = f.request(5, 1, true);
+                assert_eq!(
+                    f.submit(&other, seconds(180))["operation"]["state"],
+                    "running"
+                );
+                assert_eq!(
+                    f.complete(5, seconds(180))["operation"]["state"],
+                    "succeeded"
+                );
+                assert_eq!(
+                    f.submit(&req, seconds(900))["operation"]["state"],
+                    "running"
+                );
+            }
+
+            #[tokio::test]
+            async fn busy_exclusion_applies_in_both_directions() {
+                let mut f = Fixture::new(true, None);
+                let req = f.request(1, 0, true);
+                for command in ["start", "stop", "restart", "gateway-update"] {
+                    let mut op = request(command, 0, 2);
+                    op.bot = req.bot.clone();
+                    op.shards = Some(vec![0]);
+                    assert_eq!(f.plane.request(&op)["ok"], true);
+                    assert_eq!(f.submit(&req, Duration::ZERO)["error"], "busy");
+                    let mut op = f.plane.operations.remove(&format!("{:032x}", 2)).unwrap();
+                    f.plane.finish(&mut op);
+                }
+                let entry = f.plane.daemon.entries.get_mut(&f.key).unwrap();
+                entry.update_fallback_reserved = true;
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "busy");
+                let entry = f.plane.daemon.entries.get_mut(&f.key).unwrap();
+                entry.update_fallback_reserved = false;
+                let spawn = || {
+                    tokio::process::Command::new("/bin/sleep")
+                        .arg("30")
+                        .kill_on_drop(true)
+                        .spawn()
+                        .unwrap()
+                };
+                entry.candidate = Some(Candidate {
+                    child: spawn(),
+                    started: f.now,
+                    ready_marker: PathBuf::new(),
+                    active_marker: PathBuf::new(),
+                    activated: None,
+                });
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "busy");
+                let entry = f.plane.daemon.entries.get_mut(&f.key).unwrap();
+                entry.candidate = None;
+                entry.retiring = Some(Retiring {
+                    child: spawn(),
+                    since: f.now,
+                });
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "busy");
+                f.plane.daemon.entries.get_mut(&f.key).unwrap().retiring = None;
+                assert_eq!(
+                    f.submit(&req, Duration::ZERO)["operation"]["state"],
+                    "running"
+                );
+                let other_core = f.request(3, 1, true);
+                assert_eq!(f.submit(&other_core, Duration::ZERO)["error"], "busy");
+                for command in ["start", "stop", "gateway-update"] {
+                    let mut op = request(command, 0, 2);
+                    op.bot = req.bot.clone();
+                    op.shards = Some(vec![0]);
+                    if command == "stop" {
+                        op.force = true;
+                        op.yes = true;
+                    }
+                    assert_eq!(f.plane.request(&op)["error"], "busy");
+                }
+                let mut independent = request("start", 0, 4);
+                independent.bot = req.bot.clone();
+                independent.shards = Some(vec![1]);
+                assert_eq!(f.plane.request(&independent)["ok"], true);
+            }
+
+            #[test]
+            fn audit_failure_leaves_child_and_rate_limit_untouched() {
+                let mut f = Fixture::new(true, None);
+                let req = f.request(1, 0, true);
+                let before = f.plane.daemon.core_status(&f.key).unwrap();
+                let path = f.dir.join("core-recovery-audit.jsonl");
+                let target = f.dir.join("private-target");
+                std::fs::write(&target, b"keep").unwrap();
+                symlink(&target, &path).unwrap();
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "audit_unavailable");
+                std::fs::remove_file(&path).unwrap();
+                std::fs::hard_link(&target, &path).unwrap();
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "audit_unavailable");
+                assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+                assert_eq!(f.plane.daemon.core_status(&f.key).unwrap(), before);
+                assert!(f.plane.operations.is_empty());
+                assert!(f.plane.core_restart_history.is_empty());
+                std::fs::remove_file(&path).unwrap();
+                assert_eq!(
+                    f.submit(&req, Duration::ZERO)["operation"]["state"],
+                    "running"
+                );
+            }
+
+            #[test]
+            fn pending_audit_holds_the_shard_but_never_starts_the_restart() {
+                let mut f = Fixture::new(true, None);
+                let (writer, mut jobs) = tokio::sync::mpsc::channel(4);
+                f.plane.core_audit_worker = Some(writer);
+                let req = f.request(1, 0, true);
+                let (response, mut reply) = tokio::sync::oneshot::channel();
+                f.plane
+                    .dispatch_core_restart(&req, &ControlAccess::default(), response, json!({}));
+                let id = req.operation_id.as_deref().unwrap();
+                let before = f.plane.daemon.core_status(&f.key).unwrap();
+                let mut op = f.plane.operations.remove(id).unwrap();
+                assert!(f.plane.settle_core_restart_audit(&mut op, f.now));
+                f.plane.advance_core_restart(&mut op, f.now);
+                f.plane.operations.insert(id.to_owned(), op);
+                assert!(matches!(
+                    reply.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                assert_eq!(f.plane.request(&query(1))["error"], "audit_pending");
+                let second = f.request(2, 1, true);
+                assert_eq!(f.submit(&second, Duration::ZERO)["error"], "busy");
+                let job = jobs.try_recv().unwrap();
+                let row: Value = serde_json::from_slice(&job.record.bytes).unwrap();
+                assert_eq!(row["event"], "requested");
+                assert!(job.completion.unwrap().send((job.record, false)).is_ok());
+                let mut op = f.plane.operations.remove(id).unwrap();
+                assert!(!f.plane.settle_core_restart_audit(&mut op, f.now));
+                assert_eq!(reply.try_recv().unwrap()["error"], "audit_unavailable");
+                assert_eq!(f.plane.daemon.core_status(&f.key).unwrap(), before);
+                assert!(f.plane.core_restart_history.is_empty());
+                assert!(f.plane.operations.is_empty());
+                let (response, mut reply) = tokio::sync::oneshot::channel();
+                f.plane
+                    .dispatch_core_restart(&req, &ControlAccess::default(), response, json!({}));
+                let mut op = f.plane.operations.remove(id).unwrap();
+                let job = std::iter::from_fn(|| jobs.try_recv().ok())
+                    .find(|job| job.completion.is_some())
+                    .unwrap();
+                assert!(job.completion.unwrap().send((job.record, true)).is_ok());
+                assert!(f.plane.settle_core_restart_audit(&mut op, f.now));
+                assert_eq!(reply.try_recv().unwrap()["operation"]["state"], "running");
+                assert_eq!(f.plane.core_restart_history.len(), 1);
+                f.plane.operations.insert(id.to_owned(), op);
+            }
+
+            #[test]
+            fn audit_contains_only_validated_fields_and_retries_outcome() {
+                let mut f = Fixture::new(true, None);
+                let req = f.request(1, 0, true);
+                let path = f.dir.join("core-recovery-audit.jsonl");
+                let before = f.plane.daemon.core_status(&f.key).unwrap();
+                assert_eq!(
+                    f.submit(&req, Duration::ZERO)["operation"]["state"],
+                    "running"
+                );
+                let saved = path.with_extension("saved");
+                std::fs::rename(&path, &saved).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                let value = f.complete(1, Duration::ZERO);
+                assert_eq!(value["operation"]["state"], "succeeded");
+                assert_eq!(value["note"], CORE_RESTART_NOTE);
+                let after = f.plane.daemon.core_status(&f.key).unwrap();
+                assert_ne!(after[0].status_id, before[0].status_id);
+                assert_eq!(after[1], before[1]);
+                assert_eq!(f.plane.pending_audit.len(), 1);
+                std::fs::remove_dir(&path).unwrap();
+                std::fs::rename(saved, &path).unwrap();
+                f.plane.retry_pending_audit();
+                assert!(f.plane.pending_audit.is_empty());
+                let wrong = CommandRequest {
+                    expect_bot_id: Some("8".into()),
+                    ..req.clone()
+                };
+                assert_eq!(f.submit(&wrong, Duration::ZERO)["error"], "bot_id_mismatch");
+                let text = std::fs::read_to_string(&path).unwrap();
+                let rows: Vec<Value> = text
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(rows.len(), 3);
+                for (row, event) in rows.iter().zip(["requested", "succeeded", "rejected"]) {
+                    assert_eq!(row.as_object().unwrap().len(), 11);
+                    assert!(row["ts"].as_u64().unwrap() > 0);
+                    assert_eq!(row["event"], event);
+                    assert_eq!(row["bot_id"], "7");
+                    assert_eq!(row["subject"], "local-bootstrap");
+                    assert_eq!(row["role"], "admin");
+                    assert_eq!(row["shard"], 0);
+                    assert_eq!(row["core"], 0);
+                    assert_eq!(row["force"], true);
+                    assert_eq!(row["operation_id"].as_str(), req.operation_id.as_deref());
+                    assert_eq!(
+                        row["incarnation"].as_str(),
+                        req.expect_incarnation.as_deref()
+                    );
+                }
+                assert_eq!(rows[2]["reason"], "bot_id_mismatch");
+                let secret = std::fs::read_to_string(crate::core_attach::secret_path(
+                    f.plane.daemon.entries[&f.key].cores.as_ref().unwrap().dir(),
+                ))
+                .unwrap();
+                for forbidden in [
+                    "PRIVATE_TOKEN_ENV",
+                    "private-selector",
+                    "private-program",
+                    "core-listen",
+                    secret.trim(),
+                    f.dir.to_str().unwrap(),
+                ] {
+                    assert!(!text.contains(forbidden));
+                }
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
             }
         }
 
@@ -2986,13 +4235,11 @@ pub mod control {
             let mut file = ControlPlane::open_audit_file(&path).unwrap();
             // Model a failed truncate after successful quarantine. Retry through another
             // descriptor and then another record, sharing the saved repair progress.
-            plane
-                .quarantine_audit_tail(&mut file, &path, 3, 10)
+            ControlPlane::quarantine_audit_tail(&plane.audit_tail, &mut file, &path, 3, 10)
                 .unwrap();
             drop(file);
             let mut file = ControlPlane::open_audit_file(&path).unwrap();
-            plane
-                .quarantine_audit_tail(&mut file, &path, 3, 10)
+            ControlPlane::quarantine_audit_tail(&plane.audit_tail, &mut file, &path, 3, 10)
                 .unwrap();
             assert_eq!(std::fs::read(&corrupt).unwrap(), b"partial");
             let mut record = ControlPlane::audit_record(

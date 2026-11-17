@@ -111,6 +111,10 @@
 - **実 Discord の Gateway 自動復旧（ローカル Identify 許可）**：実 Discord の Gateway 自動復旧は、単一ホスト・単一 botd 専用のローカル Identify 許可（Bot 単位。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回。超えると `IdentifyUnavailable` で `Degraded`）の下で有効です。初回起動と手動 start は常に許可して記録します。複数プロセス・複数ホスト間の調整は未実装、botd 再起動で履歴は消えます。セッションの Resume は未実装で、再起動のたびに Identify を 1 回消費します。ローカル未ビルドで GitHub Actions の検証待ちで、実 Discord・実機では未検証です。
 - **未実装（再掲）**：プロセス再起動をまたぐ Resume（session はメモリのみ。再起動は毎回新規 Identify）、複数プロセス・複数ホスト間の Identify 調整（プロセス内のみ）。
 
+## P3 stage A の Core 手動再起動
+
+分離モードの botd に認証付きの手動操作を追加した。`botctl` のコマンドと実 Discord での確認は今後の段階。成功は旧 Core の終了確認と新 Core の起動を示す。停止中の対象スロット宛ては `worker_unavailable` になる。中断されたイベントの再処理は行われず、未受領の REST 結果は不明になり得る。再起動後の重複排除の記憶は空から始まる。手動再起動の間隔と回数は botd の起動中だけ保持する。
+
 ## P1 停滞診断（Core の状態ファイルと、botd からの照会）
 
 **状態：** 実装済み（ブランチ work/p1）。**実機（実 Discord の別 Bot、WSL、2 シャード）で動作を確認した。Oracle・実サーバーの systemd では未確認。** 設計は [DDR-0007](design-decisions/discussion-records/0007-p1-tmpfs-and-cutover-order.md)、[p1-stalled-diagnostics-design.md](design-decisions/p1-stalled-diagnostics-design.md)。
