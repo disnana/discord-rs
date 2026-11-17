@@ -628,3 +628,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 保証しないこと（文書に明記）：強制終了した Core の処理中イベントは完了しない、未受領の REST は結果不明になり得る、再起動後の重複排除の記憶は空。
 - **未確認：** 停滞した Core が stdin の EOF に反応するか（猶予の長さ）、既存の `operation` 照会に載せられるか。実装・試験・実機検証は未着手。
 - 決めてほしい項目は設計書の 9 章（D-P3-0〜5）。
+
+## 2026-11-17 Oracle を新版へ入れ替え（ユーザーが実施。新版の放置の起点）
+- 入れ替え：Oracle で `31ee55e`（コードは 76e72ce 以降の main。ログ統一・B3・`!workers`・P1 を含む）を `--release --locked -j 2` でビルドし、`botd`・`botctl`・`src` を `/opt/discord-rs/bin/` に配置、`systemctl restart botd`。旧バイナリは `*.prev` に退避済み（戻し方は `docs/soak-test.md` §5.1）。**botd の再起動時刻 2026-11-17T13:50:42Z（新版の放置の起点。`soak-diff.sh` の SINCE は `2026-11-17T13:51`）。**
+- 再起動 15 秒後（ユーザーの出力）：`active`、NRestarts 0、botd＋Core 2＋Gateway 1 が起動、Core の failures 0、journal の警告 0。
+- P1（`--core-status-dir`）は**有効にしていない**（オプトイン）。
+- **未確認：** Discord での `!ping`・`!count`・`!workers` の応答（ユーザーの確認待ち）、新版の 6 時間以上の放置、OS 再起動後の自動起動。
