@@ -605,18 +605,29 @@ fn operation_state<'a>(value: &'a Value, id: &str, command: &str) -> Result<&'a 
     {
         return Err("daemon response operation does not match request");
     }
+    let core_recovery = command == "operation" && operation["command"] == "core-restart";
     if !operation["bot_id"].is_string()
-        || operation["elapsed_ms"].as_u64().is_none()
-        || !operation["shards"].is_array()
-        || !operation["failed_shards"].is_array()
-        || !matches!(
-            operation["command"].as_str(),
-            Some("start" | "stop" | "restart" | "update" | "rollback" | "gateway-update")
-        )
+        || if core_recovery {
+            operation["shard"]
+                .as_u64()
+                .is_none_or(|shard| shard > u64::from(u32::MAX))
+                || operation["core"]
+                    .as_u64()
+                    .is_none_or(|core| core > u64::from(u32::MAX))
+        } else {
+            operation["elapsed_ms"].as_u64().is_none()
+                || !operation["shards"].is_array()
+                || !operation["failed_shards"].is_array()
+                || !matches!(
+                    operation["command"].as_str(),
+                    Some("start" | "stop" | "restart" | "update" | "rollback" | "gateway-update")
+                )
+        }
     {
         return Err("daemon operation has no valid result metadata");
     }
     if operation["state"] == "succeeded"
+        && (!core_recovery || operation["failed_shards"].is_array())
         && !operation["failed_shards"]
             .as_array()
             .is_some_and(Vec::is_empty)
@@ -625,6 +636,9 @@ fn operation_state<'a>(value: &'a Value, id: &str, command: &str) -> Result<&'a 
     }
     match operation["state"].as_str() {
         Some(state @ ("running" | "succeeded" | "failed")) => Ok(state),
+        Some("unknown") if core_recovery && operation["terminal_audit"] == "missing" => {
+            Ok("unknown")
+        }
         _ => Err("invalid daemon operation state"),
     }
 }
@@ -1109,7 +1123,7 @@ async fn run_live_inner(
             }
             match state {
                 Ok("succeeded") if response["ok"] == true => return response,
-                Ok("failed" | "succeeded") => {
+                Ok("failed" | "succeeded" | "unknown") => {
                     response["ok"] = json!(false);
                     return response;
                 }
@@ -1294,6 +1308,23 @@ mod default_wait_tests {
     fn options(args: &[&str]) -> Options {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         parse_options(&args).expect("valid arguments")
+    }
+
+    #[test]
+    fn operation_query_accepts_core_recovery_results_and_the_crash_unknown_state() {
+        let mut value = json!({"ok": false, "operation": {
+            "operation_id": "id", "command": "core-restart", "bot_id": "7",
+            "shard": 1, "core": 0, "state": "unknown", "terminal_audit": "missing"
+        }});
+        assert_eq!(operation_state(&value, "id", "operation"), Ok("unknown"));
+        assert!(operation_state(&value, "wrong-id", "operation").is_err());
+        assert!(operation_state(&value, "id", "restart").is_err());
+        value["operation"]["terminal_audit"] = json!("synced");
+        assert!(operation_state(&value, "id", "operation").is_err());
+        value["operation"]["state"] = json!("succeeded");
+        assert_eq!(operation_state(&value, "id", "operation"), Ok("succeeded"));
+        value["operation"]["shard"] = Value::Null;
+        assert!(operation_state(&value, "id", "operation").is_err());
     }
 
     #[test]

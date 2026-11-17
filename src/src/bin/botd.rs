@@ -376,6 +376,8 @@ struct StatusRequest {
     core: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expect_incarnation: Option<String>,
+    #[serde(default)]
+    expect_empty: bool,
 }
 
 struct Envelope {
@@ -501,6 +503,7 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
                     shard: request.shard,
                     core: request.core,
                     expect_incarnation: request.expect_incarnation,
+                    expect_empty: request.expect_empty,
                 },
                 None,
             ),
@@ -804,7 +807,11 @@ async fn run() -> Result<(), &'static str> {
     let mut control = ControlPlane::new(daemon, config.clone(), startup_ok);
     control.set_gateway_update_audit(options.runtime_root.join("gateway-update-audit.jsonl"));
     #[cfg(unix)]
-    control.set_core_recovery_audit(options.runtime_root.join("core-recovery-audit.jsonl"));
+    if options.separate_cores {
+        control
+            .set_core_recovery_audit(options.runtime_root.join("core-recovery-audit.jsonl"))
+            .await;
+    }
     let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
     let mut server = tokio::spawn(status_server(
         listener,

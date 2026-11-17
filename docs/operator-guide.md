@@ -161,11 +161,15 @@ botd は Shard ごとに順番に次を行います。
 
 ### 分離 Core の手動再起動（P3 stage A）
 
-Linux の分離モードで、認証済みのローカル制御要求 `core-restart` を対象シャードの `admin` が使える。`botctl` の操作コマンドは stage B。要求には `bot`、`shard`、`core`、`expect_bot_id`、`expect_total_shards`、32 桁の小文字 16 進の `operation_id` を含める。`expect_incarnation` は status の各スロットの `incarnation` と同じ非ゼロの 16 桁 16 進文字列。省略時は `force: true` が必要で、明示した世代の不一致は常に拒否する。
+Linux の分離モードでは、認証済みのローカル制御要求 `core-preview` に `bot` と `shard` を指定すると、閲覧権限のある 1 シャードの Core を確認できます。応答の `bot_id`、`total_shards`、対象スロットを使い、対象シャードの `admin` が `core-restart` を送ります。`botctl` の専用コマンドは stage B です。
 
-通常は停滞の疑いがある Core か停止済みの Core が対象。最後の稼働中 Core には `force` が必要。同一シャードで操作が進行中なら `busy`、同一スロットは `force` を含めて最短 60 秒、直近 15 分に 3 回まで。要求を `core-recovery-audit.jsonl`（0600、`ts` は UTC の Unix 時刻ミリ秒）に記録できた後、stdin を閉じ、5 秒の猶予後も残っていれば botd が所有するハンドルで終了させる。完了は `operation` で照会できる。
+`core-restart` には `bot`、`shard`、`core`、`expect_bot_id`、`expect_total_shards`、32 桁の小文字 16 進の `operation_id` を指定します。旧 Core がある場合は、P1 の有効・無効にかかわらず、プレビューの 16 桁の `incarnation` を `expect_incarnation` に指定します。`empty: true` の場合は `expect_empty: true` を指定します。`force` でも対象の固定と回数制限は必要です。
 
-`succeeded` は旧プロセスの終了確認と新プロセスの起動を示す。再起動中の対象スロット宛ては `worker_unavailable` になる。処理中のイベントは中断され得る。未受領の REST 結果は不明になり得るため、再試行の重複リスクは運用者が判断する。再起動後の重複排除の記憶は空から始まる。
+通常は停滞の疑いがある Core か、停止済みのスロットが対象です。稼働中の Core を止める際、もう一方のプロセスの稼働を観測できない場合は `force` が必要です。同じシャードで競合する操作は `busy` になります。同じスロットの手動操作は 60 秒以上空け、直近 15 分に 3 回までです。回数は既存の `core-recovery-audit.jsonl`（0600、`ts` は UTC の Unix 時刻ミリ秒）から再構成します。
+
+要求が監査ログに同期されると、制御応答に操作 ID が返ります。対象を確認して stdin を閉じ、5 秒後も残っている場合は botd が直接子へ強制終了を要求します。`termination_unconfirmed` の場合は終了確認を待ってから通常の再起動に戻ります。切断やタイムアウト時も、既知の ID で `operation` を照会してください。照会は記録されたシャードのスコープで認可します。既存の `botctl operation` でも結果を照会できます。`terminal_audit: pending_or_failed` は完了記録の未確認を示します。botd 再起動後に要求だけが残る場合は `state: unknown` となり、照会や同じ ID の再送で終了要求が繰り返されることはありません。
+
+`succeeded` は、旧 Core があれば終了を確認し、置換プロセスを起動して stdin に IPC capability を書き込んだことを示します。Core のソケット待受と Gateway の認証付き再接続は、別に確認してください。stdin の EOF でも処理中のイベントは中断され得ます。未受領の REST 結果が不明な場合、再試行すると外部操作が重複する可能性があります。直接子の監督範囲や回数制限の前提は[制約一覧](known-limitations.md)を参照してください。
 
 ### Discordに接続しない模擬実行
 
