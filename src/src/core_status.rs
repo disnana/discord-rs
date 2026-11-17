@@ -1,19 +1,29 @@
+// Status files live on tmpfs: no file data is written to a disk-backed filesystem.
+// Tmpfs pages can be swapped under memory pressure; noswap is not enforced. This
+// provides zero file writeback in normal operation, not an absolute zero.
 use std::time::{Duration, Instant};
 
 pub const RECORD_LEN: usize = 64;
 
 #[cfg(unix)]
-pub fn boot_ms() -> u64 {
+pub fn try_boot_ms() -> Option<u64> {
     let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
     // SAFETY: clock_gettime initializes the writable timespec on success.
     if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, time.as_mut_ptr()) } != 0 {
-        return 0;
+        return None;
     }
     // SAFETY: a successful clock_gettime initialized time.
     let time = unsafe { time.assume_init() };
-    (time.tv_sec as u64)
-        .saturating_mul(1000)
-        .saturating_add(time.tv_nsec as u64 / 1_000_000)
+    Some(
+        (time.tv_sec as u64)
+            .saturating_mul(1000)
+            .saturating_add(time.tv_nsec as u64 / 1_000_000),
+    )
+}
+
+#[cfg(unix)]
+pub fn boot_ms() -> u64 {
+    try_boot_ms().unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +149,7 @@ mod file_io {
     use std::{
         fs::{self, File, Metadata, OpenOptions},
         io::{self, Read, Seek, SeekFrom},
+        os::fd::AsRawFd,
         os::unix::ffi::OsStrExt,
         os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         path::Path,
@@ -148,7 +159,7 @@ mod file_io {
         fn geteuid() -> u32;
     }
     // Linux flags prevent symlink traversal and blocking on a substituted FIFO.
-    const SAFE_FLAGS: i32 = 0x20000 | 0x800;
+    const SAFE_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
     fn safe(meta: &Metadata) -> bool {
         meta.is_file() && meta.uid() == unsafe { geteuid() } && meta.nlink() == 1
@@ -170,18 +181,37 @@ mod file_io {
         unsafe { info.assume_init() }.f_type as u64 == 0x0102_1994
     }
 
+    pub fn file_is_tmpfs(file: &File) -> bool {
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the descriptor is valid and success initializes info.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), info.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        unsafe { info.assume_init() }.f_type as u64 == 0x0102_1994
+    }
+
     pub struct StatusWriter {
         file: File,
         generation: u64,
         seq: u64,
     }
     impl StatusWriter {
+        // The unchecked writer exists only for debug integration tests.
+        #[cfg(debug_assertions)]
         pub fn open(path: &Path) -> Option<StatusWriter> {
             Self::open_checked(path, false)
         }
 
         pub fn open_checked(path: &Path, require_tmpfs: bool) -> Option<StatusWriter> {
-            if require_tmpfs && !is_tmpfs(path.parent()?) {
+            Self::open_checked_inner(path, require_tmpfs, true)
+        }
+
+        fn open_checked_inner(
+            path: &Path,
+            require_tmpfs: bool,
+            check_parent: bool,
+        ) -> Option<StatusWriter> {
+            if require_tmpfs && check_parent && !is_tmpfs(path.parent()?) {
                 return None;
             }
             let generation = loop {
@@ -207,6 +237,17 @@ mod file_io {
                 }
                 Err(_) => return None,
             };
+            if require_tmpfs && !file_is_tmpfs(&file) {
+                if before.is_none() {
+                    // Remove only the inode we created, not a replacement at the path.
+                    if let (Ok(opened), Ok(current)) = (file.metadata(), fs::symlink_metadata(path))
+                        && same(&opened, &current)
+                    {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+                return None;
+            }
             let meta = file.metadata().ok()?;
             if !safe(&meta) || before.as_ref().is_some_and(|old| !same(old, &meta)) {
                 return None;
@@ -231,6 +272,32 @@ mod file_io {
             record.generation = self.generation;
             record.seq = self.seq;
             let _ = self.file.write_all_at(&record.encode(), 0);
+        }
+    }
+
+    #[cfg(all(test, debug_assertions))]
+    mod guard_tests {
+        use super::*;
+
+        #[test]
+        fn descriptor_check_rejects_non_tmpfs_even_if_parent_check_is_bypassed() {
+            let dir = std::env::temp_dir();
+            if is_tmpfs(&dir) {
+                return; // This test needs a disk-backed temporary directory.
+            }
+            let path = dir.join(format!(
+                "core-status-guard-{}-{}",
+                std::process::id(),
+                getrandom::u64().unwrap()
+            ));
+            assert!(!path.exists());
+            assert!(StatusWriter::open_checked_inner(&path, true, false).is_none());
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn safe_flags_are_platform_constants() {
+            assert_eq!(SAFE_FLAGS, libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
     }
 
@@ -289,7 +356,7 @@ mod file_io {
     }
 }
 #[cfg(unix)]
-pub use file_io::{StatusRead, StatusWriter, is_tmpfs, read_status};
+pub use file_io::{StatusRead, StatusWriter, file_is_tmpfs, is_tmpfs, read_status};
 
 #[cfg(test)]
 mod tests {

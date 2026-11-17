@@ -614,4 +614,11 @@ P1 STEP 2b: Core status is opt-in via `--core-status-file <absolute path>` and r
 
 ## 2026-11-17 P1 botd status diagnostics
 
-botd now supplies tmpfs status paths to separate Cores and adds PID-checked status and `suspected_stalled` to control responses. Failure to prepare or read a status file does not stop supervision. Unit and real-process integration tests were added but Cargo was not run as requested. Real Discord, Oracle, systemd RuntimeDirectory on a real server, and zero disk writeback measurements remain unverified. botd does not connect to the Core socket for diagnostics.
+botd now supplies tmpfs status paths to separate Cores and adds PID-checked status and `suspected_stalled` to control responses. Status reads are synchronous and can stall the control path; a bounded background reader with cached results is not implemented. Unit and real-process integration tests were added but Cargo was not run as requested. Real Discord, Oracle, systemd RuntimeDirectory on a real server, and zero disk writeback measurements remain unverified. botd does not connect to the Core socket for diagnostics.
+
+
+## 2026-11-17 P1 audit round 19 (incomplete)
+
+The writer checks the opened file descriptor with `fstatfs` before changing file contents, length, or permissions; created status directories are also checked by descriptor. Test-only argument parsing is rejected in release builds, and the writer skips a tick if CLOCK_BOOTTIME fails. These changes have not been built or tested. Reader-side tmpfs descriptor checks, clock/future timestamp validation, launch incarnation and sequence regression checks, and their integration tests are still missing. The current reader uses synchronous 64-byte reads; a hostile replacement of the status directory by an unreachable hard-mounted network filesystem could stall the control path in theory (requiring root-level control of `/run/discord-rs`). A bounded background reader with cached results is not implemented.
+
+The intended guarantee is no file data written to a disk-backed filesystem: the status file lives on tmpfs, whose pages can be swapped under memory pressure because the kernel `noswap` option is not enforced. This is zero file writeback in normal operation, not an absolute zero. The recorded idle 300 s measurement was `write_bytes` 0; the present changes have not been remeasured.

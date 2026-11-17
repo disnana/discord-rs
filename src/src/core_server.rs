@@ -341,7 +341,10 @@ async fn write_status_periodically(
         let snapshot = *summary
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let record = snapshot.record(now, crate::core_status::boot_ms());
+        let Some(boot_ms) = crate::core_status::try_boot_ms() else {
+            continue;
+        };
+        let record = snapshot.record(now, boot_ms);
         if policy.should_write(now.into_std(), &record) {
             writer.write(&record);
         }

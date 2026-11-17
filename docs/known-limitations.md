@@ -124,3 +124,8 @@ P1 STEP 2b: Core status is opt-in via `--core-status-file <absolute path>` and r
 In separate Core mode, botd reads status files from tmpfs and reports `suspected_stalled` when the record is at least 30 seconds old. This is a suspicion, not proof of a cause or a complete hang. Missing files report `unsupported`; unreadable, corrupt, and PID-mismatched records have separate reasons. `--core-status-dir` names an existing absolute directory. By default `/run/discord-rs` is used only if it exists and is tmpfs. `--core-status-allow-non-tmpfs` and `--core-status-interval-ms` are test-only; the former permits disk writes and must not be used in production.
 
 Cargo build and tests, real Discord, Oracle, systemd RuntimeDirectory on a real server, and zero disk writeback measurements remain unverified.
+
+
+P1 audit round 19 is incomplete: reader-side tmpfs descriptor validation, clock and future timestamp checks, launch incarnation and sequence regression checks, and their tests remain outstanding. Status reads are synchronous 64-byte reads; a hostile replacement of the status directory by an unreachable hard-mounted network filesystem could stall the control path in theory (requiring root-level control of `/run/discord-rs`). A bounded background reader with cached results is not implemented.
+
+The intended guarantee is no file data written to a disk-backed filesystem: the status file lives on tmpfs, whose pages can be swapped under memory pressure because the kernel `noswap` option is not enforced. This is zero file writeback in normal operation, not an absolute zero. The recorded idle 300 s measurement was `write_bytes` 0; the present changes have not been remeasured.

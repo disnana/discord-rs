@@ -997,11 +997,17 @@ async fn run() -> Result<(), AppError> {
                 }
                 status_path = Some(path);
                 i += 2;
-            } else if args[i] == "--core-status-allow-non-tmpfs" && require_tmpfs {
+            } else if cfg!(debug_assertions)
+                && args[i] == "--core-status-allow-non-tmpfs"
+                && require_tmpfs
+            {
                 // Test-only: allow the status file on a non-tmpfs filesystem.
                 require_tmpfs = false;
                 i += 1;
-            } else if args[i] == "--core-status-interval-ms" && interval.is_none() {
+            } else if cfg!(debug_assertions)
+                && args[i] == "--core-status-interval-ms"
+                && interval.is_none()
+            {
                 // Test-only: shorten the status check and heartbeat intervals.
                 interval = Some(
                     args.get(i + 1)

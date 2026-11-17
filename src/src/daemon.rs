@@ -3815,8 +3815,15 @@ fn prepare_status_dir(
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return None,
         }
-        let meta = std::fs::symlink_metadata(&dir).ok()?;
-        if !meta.file_type().is_dir()
+        use std::os::unix::fs::OpenOptionsExt;
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&dir)
+            .ok()?;
+        let meta = opened.metadata().ok()?;
+        if (!allow_non_tmpfs && !crate::core_status::file_is_tmpfs(&opened))
+            || !meta.file_type().is_dir()
             || meta.mode() & 0o7777 != 0o700
             || meta.uid() != unsafe { libc::geteuid() }
             || (!allow_non_tmpfs && !crate::core_status::is_tmpfs(&dir))

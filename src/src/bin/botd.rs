@@ -73,11 +73,16 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
             Some("--core-status-dir") if core_status_dir.is_none() => &mut core_status_dir,
-            Some("--core-status-allow-non-tmpfs") if !core_status_allow_non_tmpfs => {
+            // Test overrides must be rejected by release binaries.
+            Some("--core-status-allow-non-tmpfs")
+                if cfg!(debug_assertions) && !core_status_allow_non_tmpfs =>
+            {
                 core_status_allow_non_tmpfs = true;
                 continue;
             }
-            Some("--core-status-interval-ms") if core_status_interval_ms.is_none() => {
+            Some("--core-status-interval-ms")
+                if cfg!(debug_assertions) && core_status_interval_ms.is_none() =>
+            {
                 let value = args.next().ok_or(USAGE)?;
                 let value = value
                     .to_str()
