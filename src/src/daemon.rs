@@ -813,6 +813,7 @@ pub mod control {
             StatusRead::Missing => "unsupported",
             StatusRead::Unreadable => "unreadable",
             StatusRead::Corrupt => "corrupt",
+            StatusRead::ClockUnavailable => "clock_unavailable",
         };
         view["status_reason"] = json!(reason);
         view
@@ -861,6 +862,7 @@ pub mod control {
             (StatusRead::Missing, "unsupported"),
             (StatusRead::Unreadable, "unreadable"),
             (StatusRead::Corrupt, "corrupt"),
+            (StatusRead::ClockUnavailable, "clock_unavailable"),
             (
                 StatusRead::Fresh {
                     record: StatusRecord { pid: 43, ..record },
@@ -1478,12 +1480,7 @@ pub mod control {
                             let read = core
                                 .status_path
                                 .as_ref()
-                                .map(|path| {
-                                    crate::core_status::read_status(
-                                        path,
-                                        crate::core_status::boot_ms(),
-                                    )
-                                })
+                                .map(|path| crate::core_status::read_status(path))
                                 .unwrap_or(crate::core_status::StatusRead::Missing);
                             core_status_view(core, read)
                         })

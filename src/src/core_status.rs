@@ -310,9 +310,17 @@ mod file_io {
         Missing,
         Unreadable,
         Corrupt,
+        ClockUnavailable,
     }
 
-    pub fn read_status(path: &Path, now_ms: u64) -> StatusRead {
+    pub fn read_status(path: &Path) -> StatusRead {
+        read_status_at(path, super::try_boot_ms)
+    }
+
+    pub(super) fn read_status_at(path: &Path, now_boot_ms: impl Fn() -> Option<u64>) -> StatusRead {
+        if !path.parent().is_some_and(is_tmpfs) {
+            return StatusRead::Unreadable;
+        }
         let before = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return StatusRead::Missing,
@@ -323,12 +331,15 @@ mod file_io {
         }
         let mut file = match OpenOptions::new()
             .read(true)
-            .custom_flags(SAFE_FLAGS)
+            .custom_flags(libc::O_RDONLY | SAFE_FLAGS)
             .open(path)
         {
             Ok(file) => file,
             Err(_) => return StatusRead::Unreadable,
         };
+        if !file_is_tmpfs(&file) {
+            return StatusRead::Unreadable;
+        }
         let meta = match file.metadata() {
             Ok(meta) => meta,
             Err(_) => return StatusRead::Unreadable,
@@ -343,6 +354,12 @@ mod file_io {
             }
             match StatusRecord::decode(&bytes) {
                 Ok(record) => {
+                    let Some(now_ms) = now_boot_ms() else {
+                        return StatusRead::ClockUnavailable;
+                    };
+                    if record.boot_ms > now_ms.saturating_add(1000) {
+                        return StatusRead::Corrupt;
+                    }
                     return StatusRead::Fresh {
                         status_age_s: now_ms.saturating_sub(record.boot_ms) / 1000,
                         record,
@@ -437,7 +454,7 @@ mod tests {
         impl Dir {
             fn new() -> Self {
                 loop {
-                    let p = std::env::temp_dir().join(format!(
+                    let p = PathBuf::from("/dev/shm").join(format!(
                         "core-status-{}-{}",
                         std::process::id(),
                         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -459,23 +476,44 @@ mod tests {
             fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> i32;
         }
         #[test]
+        fn reader_rejects_non_tmpfs_parent() {
+            let dir = std::env::temp_dir();
+            if is_tmpfs(&dir) {
+                return;
+            }
+            let path = dir.join(format!(
+                "core-status-reader-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::write(&path, record().encode()).unwrap();
+            assert_eq!(
+                file_io::read_status_at(&path, || Some(9000)),
+                StatusRead::Unreadable
+            );
+            fs::remove_file(path).unwrap();
+        }
+        #[test]
         fn writer_and_reader() {
             use std::os::unix::ffi::OsStrExt;
             let d = Dir::new();
             let path = d.0.join("status");
-            assert_eq!(read_status(&path, 9000), StatusRead::Missing);
+            assert_eq!(
+                file_io::read_status_at(&path, || Some(9000)),
+                StatusRead::Missing
+            );
             let mut writer = StatusWriter::open(&path).unwrap();
             let before = fs::metadata(&path).unwrap();
             assert_eq!(before.len(), 64);
             assert_eq!(before.mode() & 0o777, 0o600);
             writer.write(&record());
-            let first = match read_status(&path, 9000) {
+            let first = match file_io::read_status_at(&path, || Some(9000)) {
                 StatusRead::Fresh { record, .. } => record,
                 other => panic!("unexpected status: {other:?}"),
             };
             assert_ne!(first.generation, 0);
             writer.write(&record());
-            let second = match read_status(&path, 9000) {
+            let second = match file_io::read_status_at(&path, || Some(9000)) {
                 StatusRead::Fresh { record, .. } => record,
                 other => panic!("unexpected status: {other:?}"),
             };
@@ -487,34 +525,60 @@ mod tests {
                 (after.dev(), after.ino(), 64)
             );
             assert_eq!(
-                read_status(&path, 9000),
+                file_io::read_status_at(&path, || Some(9000)),
                 StatusRead::Fresh {
                     record: second,
                     status_age_s: 4
                 }
             );
             assert_eq!(
-                read_status(&path, 0),
+                file_io::read_status_at(&path, || Some(0)),
+                StatusRead::Corrupt
+            );
+            assert_eq!(
+                file_io::read_status_at(&path, || None),
+                StatusRead::ClockUnavailable
+            );
+            // Exactly 1000 ms in the future is accepted with age zero.
+            assert_eq!(
+                file_io::read_status_at(&path, || Some(4000)),
                 StatusRead::Fresh {
                     record: second,
                     status_age_s: 0
                 }
             );
+            assert_eq!(
+                file_io::read_status_at(&path, || Some(3999)),
+                StatusRead::Corrupt
+            );
             let mut bytes = fs::read(&path).unwrap();
             bytes[10] ^= 1;
             fs::write(&path, bytes).unwrap();
-            assert_eq!(read_status(&path, 9000), StatusRead::Corrupt);
+            assert_eq!(
+                file_io::read_status_at(&path, || Some(9000)),
+                StatusRead::Corrupt
+            );
             let link = d.0.join("link");
             symlink(&path, &link).unwrap();
             assert!(StatusWriter::open(&link).is_none());
-            assert_eq!(read_status(&link, 0), StatusRead::Unreadable);
+            assert_eq!(
+                file_io::read_status_at(&link, || Some(0)),
+                StatusRead::Unreadable
+            );
             let fifo = d.0.join("fifo");
             let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
             assert_eq!(unsafe { mkfifo(c.as_ptr(), 0o600) }, 0);
             assert!(StatusWriter::open(&fifo).is_none());
+            assert_eq!(
+                file_io::read_status_at(&fifo, || Some(0)),
+                StatusRead::Unreadable
+            );
             let short = d.0.join("short");
             fs::write(&short, b"x").unwrap();
-            assert_eq!(read_status(&short, 0), StatusRead::Unreadable);
+            assert_eq!(
+                file_io::read_status_at(&short, || Some(0)),
+                StatusRead::Unreadable
+            );
             assert!(StatusWriter::open(&short).is_some());
             assert_eq!(fs::metadata(short).unwrap().len(), 64);
         }

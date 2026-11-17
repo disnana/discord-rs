@@ -1152,9 +1152,19 @@ async fn invalid_epoch_floor_exits_nonzero() {
 #[tokio::test]
 async fn core_status_heartbeat_is_in_place_and_nonstandard_socket_still_works() {
     use src::core_status::{StatusRead, read_status};
+    // The reader only reads files on tmpfs (an ext4 file is Unreadable), so the status file lives
+    // on /dev/shm; the test is skipped where /dev/shm is not tmpfs.
+    let shm = Path::new("/dev/shm");
+    if !src::core_status::is_tmpfs(shm) {
+        eprintln!("skipping: /dev/shm is absent or not tmpfs");
+        return;
+    }
     let dir = private_dir();
     let socket = dir.join("core-42.sock");
-    let path = dir.join("core-42.status");
+    let status_dir = shm.join(dir.file_name().unwrap());
+    std::fs::create_dir(&status_dir).unwrap();
+    std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = status_dir.join("core-42.status");
     let mut core = Core::start_mode_with_interval(
         &socket,
         SECRET,
@@ -1162,12 +1172,12 @@ async fn core_status_heartbeat_is_in_place_and_nonstandard_socket_still_works() 
         false,
         None,
         Some(100),
-        Some((&path, true)),
+        Some((&path, false)),
     )
     .await;
     let first = bounded(async {
         loop {
-            if let StatusRead::Fresh { record, .. } = read_status(&path, 0) {
+            if let StatusRead::Fresh { record, .. } = read_status(&path) {
                 break record;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1180,7 +1190,7 @@ async fn core_status_heartbeat_is_in_place_and_nonstandard_socket_still_works() 
     assert_eq!(metadata.len(), 64);
     bounded(async {
         loop {
-            if let StatusRead::Fresh { record, .. } = read_status(&path, 0)
+            if let StatusRead::Fresh { record, .. } = read_status(&path)
                 && record.seq > first.seq
             {
                 assert_eq!(record.pending, 0);
@@ -1209,6 +1219,7 @@ async fn core_status_heartbeat_is_in_place_and_nonstandard_socket_still_works() 
         Core::start_mode_with_interval(&other, SECRET, None, false, None, Some(100), None).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!dir.join("other.status").exists());
+    assert!(!status_dir.join("other.status").exists());
     let mut stream = attach(&other, SECRET).await;
     assert_eq!(
         bounded(exchange(&mut stream, r#"{"type":"health"}"#))
@@ -1218,6 +1229,7 @@ async fn core_status_heartbeat_is_in_place_and_nonstandard_socket_still_works() 
     );
     drop(stream);
     let _ = bounded(core.child.wait()).await;
+    let _ = std::fs::remove_dir_all(status_dir);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1274,7 +1286,7 @@ async fn core_status_accepts_tmpfs() {
     .await;
     bounded(async {
         while !matches!(
-            src::core_status::read_status(&path, src::core_status::boot_ms()),
+            src::core_status::read_status(&path),
             src::core_status::StatusRead::Fresh { .. }
         ) {
             tokio::time::sleep(Duration::from_millis(20)).await;
