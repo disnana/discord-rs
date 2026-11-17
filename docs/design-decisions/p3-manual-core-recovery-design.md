@@ -1,7 +1,7 @@
 # P3: 認証・監査つきの Core 手動復旧 — 設計案
 
 - 日付: 2026-11-17
-- ステータス: **設計案（未承認・未実装）**。方向は DDR-0002（共通の管理インターフェース、直接 `kill` しない）、DDR-0006/0007（P1→P2→P3、自動の再起動はしない、P3 を差し替えの実装より先に）で了承済み。**この文書の具体的な名前・値・手順は、ユーザーの確認前**。
+- ステータス: **ユーザーが 2026-11-18 に了承（[DDR-0008](discussion-records/0008-p3-manual-core-recovery-approved.md)）。未実装**。方向は DDR-0002（共通の管理インターフェース、直接 `kill` しない）、DDR-0006/0007（P1→P2→P3、自動の再起動はしない、P3 を差し替えの実装より先に）で了承済み。**この文書の具体的な名前・値・手順は、ユーザーの確認前**。
 - 関連: [DDR-0002](discussion-records/0002-stalled-core-management.md)、[DDR-0007](discussion-records/0007-p1-tmpfs-and-cutover-order.md)、[p1-stalled-diagnostics-design.md](p1-stalled-diagnostics-design.md)、[03-core-hot-swap.md](03-core-hot-swap.md)、[08-unknown-outcome-operations.md](08-unknown-outcome-operations.md)
 
 ## 1. 目的と、やらないこと
