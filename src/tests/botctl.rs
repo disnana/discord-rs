@@ -209,6 +209,125 @@ fn live(args: &[&str], port: u16) -> Output {
 }
 
 #[test]
+fn core_restart_reports_unknown_when_a_bare_failure_cannot_be_resolved() {
+    for error in [
+        "operation not found in this daemon incarnation",
+        "control permission or scope denied",
+    ] {
+        let (port, requests) = mock(vec![
+            Reply::Json(
+                json!({"ok": true, "bot_id": "101", "total_shards": 1, "shard": 0,
+                    "cores": [
+                        {"running": true, "empty": false, "incarnation": "fedcba9876543210", "status": null},
+                        {"running": false, "empty": true, "incarnation": null, "status": null},
+                    ]
+                }),
+            ),
+            Reply::Json(json!({"ok": false, "error": "shard_not_running"})),
+            Reply::Json(json!({"ok": false, "error": error})),
+        ]);
+        let output = live(
+            &[
+                "core", "restart", "alpha", "--shard", "0", "--core", "0", "--yes",
+            ],
+            port,
+        );
+        let requests = requests.join().unwrap();
+        assert_eq!(requests[0]["command"], "core-preview");
+        assert_eq!(requests[1]["command"], "core-restart");
+        assert_eq!(requests[2]["command"], "operation");
+        assert_eq!(requests[2]["operation_id"], requests[1]["operation_id"]);
+        assert_eq!(output.status.code(), Some(3));
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["state"], "unknown");
+        assert_eq!(value["error"], "operation_not_found_or_denied");
+        assert_eq!(value["operation_id"], requests[1]["operation_id"]);
+    }
+}
+
+#[test]
+fn manual_core_operation_query_uses_the_core_result_allowlist() {
+    let allowed = json!({
+        "operation_id": ID, "command": "core-restart", "core_recovery_version": 2,
+        "bot_id": "101", "shard": 0, "core": 1, "incarnation": "fedcba9876543210",
+        "state": "failed", "reason": "shard_not_running", "source": "archive",
+        "terminal_audit": "synced",
+    });
+    let mut operation = allowed.clone();
+    operation["diagnostic"] = json!("/private/operation/path");
+    let (port, requests) = mock(vec![Reply::Json(json!({
+        "ok": false, "error": "audit_replay_pending", "operation": operation,
+        "note": "/private/reply/path", "debug": "/private/debug/path",
+    }))]);
+    let output = live(&["operation", ID], port);
+    let requests = requests.join().unwrap();
+    assert_eq!(requests[0]["command"], "operation");
+    assert_eq!(requests[0]["operation_id"], ID);
+    assert_eq!(output.status.code(), Some(1));
+    let value = result(&output, false);
+    assert_eq!(value["operation"], allowed);
+    assert_eq!(value["operation_id"], ID);
+    assert!(!value.to_string().contains("/private/"));
+    assert!(value.get("error").is_none());
+}
+
+#[test]
+fn exchange_retries_only_explicit_replay_deferrals_without_an_operation() {
+    let (port, requests) = mock(vec![
+        Reply::Json(json!({"ok": false, "error": "audit_replay_pending", "retry_after_ms": 25})),
+        Reply::Json(json!({"ok": true, "bots": []})),
+    ]);
+    assert_eq!(result(&live(&["status"], port), true)["bots"], json!([]));
+    let requests = requests.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+
+    for reply in [
+        json!({"ok": true, "error": "audit_replay_pending", "bots": []}),
+        json!({"ok": false, "error": "audit_replay_pending", "operation": null, "bots": []}),
+    ] {
+        let ok = reply["ok"].as_bool().unwrap();
+        let (port, requests) = mock(vec![Reply::Json(reply)]);
+        let output = live(&["status"], port);
+        assert_eq!(requests.join().unwrap().len(), 1);
+        assert_eq!(result(&output, ok)["error"], "audit_replay_pending");
+    }
+}
+
+#[test]
+fn core_json_argument_errors_use_the_generic_usage_error_object() {
+    for (args, error) in [
+        (
+            &["core", "status", "alpha", "--json", "--bootstrap-stdin"][..],
+            "core status and core restart require exactly one --shard N",
+        ),
+        (
+            &[
+                "core",
+                "restart",
+                "alpha",
+                "--shard",
+                "0",
+                "--core",
+                "0",
+                "--expect-incarnation",
+                "invalid",
+                "--json",
+                "--bootstrap-stdin",
+            ][..],
+            "--expect-incarnation requires a nonzero 16-digit hexadecimal ID",
+        ),
+    ] {
+        let output = cli(args, &[]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            result(&output, false),
+            json!({"ok": false, "offline": false, "error": error})
+        );
+    }
+}
+
+#[test]
 fn only_configuration_validation_is_offline() {
     let fixture = Fixture::new(CONFIG);
     let value = result(&fixture.run(&["config", "validate", "--json"]), true);

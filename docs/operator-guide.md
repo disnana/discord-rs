@@ -153,11 +153,45 @@ botd は Shard ごとに順番に次を行います。
 - botd が後で Gateway を起動し直すときは、現在の epoch を `--core-epoch` で渡します。古い epoch の Gateway は Core に拒否されます。
 - botd を停止すると、進行中の更新は中断されます。未 activate の待機 Gateway と、置き換え中の旧 Gateway は強制終了します。稼働中の Gateway は通常の停止手順で止まります。
 
-権限は管理 secret に結び付いた role が `admin` で、scope が選択された Shard を含む場合に限られます。対象を指定しない場合は Bot の全 Shard が対象です（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の要求と結果は `runtime-root/gateway-update-audit.jsonl` に 1 行ずつ追記されます（権限 0600）。event は `requested`・`rejected`・`succeeded`・`failed` のいずれかで、記録は subject、role、bot、operation ID と固定の失敗種別だけです。Shard 指定はまだ記録されません。secret、パス、引数、エラー本文は含みません。要求を記録できない場合は、何も始めずに拒否されます（詳細と限界は[制約一覧](known-limitations.md)）。
+権限は管理 secret に結び付いた role が `admin` で、scope が選択された Shard を含む場合に限られます。対象を指定しない場合は Bot の全 Shard が対象です（`viewer`・`updater`、または scope 外は `control permission or scope denied` で拒否）。単一の bootstrap secret の既定 role は `admin` です。`gateway-update` の要求と結果は `runtime-root/gateway-update-audit.jsonl` に 1 行ずつ追記されます（権限 0600）。event は `requested`・`rejected`・`succeeded`・`failed` のいずれかで、記録は時刻、subject、role、正規の Bot ID（解決できない場合は null）、operation ID と固定の失敗種別です。Shard 指定はまだ記録されません。secret、パス、引数、エラー本文は含みません。要求を記録できない場合は、何も始めずに拒否されます（詳細と限界は[制約一覧](known-limitations.md)）。
 
 ログは稼働中も大きさに上限があります。`gateway.log` と `gateway-candidate.log` は 8 MiB、`core-*.log` は 4 MiB を超えると、約 60 秒ごとに `.1` へ写してから空にします（既存の `.1` は置き換えます）。起動時は `gateway.log` が 1 MiB を超えていれば `.1` へ退避します。 常に書き続ける書き手でも回転が止まらないよう、増えた分を数回コピーしてから空にします。その代わり、コピーと空にする間に書かれた分は失われ得ます（量は保証しません。上限を優先）。ローテーション後は `.1` に直前の分だけが残るため、`soak-diff.sh` の「最初と最後の比較」では回転をまたぐと件数が減ることがあります。
 
 待機 Gateway を同じ `gateway.log` に書く変更は、自動テスト（WSL。更新後に候補のログが作られないこと）で確認済みですが、Oracle・実 Discord ではまだ確認していません。ログの回転も実 Discord での確認はありません。
+
+### 分離 Core の手動再起動（P3）
+
+Linux の分離モードで、対象シャードの閲覧権限があれば `core status` で Core を確認できます。`cores` 配列はスロット番号順です。`core restart` は対象シャードの `admin` が実行できます。以下では、稼働中の botd に設定した管理 secret ファイルと制御ポートを指定します。
+
+```sh
+botctl core status BOT --shard N --secret-file /absolute/secret --port PORT
+botctl core restart BOT --shard N --core K --secret-file /absolute/secret --port PORT
+botctl core restart BOT --shard N --core K --expect-incarnation ID --yes --json --secret-file /absolute/secret --port PORT
+```
+
+再起動の前に対象のシャード、スロット、incarnation、停滞の疑いと状態記録の経過秒、診断に含まれる pending 件数と最古の経過秒、peer の状態を標準エラーへ表示します。対話時は `yes` と入力して進みます。非対話の標準入力では `--yes` が必須です。`--bootstrap-stdin` も使用でき、パイプで bootstrap を渡す場合は `--yes` を付けます。
+
+プレビューの世代または空スロットを再起動要求に固定します。`--expect-incarnation ID` を指定する場合は、表示済みの 16 桁の 16 進 ID を渡してください。プレビュー時点で ID が異なれば要求を送らず拒否し、確認後に対象が変わった場合は botd が拒否します。`core-preview` に対応していない botd では再起動要求を送りません。
+
+送信直前に操作 ID を標準エラーへ表示し、結果の確認が必要な場合は同じ ID で `operation` を照会します。`--timeout` の既定は 30 秒で、認証情報の読み取り、プレビュー、要求、照会に共通です。対話確認の入力待ちは含みません。`--json` では結果を単一の JSON オブジェクトとして標準出力に返します。再起動の結果には `state` と、要求を組み立てた場合は `operation_id` が入ります。例外として、`core status` と `core restart` の引数の解析・検証エラーは接続前に終了コード 1 を返し、`--json` の出力は `ok: false`、`offline: false`、`error` の 3 項目です。
+
+| 終了コード | `state` | 意味 |
+|---:|---|---|
+| 0 | `succeeded` | 旧 Core があれば回収し、置換を起動して IPC capability を渡した |
+| 1 | `rejected` | CLI の事前確認または botd の受付で拒否された |
+| 2 | `failed` | 操作の失敗を確認した。理由は `operation.reason` |
+| 3 | `unknown` | 応答と照会結果から受理の有無や終端結果を確定できなかった |
+| 4 | `timeout` | CLI の待機期限に達した。送信済みの操作は続く場合がある |
+
+P3 の最小クライアントバージョンは **Core 復旧プロトコル v2** です。操作の照会には v2 対応の botd と同じビルドの `botctl operation` を使用します。Core の操作結果は、自動照会と手動照会で同じ許可済みフィールドを表示します。応答の `operation.core_recovery_version` は `2` で、`source` は `live` または `archive` です。各 `core-restart` 要求には `core_recovery_version: 2`、`bot`、`shard`、`core`、`expect_bot_id`、`expect_total_shards`、32 桁の小文字 16 進の `operation_id` が必要です。旧 Core がある場合は、P1 の有効・無効にかかわらず、プレビューの 16 桁の `incarnation` を `expect_incarnation` に指定します。空スロットは `expect_empty: true` で指定します。
+
+Gateway が稼働中のシャードで、停滞の疑いがある Core または空スロットを対象にできます。稼働中の Core を止める際は、もう一方の Core の稼働を確認できることが必要です。正常な Core や peer の稼働を確認できない Core を対象にするには `--force` が必要で、使用は監査ログに残ります。対象の固定と回数制限は `--force` にも適用されます。同じシャードの競合は `busy` になります。同じスロットの手動操作は 60 秒以上空け、15 分に 3 回までです。開始時に 1 回分を計上し、完了まで長引いた場合は次の操作までの間隔を完了時点から測ります。監査ログの `charge_clock` は Linux の起動 ID と起動後の経過時間です。再生時に経過時間を確認できない操作は直近の試行として扱います。
+
+botd は要求フレームの読み取りを最大 3 秒、認証後の Core 再起動と Gateway 更新の応答を最大 8 秒待ちます。監査要求の同期は最大 5 秒待ち、`audit_timeout` を返す場合は予約を解除します。同期後も Gateway と対象を再確認し、旧 Core の stdin を閉じます。5 秒後も旧 Core が残っていれば、通常は peer の稼働を再確認してから botd が直接子へ強制終了を要求します。peer が失われた場合は `last_running_core` を返し、旧 Core を保持します。再試行には新しい操作 ID と最新のプレビューで取得した世代を使います。必要に応じて `force` を指定でき、通常の回数制限が適用されます。`termination_unconfirmed` では終了確認まで子を保持します。置換起動の 5 秒期限に達すると `launch_timeout` になり、シャードの操作予約を解除します。同じスロットは遅れて戻った起動結果と直接子の回収を確認してから再利用できます。
+
+切断やタイムアウト時は、表示された ID を `botctl operation ID --secret-file /absolute/secret --port PORT` で照会してください。照会は記録されたシャードのスコープで認可します。監査は runtime root の `core-recovery-audit.jsonl` に記録します。`terminal_audit: pending_or_failed` は終端記録の未確認を示します。botd 再起動後に要求だけが残ると結果は `unknown` です。通常停止時には、同期済みの要求を `failed/daemon_shutdown` として記録するために最大 2 秒間、制御監査の完了を待ちます。起動時の監査再生中は操作 ID を使う変更要求に `audit_replay_pending` と `retry_after_ms` を返します。無効な履歴を検出した場合は P3 の新規操作を拒否します。Gateway 更新は監査同期の待機中から操作 ID を予約します。`status` の `core_recovery_audit` には `available`、`pending`、`failed_or_dropped` が表示され、拒否記録も同期結果が判明するまで `pending` に含まれます。
+
+`succeeded` は旧 Core があれば回収し、置換プロセスを起動して stdin に IPC capability を書き込んだことを示します。Core のソケット待受、Gateway の認証付き再接続、処理中だった作業やイベントの復旧は保証に含まれません。stdin の EOF でも処理中のイベントは中断され得ます。未受領の REST 結果が不明な場合、再試行すると外部操作が重複する可能性があります。[制約一覧](known-limitations.md)
 
 ### Discordに接続しない模擬実行
 

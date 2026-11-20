@@ -17,7 +17,7 @@
 ## 2. 現状（コードで確認した事実）
 
 - botd は、シャードごとに Core を **2 スロット**起動し、`Child` のハンドルを保持している（`core_units.rs`）。終了した Core は、**指数バックオフ（1 秒〜30 秒、60 秒以上生きたら 1 秒に戻る）で自動的に再起動**される。`kill()` は、停止の期限後の最終手段としてだけ、**自分のハンドル**に使う。
-- Core の識別：起動ごとにランダムな非ゼロの **incarnation id**（`status_id`、P1）と PID を、スロットが持つ。`botctl status` に出る（P1 を有効にした場合）。
+- Core の識別：botd は起動ごとにランダムな非ゼロの **incarnation id** を割り当てる。P1 が有効なら同じ ID を診断に渡す。`core-preview` は P1 の設定にかかわらず管理用 ID を返す。
 - 制御：`127.0.0.1` の認証つき接続。要求ごとに secret を検証し、**role（`admin` など）と shard の scope** を検査する。`gateway-update` は、`gateway-update-audit.jsonl`（0600）に**要求を先に記録できなければ、何も始めず拒否**する。記録は固定語彙だけ（secret・パス・引数・エラー本文なし）。
 - 操作の直列化：`gateway-update` は、シャード単位の状態（候補・退役中の Gateway など）で、同時の操作を拒否する。
 - 配送：`(key ^ (key >> 22)) % Core の数`。**Core が落ちている間、その Core 宛の要求は処理されない**（Gateway では `worker_unavailable`）。Gateway は、新しい Core へ再接続できる（Core を落とす試験で確認済み）。
@@ -39,7 +39,7 @@ botctl core restart <BOT> --shard N --core K [--expect-incarnation ID] [--force]
 要求には、次を含め、**1 つでも一致しなければ、何もせず拒否**する。
 - `bot_id`（`expect_bot_id`）、`expect_total_shards`、shard、core 番号（0 ≤ K < Core の数）。
 - **`expect_incarnation`：いま、そのスロットで動いている Core の incarnation id と一致すること。** 再起動済みの Core（別の incarnation）や、別の世代の Core を、古い画面の情報で止めない。
-- 診断が無効（P1 を有効にしていない）で incarnation が分からないときは、`--force` が要る（4.3）。PID は、再利用され得るので、**識別には使わない**（`Child` のハンドルが保持されている限り、プロセス自体はハンドルで特定できる）。
+- 空のスロットは `expect_empty: true` で指定する。稼働中の世代と空の状態は別の事前条件で、`--force` でも固定する。PID による対象指定を受け付けず、botd が所有する `Child` で終了を観測する。
 
 ### 4.2 認可
 - **既存の role `admin` ＋ shard の scope**（`gateway-update` と同じ）。`viewer`・`updater` は拒否。
@@ -50,7 +50,8 @@ botctl core restart <BOT> --shard N --core K [--expect-incarnation ID] [--force]
 次のいずれかを満たさない場合、**`--force` なしでは拒否**する。
 - P1 の記録で「停滞の疑い」（`suspected_stalled`）。
 - スロットが、動いていない（落ちたまま、またはバックオフ待ち）。
-- 「最後の稼働中の Core」を止めるとき：**もう一方の Core が動いていなければ**、そのシャードが全面的に止まるので、`--force` が要る。
+
+稼働中の Core を停止する際は、必要性とは別に、peer のプロセスが稼働中と観測できることを確認する。不明な場合や最後の稼働中 Core を止める場合には `--force` が要る。
 
 `--force` は、監査に残る。
 
@@ -71,26 +72,26 @@ botctl core restart <BOT> --shard N --core K [--expect-incarnation ID] [--force]
 
 ## 5. 再起動の手順（daemon が行う）
 
-すべて、botd の**所有者ループ**で、非同期（待たずに状態機械で）進める。ブロックしない。
+botd の所有者ループが対象を予約し、回収と置換の状態を進める。監査の同期書き込みと手動の置換起動はループ外で行う。
 
 1. 認証・scope・対象の固定・排他・制限・必要性（4.1〜4.5）を検査。**1 つでも失敗なら、何も変えず、`rejected` を記録**して拒否。
 2. **`requested` を監査に記録**。記録できなければ、何も始めず拒否（`gateway-update` と同じ規律）。
 3. スロットを「復旧中」にする：自動の再起動の予定を保留し、stdin を閉じる（正常終了の要求）。**猶予（例：5 秒）まで待つ。**
 4. 猶予内に終了しなければ、**botd 自身が持つ `Child` のハンドルで強制終了**し、回収する（PID を指定した外部の `kill` はしない）。
 5. 新しい Core を起動し、新しい incarnation id が割り当たったことを確認する。**起動に失敗したら `failed`**（通常のバックオフの再試行に戻る）。
-6. **`succeeded` / `failed` を記録**。`succeeded` は「**旧 Core の終了を確認し、新しい Core を起動した**」の意味で、**処理が回復した、結果が確定した、という意味ではない**。
+6. **`succeeded` / `failed` を記録する。** `succeeded` は、旧 Core があれば終了を確認し、置換を起動して IPC capability を書き込んだことを示す。ソケット待受、認証付き再接続、アプリケーションの処理再開は別に確認する。
 
-制御の接続が途中で切れても、受理済みの操作は取り消さない（既存の規律）。応答は、完了後に、`operation` で照会できるようにする（既存の `operation` コマンドを流用できるか、要確認）。
+監査に同期された要求は、制御接続が切れても進める。制御応答は操作 ID を返し、結果は `operation` で照会する。botd 再起動後に要求だけが記録されている操作は `unknown` として扱い、終了処理は繰り返さない。
 
 ## 6. 監査と、結果の正直さ
 
 **`core-recovery-audit.jsonl`（0600、追記、既存の監査と同じ作法）。** 1 操作に、`requested` → `succeeded` / `failed`、または `rejected`。項目は固定語彙：時刻（UTC）、subject、role、bot_id、shard、core、操作 ID、`force` の有無、対象の incarnation id、理由コード（拒否・失敗の種別。固定語彙）。**secret・パス・引数・エラー本文は含めない。**
 
-**応答と文書に、必ず書くこと（保証しないこと）：**
-- 強制終了された Core が処理中だった**イベントの処理は、完了しない**。Discord は、Gateway のイベントを再配信しない。
-- その Core が発行して**まだ結果を受け取っていない外部操作（REST）は、結果不明**になり得る。**再試行は、重複の危険があるので、運用者の判断**（08）。
-- 再起動の間、その Core 宛の要求は `worker_unavailable`。もう一方の Core は影響を受けない。
-- 再起動した Core の**重複排除の記憶（`SeenIds`）は空**から始まる。再配送された Interaction などは、重複して処理され得る（差し替え時の引き継ぎは、優先順位 6 の対象で、P3 では扱わない）。
+- EOF または強制終了で処理中のイベントは中断され得る。Core の再起動では、Gateway が受信済みのイベントの再処理は保証されない。
+- Core が発行して結果を受け取っていない外部操作（REST）は結果不明になり得る。再試行は重複を引き起こし得るため、運用者が判断する（08）。
+- Core が利用不能な間は対象スロット宛てが `worker_unavailable` になり得る。もう一方の Core も Gateway の配信用の許可枠を共有する。
+- 新しい Core の `SeenIds` は空になる。対象は source ID を持つ `Dispatch` で、slash command は別経路を通る。
+- 停止と終了確認の対象は botd の直接子。プロセスグループの終了確認は別の設計が必要。
 
 ## 7. 検証計画
 
@@ -119,6 +120,5 @@ botctl core restart <BOT> --shard N --core K [--expect-incarnation ID] [--force]
 
 ## 10. 既知のリスク・要確認
 
-- 停滞した Core が、stdin の EOF に反応しない場合は、**猶予が無駄になる**だけで、強制終了で止まる（`SIGKILL` は常に効く。ただしカーネルで D 状態のプロセスは例外）。
-- 診断（P1）が無効の環境では、incarnation が分からず、`--force` が増える。P1 をオプトインにした判断と、緊張関係がある。**P3 を使う運用では、P1 の有効化を推奨**する。
-- 既存の `operation` 照会に、Core の復旧を載せられるかは、実装時に確認する（載らなければ、応答に同期して結果を返す）。
+- EOF に応じない Core には 5 秒後に強制終了を要求する。カーネル待機や観測エラーで終了を確認できない場合は `termination_unconfirmed` を返す。その botd は終了の観測まで子を保持する。
+- P1 が無効な場合も管理用 ID を取得できる。稼働中 Core の停滞を診断できないときは `--force` が必要になる。
