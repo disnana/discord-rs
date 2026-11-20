@@ -4,7 +4,7 @@
 //! is random unless `--control-port` is given (only with `--secret-file`).
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use src::daemon::control::{CommandRequest, ControlPlane, NOTE};
+use src::daemon::control::{AUDIT_ACK_TIMEOUT, CommandRequest, ControlPlane, NOTE};
 use src::daemon::update_control::{ControlAccess, UpdateHub};
 use src::{cluster::NodeId, cluster_runtime::RaftRuntimeOptions, raft_quorum::StorageMode};
 use src::{local_control::DaemonControlEnvelope, update_rollback::UpdateControlRequest};
@@ -467,56 +467,64 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
     access: &ControlAccess,
     commands: &mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
-    tokio::time::timeout(DEADLINE, async {
-        let frame = read_frame(&mut stream).await?;
-        let request: WireRequest = serde_json::from_slice(&frame)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid status request"))?;
-        let received_secret = match &request {
-            WireRequest::Update(wire) => &wire.secret,
-            WireRequest::Command(wire) => &wire.secret,
-        };
-        if !bool::from(received_secret.ct_eq(secret)) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "status request denied",
-            ));
-        }
-        let (command, update) = match request {
-            WireRequest::Update(wire) => (
-                CommandRequest {
-                    command: wire.request.command_name().into(),
-                    bot: Some(wire.request.bot.clone()),
-                    operation_id: Some(wire.request.operation_id.clone()),
-                    yes: wire.request.yes,
-                    ..Default::default()
-                },
-                Some(wire.request),
-            ),
-            WireRequest::Command(request) => (
-                CommandRequest {
-                    command: request.command,
-                    bot: request.bot,
-                    operation_id: request.operation_id,
-                    force: request.force,
-                    yes: request.yes,
-                    shards: request.shards,
-                    expect_total_shards: request.expect_total_shards,
-                    expect_bot_id: request.expect_bot_id,
-                    shard: request.shard,
-                    core: request.core,
-                    expect_incarnation: request.expect_incarnation,
-                    expect_empty: request.expect_empty,
-                    core_recovery_version: request.core_recovery_version,
-                },
-                None,
-            ),
-        };
-        if update.is_none() && !command.valid() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "control request denied",
-            ));
-        }
+    let frame = tokio::time::timeout(DEADLINE, read_frame(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control frame timed out"))??;
+    let request: WireRequest = serde_json::from_slice(&frame)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid status request"))?;
+    let received_secret = match &request {
+        WireRequest::Update(wire) => &wire.secret,
+        WireRequest::Command(wire) => &wire.secret,
+    };
+    if !bool::from(received_secret.ct_eq(secret)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "status request denied",
+        ));
+    }
+    let (command, update) = match request {
+        WireRequest::Update(wire) => (
+            CommandRequest {
+                command: wire.request.command_name().into(),
+                bot: Some(wire.request.bot.clone()),
+                operation_id: Some(wire.request.operation_id.clone()),
+                yes: wire.request.yes,
+                ..Default::default()
+            },
+            Some(wire.request),
+        ),
+        WireRequest::Command(request) => (
+            CommandRequest {
+                command: request.command,
+                bot: request.bot,
+                operation_id: request.operation_id,
+                force: request.force,
+                yes: request.yes,
+                shards: request.shards,
+                expect_total_shards: request.expect_total_shards,
+                expect_bot_id: request.expect_bot_id,
+                shard: request.shard,
+                core: request.core,
+                expect_incarnation: request.expect_incarnation,
+                expect_empty: request.expect_empty,
+                core_recovery_version: request.core_recovery_version,
+            },
+            None,
+        ),
+    };
+    if update.is_none() && !command.valid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "control request denied",
+        ));
+    }
+    let response_deadline = if matches!(command.command.as_str(), "core-restart" | "gateway-update")
+    {
+        AUDIT_ACK_TIMEOUT + DEADLINE
+    } else {
+        DEADLINE
+    };
+    tokio::time::timeout(response_deadline, async {
         // Only the daemon owner admits/executes commands. A disconnected client
         // never cancels an already admitted operation or forces a child to exit.
         let (response, receiver) = oneshot::channel();
@@ -886,32 +894,24 @@ async fn run() -> Result<(), &'static str> {
             }
             Some(envelope) = receiver.recv() => {
                 if !envelope.response.is_closed() {
+                    let external_id_conflict = envelope.request.operation_id.as_deref()
+                        .is_some_and(|id| updates.contains(id));
                     #[cfg(unix)]
-                    if envelope.request.command == "core-restart"
-                        && !envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id))
-                    {
-                        control.dispatch_core_restart(&envelope.request, &envelope.access, envelope.response, audit.status());
+                    if envelope.request.command == "core-restart" {
+                        control.dispatch_core_restart(&envelope.request, &envelope.access, external_id_conflict, envelope.response, audit.status());
                         continue;
                     }
                     #[cfg(unix)]
                     if envelope.request.command == "gateway-update" && envelope.update.is_none() {
-                        control.dispatch_gateway_update(envelope.request, &envelope.access, envelope.response, audit.status());
+                        control.dispatch_gateway_update(envelope.request, &envelope.access, external_id_conflict, envelope.response, audit.status());
                         continue;
                     }
                     let mut response = if let Some(update) = envelope.update {
-                        if control.operation_exists(&update.operation_id) {
-                            json!({"ok":false,"error":"operation ID conflicts with an earlier request"})
-                        } else {
-                            let busy = control.bot_busy(&update.bot);
-                            updates.admit(update, envelope.access, busy)
-                        }
-                    } else if envelope.request.command == "operation" && envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id)) {
+                        control.dispatch_manifest_update(&mut updates, update, envelope.access)
+                    } else if envelope.request.command == "operation" && external_id_conflict {
                         updates.query(envelope.request.operation_id.as_deref().unwrap(), &envelope.access)
-                    } else if envelope.request.command == "core-restart"
-                        && envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id)) {
-                        json!({"ok":false,"error":"operation_id_conflict"})
                     } else if matches!(envelope.request.command.as_str(), "start" | "stop" | "restart")
-                        && (envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id)) || envelope.request.bot.as_deref().and_then(|selector| src::botref::resolve(&config.bots, selector).ok().map(|b| updates.busy(&b.bot_id))).unwrap_or(false)) {
+                        && (external_id_conflict || envelope.request.bot.as_deref().and_then(|selector| src::botref::resolve(&config.bots, selector).ok().map(|b| updates.busy(&b.bot_id))).unwrap_or(false)) {
                         json!({"ok":false,"error":"Bot or operation ID is already busy"})
                     } else { control.request_as(&envelope.request, &envelope.access) };
                     response["recovery_audit"] = audit.status();
@@ -936,6 +936,10 @@ async fn run() -> Result<(), &'static str> {
                 STOP_CHILDREN_DEADLINE.as_secs()
             );
         }
+    }
+    #[cfg(unix)]
+    if !control.shutdown_core_launches().await {
+        eprintln!("Core launch shutdown deadline reached; replacement cleanup is unconfirmed");
     }
     #[cfg(unix)]
     if !control.shutdown_control_audits().await {
@@ -1846,6 +1850,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_core_admission_can_reply_after_the_frame_deadline() {
+        let wire = json!({
+            "secret": vec![7; 32], "command": "core-restart", "bot": "bot",
+            "shard": 1, "core": 0, "expect_total_shards": 2, "expect_bot_id": "7",
+            "expect_incarnation": "fedcba9876543210", "force": true,
+            "core_recovery_version": src::daemon::control::CORE_RECOVERY_VERSION,
+            "operation_id": "0123456789abcdef0123456789abcdef",
+        });
+        let (mut client, server) = duplex(8192);
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
+        let task = tokio::spawn(async move {
+            serve_control(server, &[7; 32], &ControlAccess::default(), &sender).await
+        });
+        client
+            .write_all(format!("{wire}\n").as_bytes())
+            .await
+            .unwrap();
+        let envelope = receiver.recv().await.unwrap();
+        assert_eq!(envelope.request.command, "core-restart");
+        tokio::time::sleep(AUDIT_ACK_TIMEOUT).await;
+        envelope
+            .response
+            .send(json!({"ok": false, "error": "audit_timeout"}))
+            .unwrap();
+        let reply = read_frame(&mut client).await.unwrap();
+        let reply: Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(reply["error"], "audit_timeout");
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn rejects_oversized_response_before_writing() {
         let (result, response) = status_session(
             &request([7; 32], "status"),
@@ -1860,7 +1895,12 @@ mod tests {
     async fn idle_control_client_has_a_deadline() {
         let (_client, server) = duplex(128);
         let (sender, _receiver) = mpsc::channel(1);
-        let result = serve_status(server, &[7; 32], &sender).await;
+        let result = tokio::time::timeout(
+            DEADLINE + Duration::from_secs(1),
+            serve_status(server, &[7; 32], &sender),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 

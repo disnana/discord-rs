@@ -301,6 +301,71 @@ async fn control(port: u16, mut value: Value) -> Value {
     serde_json::from_slice(&reply).expect("daemon response")
 }
 
+#[tokio::test]
+async fn core_restart_conflict_with_manifest_update_is_audited_over_control_wire() {
+    let mut fixture = Fixture::start().await;
+    let _gateway = fixture.accept().await;
+    bounded(async {
+        loop {
+            let view = control(fixture.port, json!({"command":"status"})).await;
+            if view["status"]["core_recovery_audit"]["ok"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let id = "789abcde01234567789abcde01234567";
+    let update = control(fixture.port, json!({
+        "command": "update", "bot": "101", "operation_id": id, "yes": true, "component": "core",
+        "manifest": {
+            "bot_id": "101", "bot_name": "alpha", "total_shards": 1,
+            "shards": [{"shard_id": 0, "core": {"current": 1, "candidate": 2}}],
+            "artifacts": {"core": {"path": fixture.root.join("unused"), "sha256": "0".repeat(64)}}
+        }
+    })).await;
+    assert_eq!(update["operation"]["state"], "running", "{update}");
+    let preview = control(
+        fixture.port,
+        json!({"command": "core-preview", "bot": "alpha", "shard": 0}),
+    )
+    .await;
+    let incarnation = preview["cores"][0]["incarnation"].as_str().unwrap();
+    let reply = control(
+        fixture.port,
+        json!({
+            "command": "core-restart", "bot": "alpha", "shard": 0, "core": 0,
+            "expect_total_shards": 1, "expect_bot_id": "101", "expect_incarnation": incarnation,
+            "operation_id": id, "force": true,
+            "core_recovery_version": src::daemon::control::CORE_RECOVERY_VERSION,
+        }),
+    )
+    .await;
+    assert_eq!(reply["error"], "operation_id_conflict", "{reply}");
+    let audit_path = fixture.root.join("core-recovery-audit.jsonl");
+    let rows = bounded(async {
+        loop {
+            let view = control(fixture.port, json!({"command":"status"})).await;
+            if view["status"]["core_recovery_audit"]["ok"] == true {
+                break std::fs::read_to_string(&audit_path).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let mut lines = rows.lines();
+    let row: Value = serde_json::from_str(lines.next().expect("durable rejection")).unwrap();
+    assert!(lines.next().is_none());
+    assert_eq!(row["event"], "rejected");
+    assert_eq!(row["operation_id"], id);
+    assert_eq!(row["bot_id"], "101");
+    assert_eq!(row["reason"], "operation_id_conflict");
+    assert_eq!(row["incarnation"], incarnation);
+    signal(fixture.daemon.id().unwrap(), "TERM");
+    assert!(bounded(fixture.daemon.wait()).await.unwrap().success());
+    std::fs::remove_dir_all(&fixture.root).unwrap();
+}
+
 /// A Gateway update through botd: a standby Gateway starts, becomes active, and the old one
 /// exits, while the Core processes stay the very same ones. A Gateway botd restarts
 /// afterwards attaches with the new epoch (it could not otherwise reach the Cores).

@@ -1005,6 +1005,7 @@ pub mod control {
                 | "separate_cores_required"
                 | "termination_unconfirmed"
                 | "launch_failed"
+                | "launch_timeout"
         )
     }
     fn update_timeout(shards: usize) -> Duration {
@@ -1216,10 +1217,11 @@ pub mod control {
     const CORE_RESTART_LIMIT: usize = 3;
     #[cfg(unix)]
     const AUDIT_QUEUE_LIMIT: usize = 64;
-    #[cfg(unix)]
-    const AUDIT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+    pub const AUDIT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
     #[cfg(unix)]
     const AUDIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+    #[cfg(unix)]
+    const CORE_LAUNCH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
     const CORE_RESTART_NOTE: &str = "succeeded は、旧 Core があれば終了を確認し、新しい Core を起動して stdin へ IPC capability を書き込んだことを示します。IPC の再接続と処理の状態は別途確認してください。中断したイベントの処理や未受領の REST 結果は不明になり得ます。";
 
     #[cfg(unix)]
@@ -1529,6 +1531,8 @@ pub mod control {
         core_audit_boot_id: Option<String>,
         #[cfg(unix)]
         core_audit_failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        #[cfg(unix)]
+        core_audit_rejections: Vec<AuditResult>,
         #[cfg(unix)]
         gateway_audit_worker: Option<tokio::sync::mpsc::Sender<CoreAuditJob>>,
         #[cfg(unix)]
@@ -2193,6 +2197,19 @@ pub mod control {
 
         fn retry_pending_audit(&mut self) {
             #[cfg(unix)]
+            self.core_audit_rejections.retain_mut(|result| {
+                use tokio::sync::oneshot::error::TryRecvError;
+                match result.try_recv() {
+                    Err(TryRecvError::Empty) => return true,
+                    Ok((_, true)) => {}
+                    Ok((_, false)) | Err(TryRecvError::Closed) => {
+                        self.core_audit_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                false
+            });
+            #[cfg(unix)]
             self.audit_writes.retain_mut(|(kind, result)| {
                 use tokio::sync::oneshot::error::TryRecvError;
                 match result.try_recv() {
@@ -2239,26 +2256,51 @@ pub mod control {
         }
 
         pub fn operation_exists(&self, id: &str) -> bool {
-            if self.operations.contains_key(id) {
-                return true;
-            }
-            self.archived_core_exists(id)
+            self.operations.contains_key(id) || self.operation_id_reserved(id)
         }
 
         #[cfg(unix)]
-        fn archived_core_exists(&self, id: &str) -> bool {
-            self.reserved_core_ids.contains(id) || self.archived_core_restarts.contains_key(id)
+        fn operation_id_reserved(&self, id: &str) -> bool {
+            self.reserved_core_ids.contains(id)
+                || self.archived_core_restarts.contains_key(id)
+                || self
+                    .pending_gateway_updates
+                    .iter()
+                    .any(|pending| pending.request.operation_id.as_deref() == Some(id))
         }
 
         #[cfg(not(unix))]
-        fn archived_core_exists(&self, _id: &str) -> bool {
+        fn operation_id_reserved(&self, _id: &str) -> bool {
             false
         }
 
-        pub fn bot_busy(&self, bot: &str) -> bool {
-            self.operations
+        fn replay_retry_response(&self) -> Option<Value> {
+            #[cfg(unix)]
+            if self.core_audit_replay.is_some() {
+                let mut response = Self::error("audit_replay_pending");
+                response["retry_after_ms"] = json!(100);
+                return Some(response);
+            }
+            None
+        }
+
+        pub fn dispatch_manifest_update(
+            &self,
+            updates: &mut super::update_control::UpdateHub,
+            request: crate::update_rollback::UpdateControlRequest,
+            access: super::update_control::ControlAccess,
+        ) -> Value {
+            if let Some(response) = self.replay_retry_response() {
+                return response;
+            }
+            if self.operation_exists(&request.operation_id) {
+                return Self::error("operation ID conflicts with an earlier request");
+            }
+            let busy = self
+                .operations
                 .values()
-                .any(|op| op.bot_id == bot && op.finished.is_none())
+                .any(|op| op.bot_id == request.bot && op.finished.is_none());
+            updates.admit(request, access, busy)
         }
 
         pub fn request_as(
@@ -2269,7 +2311,7 @@ pub mod control {
             if request.command == "core-restart" {
                 #[cfg(unix)]
                 return self
-                    .request_core_restart(request, access, Instant::now(), None)
+                    .request_core_restart(request, access, Instant::now(), false, None)
                     .unwrap_or_else(|| Self::error("audit_unavailable"));
                 #[cfg(not(unix))]
                 return Self::error("core restart requires separate Core mode on Linux");
@@ -2368,6 +2410,9 @@ pub mod control {
                 return Self::error("control permission or scope denied");
             }
             if request.command == "gateway-update" && request.valid() {
+                if let Some(response) = self.replay_retry_response() {
+                    return response;
+                }
                 let id = request.operation_id.clone().unwrap_or_default();
                 let bot = target.as_deref();
                 let actor = (access.subject.clone(), access.role.clone());
@@ -2393,6 +2438,7 @@ pub mod control {
             &mut self,
             request: CommandRequest,
             access: &super::update_control::ControlAccess,
+            external_id_conflict: bool,
             response: tokio::sync::oneshot::Sender<Value>,
             recovery_audit: Value,
         ) {
@@ -2426,8 +2472,19 @@ pub mod control {
                 reply.send(Self::error("control permission or scope denied"));
                 return;
             }
+            if let Some(response) = self.replay_retry_response() {
+                reply.send(response);
+                return;
+            }
             let actor = (access.subject.clone(), access.role.clone());
             let id = request.operation_id.as_deref().expect("validated ID");
+            if external_id_conflict || self.operation_id_reserved(id) {
+                self.audit_gateway_rejection(id, bot.as_deref(), &actor);
+                reply.send(Self::error(
+                    "operation ID conflicts with an earlier request",
+                ));
+                return;
+            }
             if bot.is_none() || (!self.operations.contains_key(id) && self.core_restart_busy(&keys))
             {
                 self.audit_gateway_rejection(id, bot.as_deref(), &actor);
@@ -2520,6 +2577,7 @@ pub mod control {
             &mut self,
             request: &CommandRequest,
             access: &super::update_control::ControlAccess,
+            external_id_conflict: bool,
             response: tokio::sync::oneshot::Sender<Value>,
             recovery_audit: Value,
         ) {
@@ -2528,7 +2586,13 @@ pub mod control {
                 recovery_audit,
             };
             // すぐ返せる拒否はここで応答する。追記中の要求の応答は操作が保持する。
-            let _ = self.request_core_restart(request, access, Instant::now(), Some(reply));
+            let _ = self.request_core_restart(
+                request,
+                access,
+                Instant::now(),
+                external_id_conflict,
+                Some(reply),
+            );
         }
 
         #[cfg(unix)]
@@ -2537,9 +2601,10 @@ pub mod control {
             request: &CommandRequest,
             access: &super::update_control::ControlAccess,
             now: Instant,
+            external_id_conflict: bool,
             mut reply: Option<ControlReply>,
         ) -> Option<Value> {
-            if !request.valid() {
+            if request.command != "core-restart" || !request.valid() {
                 return ControlReply::respond(reply, Self::error("invalid control request"));
             }
             if !access.valid() {
@@ -2570,15 +2635,18 @@ pub mod control {
             };
             let id = request.operation_id.as_deref().expect("validated ID");
             let force = request.force;
-            let reject =
-                |plane: &Self, reply, recovery: &CoreRestart, reason, retry: Option<Duration>| {
-                    plane.audit_core_rejection(id, &key, force, recovery, reason);
-                    let mut value = Self::error(reason);
-                    if let Some(retry) = retry {
-                        value["retry_after_ms"] = json!(retry.as_millis().max(1));
-                    }
-                    ControlReply::respond(reply, value)
-                };
+            let reject = |plane: &mut Self,
+                          reply,
+                          recovery: &CoreRestart,
+                          reason,
+                          retry: Option<Duration>| {
+                plane.audit_core_rejection(id, &key, force, recovery, reason);
+                let mut value = Self::error(reason);
+                if let Some(retry) = retry {
+                    value["retry_after_ms"] = json!(retry.as_millis().max(1));
+                }
+                ControlReply::respond(reply, value)
+            };
             let local_keys = self
                 .daemon
                 .entries
@@ -2590,6 +2658,12 @@ pub mod control {
                 local_keys.unwrap_or_default(),
             ) {
                 return reject(self, reply, &recovery, "permission_denied", None);
+            }
+            if let Some(response) = self.replay_retry_response() {
+                return ControlReply::respond(reply, response);
+            }
+            if external_id_conflict {
+                return reject(self, reply, &recovery, "operation_id_conflict", None);
             }
             let Some(bot) = bot else {
                 return reject(self, reply, &recovery, "bot_not_found", None);
@@ -2630,7 +2704,7 @@ pub mod control {
                 }
                 return reject(self, reply, &recovery, "operation_id_conflict", None);
             }
-            if self.reserved_core_ids.contains(id) {
+            if self.operation_id_reserved(id) {
                 return reject(self, reply, &recovery, "operation_id_conflict", None);
             }
             if !self.core_audit_ready {
@@ -2824,7 +2898,7 @@ pub mod control {
 
         #[cfg(unix)]
         fn audit_core_rejection(
-            &self,
+            &mut self,
             id: &str,
             key: &ShardKey,
             force: bool,
@@ -2835,7 +2909,15 @@ pub mod control {
                 Self::core_restart_record("rejected", id, key, force, recovery, Some(reason))
                     .is_ok_and(|mut record| {
                         if let Some(worker) = self.core_audit_worker.as_ref() {
-                            Self::submit_audit(worker, record, false).is_ok()
+                            // The queue can hold 64 jobs while the worker writes one.
+                            if self.core_audit_rejections.len() >= AUDIT_QUEUE_LIMIT + 1 {
+                                return false;
+                            }
+                            let Ok(Some(result)) = Self::submit_audit(worker, record, true) else {
+                                return false;
+                            };
+                            self.core_audit_rejections.push(result);
+                            true
                         } else {
                             self.write_audit(&mut record).is_ok()
                         }
@@ -2964,6 +3046,8 @@ pub mod control {
                 core_audit_boot_id: None,
                 #[cfg(unix)]
                 core_audit_failures: Default::default(),
+                #[cfg(unix)]
+                core_audit_rejections: Vec::new(),
                 #[cfg(unix)]
                 gateway_audit_worker: None,
                 #[cfg(unix)]
@@ -3298,7 +3382,8 @@ pub mod control {
                                                 .as_ref()
                                                 .is_some_and(|recovery| recovery.pending.is_some())
                                         })
-                                        .count(),
+                                        .count()
+                                        + self.core_audit_rejections.len(),
                                 ),
                                 AuditKind::GatewayUpdate => (
                                     self.gateway_audit_worker
@@ -3365,6 +3450,9 @@ pub mod control {
         }
 
         fn admit(&mut self, request: &CommandRequest, bot_id: String) -> Value {
+            if let Some(response) = self.replay_retry_response() {
+                return response;
+            }
             if request.force && !request.yes {
                 return Self::error("force stop requires --yes");
             }
@@ -3379,7 +3467,7 @@ pub mod control {
                 }
                 return self.operation_view(old);
             }
-            if self.archived_core_exists(id) {
+            if self.operation_id_reserved(id) {
                 return Self::error("operation ID conflicts with an earlier request");
             }
             if self.operations.len() >= OPERATION_LIMIT {
@@ -3877,6 +3965,9 @@ pub mod control {
                         ManualRestartError::LaunchFailed => {
                             ("launch_failed", DaemonError::SpawnFailed)
                         }
+                        ManualRestartError::LaunchTimeout => {
+                            ("launch_timeout", DaemonError::SpawnFailed)
+                        }
                         ManualRestartError::LastRunningCore => {
                             ("last_running_core", DaemonError::InvalidState)
                         }
@@ -3938,6 +4029,34 @@ pub mod control {
         }
 
         #[cfg(unix)]
+        pub async fn shutdown_core_launches(&mut self) -> bool {
+            self.shutdown_core_launches_with_timeout(CORE_LAUNCH_SHUTDOWN_TIMEOUT)
+                .await
+        }
+
+        #[cfg(unix)]
+        async fn shutdown_core_launches_with_timeout(&mut self, timeout: Duration) -> bool {
+            // This is also called on the exit path that leaves healthy children alone.
+            self.cancel_audit_admissions();
+            tokio::time::timeout(timeout, async {
+                loop {
+                    let mut pending = false;
+                    for entry in self.daemon.entries.values_mut() {
+                        if let Some(cores) = &mut entry.cores {
+                            pending |= cores.poll_cancelled_launches();
+                        }
+                    }
+                    if !pending {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+
+        #[cfg(unix)]
         async fn shutdown_control_audits_with_timeout(&mut self, timeout: Duration) -> bool {
             self.cancel_audit_admissions();
             let drained = tokio::time::timeout(timeout, async {
@@ -3959,7 +4078,10 @@ pub mod control {
                         self.operations.insert(id, op);
                     }
                     self.retry_pending_audit();
-                    if !any_pending && self.audit_writes.is_empty() && self.pending_audit.is_empty()
+                    if !any_pending
+                        && self.audit_writes.is_empty()
+                        && self.pending_audit.is_empty()
+                        && self.core_audit_rejections.is_empty()
                     {
                         break;
                     }
@@ -4095,8 +4217,21 @@ pub mod control {
         #[cfg(unix)]
         mod core_restart {
             use super::*;
-            use crate::daemon::update_control::ControlAccess;
+            use crate::daemon::update_control::{ControlAccess, UpdateHub};
             use std::os::unix::fs::{PermissionsExt, symlink};
+
+            fn manifest_update(id: &str) -> crate::update_rollback::UpdateControlRequest {
+                serde_json::from_value(json!({
+                    "command": "update", "bot": "7", "operation_id": id, "yes": true,
+                    "component": "core",
+                    "manifest": {
+                        "bot_id": "7", "bot_name": "private-selector", "total_shards": 2,
+                        "shards": [{"shard_id": 0, "core": {"current": 1, "candidate": 2}}],
+                        "artifacts": {"core": {"path": "/fixture", "sha256": "0".repeat(64)}}
+                    }
+                }))
+                .unwrap()
+            }
 
             struct Fixture {
                 plane: ControlPlane,
@@ -4260,6 +4395,7 @@ pub mod control {
                             request,
                             &ControlAccess::default(),
                             self.now + at,
+                            false,
                             None,
                         )
                         .unwrap()
@@ -4605,8 +4741,13 @@ pub mod control {
                 f.plane.core_audit_worker = Some(writer);
                 let req = f.request(1, 0, true);
                 let (response, mut reply) = tokio::sync::oneshot::channel();
-                f.plane
-                    .dispatch_core_restart(&req, &ControlAccess::default(), response, json!({}));
+                f.plane.dispatch_core_restart(
+                    &req,
+                    &ControlAccess::default(),
+                    false,
+                    response,
+                    json!({}),
+                );
                 let id = req.operation_id.as_deref().unwrap();
                 let before = f.plane.daemon.core_status(&f.key).unwrap();
                 let mut op = f.plane.operations.remove(id).unwrap();
@@ -4631,8 +4772,13 @@ pub mod control {
                 assert!(f.plane.core_restart_history.is_empty());
                 assert!(f.plane.operations.is_empty());
                 let (response, mut reply) = tokio::sync::oneshot::channel();
-                f.plane
-                    .dispatch_core_restart(&req, &ControlAccess::default(), response, json!({}));
+                f.plane.dispatch_core_restart(
+                    &req,
+                    &ControlAccess::default(),
+                    false,
+                    response,
+                    json!({}),
+                );
                 let mut op = f.plane.operations.remove(id).unwrap();
                 let job = std::iter::from_fn(|| jobs.try_recv().ok())
                     .find(|job| job.completion.is_some())
@@ -4678,6 +4824,7 @@ pub mod control {
                 f.plane.dispatch_core_restart(
                     &request,
                     &ControlAccess::default(),
+                    false,
                     response,
                     json!({}),
                 );
@@ -4711,6 +4858,7 @@ pub mod control {
                 f.plane.dispatch_core_restart(
                     &request,
                     &ControlAccess::default(),
+                    false,
                     response,
                     json!({}),
                 );
@@ -4767,6 +4915,7 @@ pub mod control {
                 f.plane.dispatch_core_restart(
                     &request,
                     &ControlAccess::default(),
+                    false,
                     response,
                     json!({}),
                 );
@@ -4910,8 +5059,13 @@ pub mod control {
                 f.plane.core_audit_worker = Some(queue);
                 let req = f.request(1, 0, false);
                 let (response, mut reply) = tokio::sync::oneshot::channel();
-                f.plane
-                    .dispatch_core_restart(&req, &ControlAccess::default(), response, json!({}));
+                f.plane.dispatch_core_restart(
+                    &req,
+                    &ControlAccess::default(),
+                    false,
+                    response,
+                    json!({}),
+                );
                 let job = jobs.try_recv().unwrap();
                 let id = req.operation_id.as_deref().unwrap();
                 let mut op = f.plane.operations.remove(id).unwrap();
@@ -5009,8 +5163,49 @@ pub mod control {
                 assert_eq!(after[0].status_id, target.status_id);
                 assert!(!after[0].running);
                 assert_eq!(after[1], status[1]);
-                assert_eq!(unsafe { libc::kill(target_pid, libc::SIGCONT) }, 0);
+                assert!(
+                    std::fs::read_to_string(format!("/proc/{target_pid}/stat"))
+                        .unwrap()
+                        .rsplit_once(") ")
+                        .is_some_and(|(_, stat)| stat.starts_with("T "))
+                );
+                f.plane.operations.insert(id.to_owned(), op);
                 assert_eq!(unsafe { libc::kill(peer_pid, libc::SIGCONT) }, 0);
+                let retry = f.request(2, 0, true);
+                assert_eq!(retry.incarnation(), target.status_id);
+                assert_eq!(
+                    f.submit(&retry, Duration::from_secs(64))["error"],
+                    "rate_limited"
+                );
+                let stale = CommandRequest {
+                    operation_id: Some(format!("{:032x}", 3)),
+                    expect_incarnation: status[1].status_id.map(|id| format!("{id:016x}")),
+                    ..retry.clone()
+                };
+                let retry_at = Duration::from_secs(65);
+                let denied = f.plane.request_core_restart(
+                    &retry,
+                    &ControlAccess {
+                        role: "viewer".into(),
+                        ..Default::default()
+                    },
+                    f.now + retry_at,
+                    false,
+                    None,
+                );
+                assert_eq!(denied.unwrap()["error"], "permission_denied");
+                assert_eq!(f.submit(&stale, retry_at)["error"], "incarnation_mismatch");
+                assert_eq!(f.submit(&retry, retry_at)["operation"]["state"], "running");
+                assert_eq!(
+                    f.complete(2, retry_at + Duration::from_secs(5))["operation"]["state"],
+                    "succeeded"
+                );
+                let replaced = f.plane.daemon.core_status(&f.key).unwrap();
+                assert!(replaced[0].running);
+                assert_ne!(replaced[0].pid, target.pid);
+                assert_ne!(replaced[0].status_id, target.status_id);
+                assert!(!Path::new(&format!("/proc/{target_pid}")).exists());
+                assert_eq!(replaced[1], status[1]);
             }
 
             #[test]
@@ -5020,8 +5215,13 @@ pub mod control {
                 f.plane.core_audit_worker = Some(queue);
                 let req = f.request(1, 0, true);
                 let (response, reply) = tokio::sync::oneshot::channel();
-                f.plane
-                    .dispatch_core_restart(&req, &ControlAccess::default(), response, json!({}));
+                f.plane.dispatch_core_restart(
+                    &req,
+                    &ControlAccess::default(),
+                    false,
+                    response,
+                    json!({}),
+                );
                 drop(reply);
                 let mut job = jobs.try_recv().unwrap();
                 f.plane.write_audit(&mut job.record).unwrap();
@@ -5057,8 +5257,13 @@ pub mod control {
                 let (queue, mut jobs) = tokio::sync::mpsc::channel(4);
                 f.plane.core_audit_worker = Some(queue);
                 let (response, _reply) = tokio::sync::oneshot::channel();
-                f.plane
-                    .dispatch_core_restart(&old, &ControlAccess::default(), response, json!({}));
+                f.plane.dispatch_core_restart(
+                    &old,
+                    &ControlAccess::default(),
+                    false,
+                    response,
+                    json!({}),
+                );
                 let mut job = jobs.try_recv().unwrap();
                 f.plane.write_audit(&mut job.record).unwrap();
                 // The original owner never consumes the fsync acknowledgment or closes stdin.
@@ -5123,7 +5328,7 @@ pub mod control {
             #[test]
             fn audit_replay_charges_each_operation_id_once_in_the_rolling_window() {
                 let mut f = Fixture::new(false, None);
-                for id in 1..=3 {
+                for id in 1..=2 {
                     let request = f.request(id, 0, true);
                     let at = Duration::from_secs((id as u64 - 1) * 60);
                     assert_eq!(f.submit(&request, at)["operation"]["state"], "running");
@@ -5144,11 +5349,20 @@ pub mod control {
                 restarted.load_replay(archived, None);
                 assert_eq!(
                     restarted.plane.core_restart_history[&(restarted.key.clone(), 0)].len(),
-                    3
+                    2
+                );
+                let third = restarted.request(3, 0, true);
+                assert_eq!(
+                    restarted.submit(&third, Duration::from_secs(60))["operation"]["state"],
+                    "running"
+                );
+                assert_eq!(
+                    restarted.complete(3, Duration::from_secs(60))["operation"]["state"],
+                    "succeeded"
                 );
                 let request = restarted.request(4, 0, true);
                 assert_eq!(
-                    restarted.submit(&request, Duration::from_secs(60))["error"],
+                    restarted.submit(&request, Duration::from_secs(120))["error"],
                     "rate_limited"
                 );
             }
@@ -5298,10 +5512,19 @@ pub mod control {
                     .unwrap()
                     .unwrap();
                 let request = f.request(1, 0, true);
-                assert_eq!(
-                    f.submit(&request, Duration::ZERO)["error"],
-                    "audit_unavailable"
+                let (send, mut reply) = tokio::sync::oneshot::channel();
+                f.plane.dispatch_core_restart(
+                    &request,
+                    &ControlAccess::default(),
+                    false,
+                    send,
+                    json!({}),
                 );
+                let response = reply.try_recv().unwrap();
+                assert_eq!(response["error"], "audit_replay_pending");
+                assert!(response["retry_after_ms"].as_u64().unwrap() > 0);
+                assert!(f.plane.operations.is_empty());
+                assert!(f.plane.core_audit_rejections.is_empty());
                 assert_eq!(
                     f.plane.request(&CommandRequest {
                         command: "status".into(),
@@ -5330,8 +5553,167 @@ pub mod control {
                     .unwrap();
             }
 
-            #[test]
-            fn gateway_audit_rejections_are_canonical_and_admission_waits_for_sync() {
+            #[tokio::test]
+            async fn archived_id_cannot_be_acquired_before_replay_publishes_it() {
+                let mut old = Fixture::new(false, None);
+                let archived = old.request(1, 0, true);
+                assert_eq!(old.submit(&archived, Duration::ZERO)["ok"], true);
+                assert_eq!(
+                    old.complete(1, Duration::ZERO)["operation"]["state"],
+                    "succeeded"
+                );
+                let id = archived.operation_id.unwrap();
+                let stop = CommandRequest {
+                    command: "stop".into(),
+                    bot: archived.bot,
+                    operation_id: Some(id.clone()),
+                    shards: Some(vec![0]),
+                    ..Default::default()
+                };
+                let mut f = Fixture::new(false, None);
+                let mut updates = UpdateHub::new(
+                    f.plane.config.clone(),
+                    vec![f.key.clone()],
+                    f.dir.join("update-audit.jsonl"),
+                );
+                let (entered, reading) = tokio::sync::oneshot::channel();
+                let (resume, release) = std::sync::mpsc::channel();
+                f.plane
+                    .start_core_recovery_audit_with(
+                        old.dir.join("core-recovery-audit.jsonl"),
+                        move |path| {
+                            entered.send(()).unwrap();
+                            release.recv_timeout(Duration::from_secs(5)).unwrap();
+                            ControlPlane::read_core_recovery_audit(path)
+                        },
+                    )
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), reading)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!f.plane.operation_exists(&id));
+                let access = ControlAccess::default();
+                let rejected = f.plane.request_as(&stop, &access);
+                assert_eq!(rejected["error"], "audit_replay_pending");
+                assert!(rejected["retry_after_ms"].as_u64().unwrap() > 0);
+                let rejected = f.plane.dispatch_manifest_update(
+                    &mut updates,
+                    manifest_update(&id),
+                    access.clone(),
+                );
+                assert_eq!(rejected["error"], "audit_replay_pending");
+                assert!(!updates.contains(&id));
+                assert!(f.plane.operations.is_empty());
+                resume.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while f.plane.core_audit_replay.is_some() {
+                        f.plane.tick(&no_credentials).await;
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(f.plane.operation_exists(&id));
+                assert_eq!(
+                    f.plane.request_as(&stop, &access)["error"],
+                    "operation ID conflicts with an earlier request"
+                );
+                let archive = f.plane.request_as(&query(1), &access);
+                assert_eq!(archive["operation"]["source"], "archive");
+                assert_eq!(archive["operation"]["state"], "succeeded");
+                assert!(f.plane.shutdown_control_audits().await);
+            }
+
+            #[tokio::test]
+            async fn stalled_launch_releases_the_shard_and_shutdown_waits_for_child_reaping() {
+                for expire in [false, true] {
+                    let mut f = Fixture::new(false, None);
+                    let request = f.request(1, 0, true);
+                    let pid = f.plane.daemon.core_status(&f.key).unwrap()[0].pid.unwrap();
+                    let late = f.dir.join("late-core");
+                    std::fs::write(
+                        &late,
+                        "#!/bin/sh\nif IFS= read -r secret; then : > \"$2.capability\"; fi\nexec /bin/sleep 30\n",
+                    ).unwrap();
+                    std::fs::set_permissions(&late, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    let entry = f.plane.daemon.entries.get_mut(&f.key).unwrap();
+                    entry.spec.gateway.program = late.into_os_string();
+                    let cores = entry.cores.as_mut().unwrap();
+                    let marker = crate::core_attach::socket_path(cores.dir(), 0)
+                        .with_extension("sock.capability");
+                    let (spawned, resume) = cores.pause_next_manual_launch();
+                    assert_eq!(f.submit(&request, Duration::ZERO)["ok"], true);
+                    let id = request.operation_id.unwrap();
+                    let mut op = f.plane.operations.remove(&id).unwrap();
+                    let until = Instant::now() + Duration::from_secs(2);
+                    let late_pid = loop {
+                        f.plane.advance_core_restart(&mut op, f.now);
+                        assert!(op.finished.is_none());
+                        if let Ok(pid) = spawned.try_recv() {
+                            break pid;
+                        }
+                        assert!(Instant::now() < until);
+                        std::thread::yield_now();
+                    };
+                    assert!(!Path::new(&format!("/proc/{pid}")).exists());
+                    assert!(Path::new(&format!("/proc/{late_pid}")).exists());
+                    assert!(!marker.exists());
+                    if expire {
+                        let stop = CommandRequest {
+                            command: "stop".into(),
+                            bot: request.bot,
+                            operation_id: Some(format!("{:032x}", 2)),
+                            shards: Some(vec![0]),
+                            force: true,
+                            yes: true,
+                            ..Default::default()
+                        };
+                        f.plane
+                            .advance_core_restart(&mut op, f.now + Duration::from_millis(4_999));
+                        assert!(op.finished.is_none());
+                        f.plane.operations.insert(id.clone(), op);
+                        assert_eq!(f.plane.request(&stop)["error"], "busy");
+                        op = f.plane.operations.remove(&id).unwrap();
+                        f.plane
+                            .advance_core_restart(&mut op, f.now + Duration::from_secs(5));
+                        assert_eq!(
+                            f.plane.operation_view(&op)["operation"]["reason"],
+                            "launch_timeout"
+                        );
+                        f.plane.operations.insert(id.clone(), op);
+                        assert_eq!(f.plane.request(&stop)["ok"], true);
+                        let replay = ControlPlane::read_core_recovery_audit(
+                            &f.dir.join("core-recovery-audit.jsonl"),
+                        )
+                        .unwrap();
+                        assert!(!replay.invalid);
+                        assert_eq!(replay.archived[&id].state(), "failed");
+                    } else {
+                        f.plane.operations.insert(id.clone(), op);
+                    }
+                    assert!(
+                        !f.plane
+                            .shutdown_core_launches_with_timeout(Duration::from_millis(20))
+                            .await
+                    );
+                    if !expire {
+                        assert_eq!(
+                            f.plane.request(&query(1))["operation"]["reason"],
+                            "daemon_shutdown"
+                        );
+                    }
+                    assert!(Path::new(&format!("/proc/{late_pid}")).exists());
+                    resume.send(()).unwrap();
+                    assert!(f.plane.shutdown_core_launches().await);
+                    assert!(!Path::new(&format!("/proc/{late_pid}")).exists());
+                    assert!(!marker.exists());
+                }
+            }
+
+            #[tokio::test]
+            async fn gateway_audit_rejections_are_canonical_and_admission_waits_for_sync() {
                 let mut f = Fixture::new(false, None);
                 let core = f.request(1, 0, true);
                 assert_eq!(f.submit(&core, Duration::ZERO)["ok"], true);
@@ -5355,6 +5737,7 @@ pub mod control {
                             ..request.clone()
                         },
                         &ControlAccess::default(),
+                        false,
                         response,
                         json!({}),
                     );
@@ -5375,11 +5758,17 @@ pub mod control {
                     assert!(jobs.try_recv().is_err());
                 }
                 assert_eq!(f.complete(1, Duration::ZERO)["ok"], true);
+                let mut updates = UpdateHub::new(
+                    f.plane.config.clone(),
+                    vec![f.key.clone()],
+                    f.dir.join("update-audit.jsonl"),
+                );
                 for synced in [false, true] {
                     let (response, mut reply) = tokio::sync::oneshot::channel();
                     f.plane.dispatch_gateway_update(
                         request.clone(),
                         &ControlAccess::default(),
+                        false,
                         response,
                         json!({}),
                     );
@@ -5391,7 +5780,18 @@ pub mod control {
                     let now =
                         f.plane.pending_gateway_updates[0].deadline - Duration::from_millis(1);
                     f.plane.settle_gateway_audits(now);
-                    assert!(!f.plane.operation_exists(id));
+                    assert!(f.plane.operation_exists(id));
+                    assert!(!f.plane.operations.contains_key(id));
+                    let conflict = f.plane.dispatch_manifest_update(
+                        &mut updates,
+                        manifest_update(id),
+                        ControlAccess::default(),
+                    );
+                    assert_eq!(
+                        conflict["error"],
+                        "operation ID conflicts with an earlier request"
+                    );
+                    assert!(!updates.contains(id));
                     assert!(reply.try_recv().is_err());
                     assert!(job.completion.unwrap().send((job.record, synced)).is_ok());
                     f.plane.settle_gateway_audits(now);
@@ -5415,16 +5815,22 @@ pub mod control {
                 let (writer, jobs) = tokio::sync::mpsc::channel(1);
                 f.plane.core_audit_worker = Some(writer);
                 assert_eq!(f.submit(&req, Duration::ZERO)["error"], "core_out_of_range");
+                let health = f.plane.request(&status)["status"]["core_recovery_audit"].clone();
+                assert_eq!(health["ok"], false);
+                assert_eq!(health["pending"], 1);
+                assert_eq!(health["failed_or_dropped"], 0);
                 assert_eq!(f.submit(&req, Duration::ZERO)["error"], "core_out_of_range");
                 let health = f.plane.request(&status)["status"]["core_recovery_audit"].clone();
                 assert_eq!(health["ok"], false);
                 assert_eq!(health["available"], true);
                 assert_eq!(health["failed_or_dropped"], 1);
                 drop(jobs);
+                f.plane.retry_pending_audit();
                 assert_eq!(f.submit(&req, Duration::ZERO)["error"], "core_out_of_range");
                 let health = f.plane.request(&status)["status"]["core_recovery_audit"].clone();
                 assert_eq!(health["available"], false);
-                assert_eq!(health["failed_or_dropped"], 2);
+                assert_eq!(health["pending"], 0);
+                assert_eq!(health["failed_or_dropped"], 3);
 
                 let path = f.dir.join("core-recovery-audit.jsonl");
                 f.plane.start_core_recovery_audit(path.clone()).unwrap();
@@ -5438,10 +5844,12 @@ pub mod control {
                 std::fs::create_dir(&path).unwrap();
                 assert_eq!(f.submit(&req, Duration::ZERO)["error"], "core_out_of_range");
                 loop {
+                    f.plane.retry_pending_audit();
                     let health = f.plane.request(&status)["status"]["core_recovery_audit"].clone();
-                    if health["failed_or_dropped"] == 3 {
+                    if health["failed_or_dropped"] == 4 {
                         assert_eq!(health["ok"], false);
                         assert_eq!(health["available"], true);
+                        assert_eq!(health["pending"], 0);
                         break;
                     }
                     assert!(Instant::now() < until);
@@ -5479,8 +5887,13 @@ pub mod control {
                 let req = f.request(1, 0, true);
                 let before = f.plane.daemon.core_status(&f.key).unwrap();
                 let (response, mut reply) = tokio::sync::oneshot::channel();
-                f.plane
-                    .dispatch_core_restart(&req, &ControlAccess::default(), response, json!({}));
+                f.plane.dispatch_core_restart(
+                    &req,
+                    &ControlAccess::default(),
+                    false,
+                    response,
+                    json!({}),
+                );
                 let id = req.operation_id.as_deref().unwrap();
                 assert!(
                     f.plane.operations[id]
@@ -7717,6 +8130,7 @@ impl<C: Clock> Daemon<C> {
                 entry.spec.ipc_path.clone(),
                 crate::protocol::BotId(bot_id),
                 shard,
+                self.instance,
             );
             cores.set_epoch_floor(entry.epoch);
             entry.cores = Some(cores);

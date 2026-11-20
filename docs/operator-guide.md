@@ -167,9 +167,9 @@ P3 の最小クライアントバージョンは **Core 復旧プロトコル v2
 
 Gateway が稼働中のシャードで、停滞の疑いがある Core または空スロットを対象にできます。稼働中の Core を止める際は、もう一方の Core の稼働を確認できることが必要です。`force` でこの条件を解除できます。対象の固定と回数制限は `force` にも適用されます。同じシャードの競合は `busy` になります。同じスロットの手動操作は 60 秒以上空け、15 分に 3 回までです。開始時に 1 回分を計上し、完了まで長引いた場合は次の操作までの間隔を完了時点から測ります。監査ログの `charge_clock` は Linux の起動 ID と起動後の経過時間です。再生時に経過時間を確認できない操作は直近の試行として扱います。
 
-botd は監査要求の同期を最大 5 秒待ち、`audit_timeout` を返す場合は予約を解除します。同期後も Gateway と対象を再確認し、旧 Core の stdin を閉じます。5 秒後も旧 Core が残っていれば、通常は peer の稼働を再確認してから botd が直接子へ強制終了を要求します。peer が失われた場合は `last_running_core` を返し、旧 Core の終了を待ちます。`termination_unconfirmed` も終了確認まで子を保持します。
+botd は要求フレームの読み取りを最大 3 秒、認証後の Core 再起動と Gateway 更新の応答を最大 8 秒待ちます。監査要求の同期は最大 5 秒待ち、`audit_timeout` を返す場合は予約を解除します。同期後も Gateway と対象を再確認し、旧 Core の stdin を閉じます。5 秒後も旧 Core が残っていれば、通常は peer の稼働を再確認してから botd が直接子へ強制終了を要求します。peer が失われた場合は `last_running_core` を返し、旧 Core を保持します。再試行には新しい操作 ID と最新のプレビューで取得した世代を使います。必要に応じて `force` を指定でき、通常の回数制限が適用されます。`termination_unconfirmed` では終了確認まで子を保持します。置換起動の 5 秒期限に達すると `launch_timeout` になり、シャードの操作予約を解除します。同じスロットは遅れて戻った起動結果と直接子の回収を確認してから再利用できます。
 
-切断やタイムアウト時は、既知の ID を `operation` で照会してください。照会は記録されたシャードのスコープで認可します。`terminal_audit: pending_or_failed` は終端記録の未確認を示します。botd 再起動後に要求だけが残ると結果は `unknown` です。通常停止時には、同期済みの要求を `failed/daemon_shutdown` として記録するために最大 2 秒間、制御監査の完了を待ちます。起動時の再生中や無効な履歴を検出した場合は P3 の新規操作が拒否されます。`status` の `core_recovery_audit` には `available`、`pending`、`failed_or_dropped` が表示されます。
+切断やタイムアウト時は、既知の ID を `operation` で照会してください。照会は記録されたシャードのスコープで認可します。`terminal_audit: pending_or_failed` は終端記録の未確認を示します。botd 再起動後に要求だけが残ると結果は `unknown` です。通常停止時には、同期済みの要求を `failed/daemon_shutdown` として記録するために最大 2 秒間、制御監査の完了を待ちます。起動時の監査再生中は操作 ID を使う変更要求に `audit_replay_pending` と `retry_after_ms` を返します。無効な履歴を検出した場合は P3 の新規操作を拒否します。Gateway 更新は監査同期の待機中から操作 ID を予約します。`status` の `core_recovery_audit` には `available`、`pending`、`failed_or_dropped` が表示され、拒否記録も同期結果が判明するまで `pending` に含まれます。
 
 `succeeded` は旧 Core があれば終了を確認し、置換プロセスを起動して stdin に IPC capability を書き込んだことを示します。Core のソケット待受と Gateway の認証付き再接続は別途確認してください。stdin の EOF でも処理中のイベントは中断され得ます。未受領の REST 結果が不明な場合、再試行すると外部操作が重複する可能性があります。[制約一覧](known-limitations.md)
 
