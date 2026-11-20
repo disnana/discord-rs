@@ -10,7 +10,7 @@ use src::daemon::control::{
 use src::local_control::DaemonControlEnvelope;
 use src::update_rollback::{self, Action, Component, UpdateControlRequest};
 use src::{botref, placement::Config};
-use std::{collections::HashMap, ffi::OsString, path::PathBuf, time::Duration};
+use std::{collections::HashMap, ffi::OsString, io::IsTerminal, path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -19,7 +19,9 @@ use tokio::{
 
 const REQUEST_LIMIT: usize = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
-const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl start|stop|restart|gateway-update BOT [--shard N]... [--guild ID]...; botctl start|stop|restart|gateway-update --all (--yes | --dry-run); botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
+const CORE_USAGE: &str = "usage: botctl core status BOT --shard N | botctl core restart BOT --shard N --core K [--expect-incarnation ID] [--force] [--yes]; both require (--bootstrap-stdin | --secret-file ABS --port PORT) and accept [--json] [--timeout 30s]";
+const CORE_RESTART_NOTE: &str = "succeeded means the old Core, if present, was reaped and a replacement was launched and given its IPC capability. In-flight work and events are not guaranteed to be recovered.";
+const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl start|stop|restart|gateway-update BOT [--shard N]... [--guild ID]...; botctl start|stop|restart|gateway-update --all (--yes | --dry-run); botctl core status|restart BOT --shard N; botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
 const OFFLINE_NOTE: &str =
     "オフライン設定検証のみ。daemon・実稼働状態・認証・quorum/leaseは検証していません。";
 
@@ -48,6 +50,8 @@ struct Options {
     all_dry_run: bool,
     /// Only populated from the `--all` snapshot, never a fuzzy identity.
     expect_bot_id: Option<String>,
+    core: Option<u32>,
+    expect_incarnation: Option<String>,
 }
 
 fn valid_operation_id(value: &str) -> bool {
@@ -100,6 +104,8 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     let mut secret_file = None;
     let mut port = None;
     let mut out = None;
+    let mut core = None;
+    let mut expect_incarnation = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -178,6 +184,24 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
                 shards.push(number);
             }
             Some("--all") if !all => all = true,
+            Some("--core") if core.is_none() => {
+                let number = args
+                    .next()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or("--core requires a non-negative Core slot number")?;
+                core = Some(number);
+            }
+            Some("--expect-incarnation") if expect_incarnation.is_none() => {
+                let id = args
+                    .next()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .filter(|value| core_recovery_incarnation(value))
+                    .ok_or("--expect-incarnation requires a nonzero 16-digit hexadecimal ID")?;
+                expect_incarnation = Some(id);
+            }
             Some("--guild") => {
                 let value = args
                     .next()
@@ -237,6 +261,9 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         ["stop" | "shutdown", bot] => ("stop", Some((*bot).to_owned())),
         ["restart" | "reboot", bot] => ("restart", Some((*bot).to_owned())),
         ["gateway-update", bot] => ("gateway-update", Some((*bot).to_owned())),
+        ["core", "status", bot] => ("core-preview", Some((*bot).to_owned())),
+        ["core", "restart", bot] => ("core-restart", Some((*bot).to_owned())),
+        ["core", ..] => return Err(CORE_USAGE),
         ["update", bot] => ("update", Some((*bot).to_owned())),
         ["rollback", bot] => ("rollback", Some((*bot).to_owned())),
         ["operation" | "op", id] if operation_id.is_none() => {
@@ -256,6 +283,17 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     }
     if secret_file.is_some() != port.is_some() {
         return Err("--secret-file and --port must be specified together");
+    }
+    let core_restart = command == "core-restart";
+    let core_command = core_restart || command == "core-preview";
+    if core_command && (shards.len() != 1 || !guilds.is_empty()) {
+        return Err("core status and core restart require exactly one --shard N");
+    }
+    if core_restart && core.is_none() {
+        return Err("core restart requires --core K");
+    }
+    if !core_restart && (core.is_some() || expect_incarnation.is_some()) {
+        return Err("--core and --expect-incarnation require core restart");
     }
     if command == "secret" {
         if out.is_none() {
@@ -296,16 +334,19 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             all: false,
             all_dry_run: false,
             expect_bot_id: None,
+            core,
+            expect_incarnation,
         });
     }
     if out.is_some() {
         return Err("--out is only supported for secret generate");
     }
     let auth = bootstrap || secret_file.is_some();
-    if force && command != "stop" {
-        return Err("--force is supported only for stop");
+    if force && !matches!(command, "stop" | "core-restart") {
+        return Err("--force is supported only for stop and core restart");
     }
-    if (!shards.is_empty() || !guilds.is_empty())
+    if !core_command
+        && (!shards.is_empty() || !guilds.is_empty())
         && !matches!(command, "start" | "stop" | "restart" | "gateway-update")
     {
         return Err(
@@ -334,12 +375,12 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             );
         }
     }
-    if force && !yes && !(all && dry_run) {
+    if force && command == "stop" && !yes && !(all && dry_run) {
         return Err("force stop requires explicit --yes confirmation");
     }
     let update = matches!(command, "update" | "rollback");
-    if yes && !force && !update && !all {
-        return Err("--yes requires --force stop");
+    if yes && !force && !update && !all && !core_restart {
+        return Err("--yes requires an operation with confirmation");
     }
     if operation_id.is_some()
         && !matches!(
@@ -412,6 +453,8 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         all,
         all_dry_run: all && dry_run,
         expect_bot_id: None,
+        core,
+        expect_incarnation,
     })
 }
 
@@ -629,7 +672,7 @@ fn operation_state<'a>(value: &'a Value, id: &str, command: &str) -> Result<&'a 
     {
         return Err("daemon response operation does not match request");
     }
-    if command == "operation" && operation["command"] == "core-restart" {
+    if operation["command"] == "core-restart" {
         return core_recovery_state(value);
     }
     if !operation["bot_id"].is_string()
@@ -742,6 +785,328 @@ fn core_recovery_state(value: &Value) -> Result<&str, &'static str> {
     Ok(state)
 }
 
+// Only display fields with a known type and vocabulary. Do not relay the
+// daemon's notes, process snapshots, or any other free-form fields.
+#[derive(Deserialize, Serialize)]
+struct CorePreview {
+    bot_id: String,
+    total_shards: u32,
+    shard: u32,
+    cores: [CoreSlot; 2],
+}
+
+#[derive(Deserialize, Serialize)]
+struct CoreSlot {
+    running: bool,
+    empty: bool,
+    incarnation: Option<String>,
+    status: Option<CoreDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_reason: Option<CoreStatusReason>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CoreDiagnostic {
+    suspected_stalled: bool,
+    status_age_s: u64,
+    pending: Option<u64>,
+    oldest_age_s: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CoreStatusReason {
+    Unsupported,
+    Unreadable,
+    Corrupt,
+    StaleGeneration,
+    Regressed,
+    ClockUnavailable,
+}
+
+fn validate_core_preview(value: Value, shard: u32) -> Result<CorePreview, &'static str> {
+    let invalid = "invalid core-preview response; a Core recovery v2 daemon is required";
+    let preview: CorePreview = serde_json::from_value(value).map_err(|_| invalid)?;
+    if preview.shard != shard
+        || shard >= preview.total_shards
+        || preview
+            .bot_id
+            .parse::<u64>()
+            .ok()
+            .is_none_or(|id| id.to_string() != preview.bot_id)
+        || !preview.cores.iter().all(|slot| {
+            if slot.empty {
+                !slot.running && slot.incarnation.is_none()
+            } else {
+                slot.incarnation
+                    .as_deref()
+                    .is_some_and(core_recovery_incarnation)
+            }
+        })
+    {
+        return Err(invalid);
+    }
+    Ok(preview)
+}
+
+fn core_reply_error(value: &Value) -> Option<&str> {
+    if value["ok"] != false || value.get("operation").is_some() {
+        return None;
+    }
+    value["error"].as_str()
+}
+
+fn core_restart_rejection(value: &Value) -> Option<&str> {
+    core_reply_error(value).filter(|reason| {
+        core_recovery_failure_reason(reason)
+            || matches!(
+                *reason,
+                "permission_denied"
+                    | "operation_id_conflict"
+                    | "bot_not_found"
+                    | "bot_id_mismatch"
+                    | "total_shards_mismatch"
+                    | "shard_not_local"
+                    | "busy"
+                    | "operation_history_full"
+                    | "audit_replay_pending"
+                    | "daemon control busy"
+                    | "invalid control request"
+            )
+    })
+}
+
+fn core_outcome(state: &str, error: Option<&str>, id: Option<&str>) -> Value {
+    let mut value = json!({
+        "ok": state == "succeeded", "offline": false, "state": state, "note": CORE_RESTART_NOTE
+    });
+    if let Some(error) = error {
+        value["error"] = json!(error);
+    }
+    if let Some(id) = id {
+        value["operation_id"] = json!(id);
+    }
+    value
+}
+
+async fn run_core(options: Options, mut deadline: Instant) -> Value {
+    let restart = options.command == "core-restart";
+    let preview_error = |state, error| {
+        if restart {
+            core_outcome(state, Some(error), None)
+        } else {
+            failure(error, None, None)
+        }
+    };
+    if restart && !options.yes && !std::io::stdin().is_terminal() {
+        return preview_error(
+            "rejected",
+            "core restart requires --yes with non-interactive stdin",
+        );
+    }
+    let bootstrap = match timeout_at(
+        deadline,
+        load_bootstrap(options.secret_file.as_deref(), options.port),
+    )
+    .await
+    {
+        Ok(Ok(bootstrap)) => bootstrap,
+        Ok(Err(error)) => return preview_error("rejected", error),
+        Err(_) => return preview_error("timeout", "control bootstrap timed out"),
+    };
+    let shard = options.shards[0];
+    let selector = options.bot.as_deref().expect("validated Bot selector");
+    let request = json!({
+        "secret": bootstrap.secret, "command": "core-preview", "bot": selector, "shard": shard,
+    });
+    let unsupported =
+        "core-preview unavailable; verify authentication and use a Core recovery v2 daemon";
+    let preview = match timeout_at(deadline, exchange(&bootstrap, &request)).await {
+        Ok(Ok(value)) if value["ok"] == true => match validate_core_preview(value, shard) {
+            Ok(preview) => preview,
+            Err(error) => return preview_error("rejected", error),
+        },
+        Ok(Ok(value)) => {
+            let error = match core_reply_error(&value) {
+                Some(
+                    error @ ("control permission or scope denied"
+                    | "bot_not_found"
+                    | "local separate Core shard required"
+                    | "daemon control busy"),
+                ) => error,
+                _ => unsupported,
+            };
+            return preview_error("rejected", error);
+        }
+        Ok(Err(_)) => return preview_error("rejected", unsupported),
+        Err(_) => {
+            return preview_error(
+                "timeout",
+                "core-preview timed out; a Core recovery v2 daemon is required",
+            );
+        }
+    };
+    if !restart {
+        let mut value = json!(preview);
+        value["ok"] = json!(true);
+        value["offline"] = json!(false);
+        return value;
+    }
+    let core = options.core.expect("validated Core slot");
+    let Some(slot) = preview.cores.get(core as usize) else {
+        return core_outcome("rejected", Some("core_out_of_range"), None);
+    };
+    let peer = 1 - core;
+    let target = json!({
+        "bot_id": preview.bot_id, "total_shards": preview.total_shards,
+        "shard": shard, "core": core, "slot": slot,
+        "peer": {"core": peer, "slot": preview.cores[peer as usize]}, "force": options.force,
+    });
+    eprintln!(
+        "Core restart target\n{}",
+        serde_json::to_string_pretty(&target).expect("JSON value")
+    );
+    let mut outcome = if options
+        .expect_incarnation
+        .as_ref()
+        .is_some_and(|id| slot.incarnation.as_ref() != Some(id))
+    {
+        core_outcome("rejected", Some("incarnation_mismatch"), None)
+    } else {
+        let prompt_started = Instant::now();
+        let confirmed = options.yes || confirm_core_restart();
+        deadline += prompt_started.elapsed();
+        if confirmed {
+            restart_core(
+                &bootstrap,
+                selector,
+                &preview,
+                core,
+                options.force,
+                deadline,
+            )
+            .await
+        } else {
+            core_outcome("rejected", Some("confirmation_declined"), None)
+        }
+    };
+    outcome["target"] = target;
+    outcome
+}
+
+fn confirm_core_restart() -> bool {
+    eprintln!("Restart this Core? Type yes to continue.");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).is_ok() && answer.trim() == "yes"
+}
+
+async fn restart_core(
+    bootstrap: &Bootstrap,
+    selector: &str,
+    preview: &CorePreview,
+    core: u32,
+    force: bool,
+    deadline: Instant,
+) -> Value {
+    if Instant::now() >= deadline {
+        return core_outcome("timeout", Some("operation_wait_timed_out"), None);
+    }
+    let id = match new_operation_id() {
+        Ok(id) => id,
+        Err(error) => return core_outcome("rejected", Some(error), None),
+    };
+    let slot = &preview.cores[core as usize];
+    let mut request = json!({
+        "secret": bootstrap.secret, "command": "core-restart", "bot": selector,
+        "shard": preview.shard, "core": core, "expect_bot_id": preview.bot_id,
+        "expect_total_shards": preview.total_shards, "operation_id": id,
+        "force": force, "core_recovery_version": CORE_RECOVERY_VERSION,
+    });
+    if slot.empty {
+        request["expect_empty"] = json!(true);
+    } else {
+        request["expect_incarnation"] = json!(slot.incarnation);
+    }
+    let query = json!({"secret": bootstrap.secret, "command": "operation", "operation_id": id});
+    let mut sending = true;
+    let mut rejection = None;
+    loop {
+        let response = match timeout_at(
+            deadline,
+            exchange(bootstrap, if sending { &request } else { &query }),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) if sending => {
+                // The daemon might have admitted the request before the reply was lost.
+                sending = false;
+                continue;
+            }
+            Ok(Err(_)) => {
+                return core_outcome("unknown", Some("operation_query_unavailable"), Some(&id));
+            }
+            Err(_) => return core_outcome("timeout", Some("operation_wait_timed_out"), Some(&id)),
+        };
+        if sending && let Some(reason) = core_restart_rejection(&response) {
+            let mut result = core_outcome("rejected", Some(reason), Some(&id));
+            if let Some(wait) = response["retry_after_ms"].as_u64() {
+                result["retry_after_ms"] = json!(wait);
+            }
+            if !core_recovery_failure_reason(reason) {
+                return result;
+            }
+            // Revalidation after the audit write may return the same reason as a
+            // pre-admission rejection, but leave a failed operation to query.
+            rejection = Some(result);
+        }
+        let op = &response["operation"];
+        let bound = op["bot_id"] == preview.bot_id
+            && op["shard"] == preview.shard
+            && op["core"] == core
+            && op["incarnation"].as_str() == slot.incarnation.as_deref()
+            && (op["source"] == "archive"
+                || op["shards"][0]["total_shards"] == preview.total_shards);
+        let state = operation_state(&response, &id, "core-restart")
+            .ok()
+            .filter(|_| bound);
+        match state {
+            Some(state @ ("succeeded" | "failed" | "unknown")) => {
+                let mut result = core_outcome(state, op["reason"].as_str(), Some(&id));
+                result["operation"] = json!({
+                    "operation_id": id, "command": "core-restart",
+                    "core_recovery_version": CORE_RECOVERY_VERSION,
+                    "bot_id": preview.bot_id, "shard": preview.shard, "core": core,
+                    "incarnation": slot.incarnation, "state": state, "reason": op["reason"],
+                    "source": op["source"], "terminal_audit": op["terminal_audit"],
+                });
+                return result;
+            }
+            Some("running") => {}
+            _ if sending => {}
+            _ => match core_reply_error(&response) {
+                Some("audit_pending" | "audit_replay_pending" | "daemon control busy") => {}
+                Some(
+                    "operation not found in this daemon incarnation"
+                    | "control permission or scope denied",
+                ) => {
+                    return rejection.unwrap_or_else(|| {
+                        core_outcome("unknown", Some("operation_not_found_or_denied"), Some(&id))
+                    });
+                }
+                _ => {
+                    return core_outcome("unknown", Some("invalid_operation_reply"), Some(&id));
+                }
+            },
+        }
+        sending = false;
+        tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(100))).await;
+        if Instant::now() >= deadline {
+            return core_outcome("timeout", Some("operation_wait_timed_out"), Some(&id));
+        }
+    }
+}
+
 fn validate_update_result(
     value: &Value,
     expected: Option<&UpdateControlRequest>,
@@ -833,6 +1198,9 @@ async fn run(options: Options) -> Value {
         return run_all(options).await;
     }
     let deadline = Instant::now() + options.timeout;
+    if matches!(options.command, "core-preview" | "core-restart") {
+        return run_core(options, deadline).await;
+    }
     run_live(options, None, deadline, None).await
 }
 
@@ -1384,9 +1752,12 @@ async fn run_update(mut options: Options) -> Value {
 async fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let json_output = args.iter().any(|arg| arg == "--json");
-    let value = match parse_options(&args) {
-        Ok(options) => run(options).await,
-        Err(error) => failure(error, None, None),
+    let (value, core_restart) = match parse_options(&args) {
+        Ok(options) => {
+            let core_restart = options.command == "core-restart";
+            (run(options).await, core_restart)
+        }
+        Err(error) => (failure(error, None, None), false),
     };
     let success = value["ok"] == true;
     let text = serde_json::to_string_pretty(&value).expect("JSON value");
@@ -1397,7 +1768,20 @@ async fn main() {
     }
     // A timed-out Tokio stdin read can leave a blocking reader waiting for the
     // launcher. Exiting explicitly also bounds that case on both supported OSes.
-    std::process::exit(if success { 0 } else { 1 });
+    let code = if core_restart {
+        match value["state"].as_str() {
+            Some("succeeded") => 0,
+            Some("rejected") => 1,
+            Some("failed") => 2,
+            Some("timeout") => 4,
+            _ => 3,
+        }
+    } else if success {
+        0
+    } else {
+        1
+    };
+    std::process::exit(code);
 }
 
 #[cfg(test)]
@@ -1407,6 +1791,144 @@ mod default_wait_tests {
     fn options(args: &[&str]) -> Options {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         parse_options(&args).expect("valid arguments")
+    }
+
+    #[test]
+    fn core_commands_require_a_single_shard_and_only_restart_accepts_a_pin() {
+        let restart = options(&[
+            "core",
+            "restart",
+            "alpha",
+            "--shard",
+            "1",
+            "--core",
+            "0",
+            "--expect-incarnation",
+            "ABCDEF0123456789",
+            "--force",
+            "--bootstrap-stdin",
+        ]);
+        assert_eq!(restart.command, "core-restart");
+        assert_eq!(restart.shards, [1]);
+        assert_eq!(restart.core, Some(0));
+        assert_eq!(
+            restart.expect_incarnation.as_deref(),
+            Some("abcdef0123456789")
+        );
+        assert!(restart.force);
+        assert!(!restart.yes);
+        for args in [
+            &["core", "restart", "alpha", "--shard", "0"][..],
+            &["core", "status", "alpha"],
+            &["core", "status", "alpha", "--shard", "0", "--shard", "1"],
+            &["core", "status", "alpha", "--shard", "0", "--core", "0"],
+            &[
+                "core",
+                "restart",
+                "alpha",
+                "--shard",
+                "0",
+                "--core",
+                "0",
+                "--expect-incarnation",
+                "0000000000000000",
+            ],
+            &["restart", "alpha", "--core", "0"],
+        ] {
+            let mut args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            args.push("--bootstrap-stdin".into());
+            assert!(parse_options(&args).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn core_restart_queries_after_an_ambiguous_reply_and_pins_an_empty_slot() {
+        for state in ["failed", "unknown", "timeout"] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let bootstrap = Bootstrap {
+                port: listener.local_addr().unwrap().port(),
+                secret: [7; 32],
+            };
+            let preview = validate_core_preview(
+                json!({"bot_id": "101", "total_shards": 2, "shard": 1, "cores": [
+                    {"running": false, "empty": true, "incarnation": null, "status": null},
+                    {"running": true, "empty": false, "incarnation": "fedcba9876543210", "status": null},
+                ]}),
+                1,
+            )
+            .unwrap();
+            let server = tokio::spawn(async move {
+                let (mut mutation, _) = listener.accept().await.unwrap();
+                let frame = read_frame(&mut mutation, REQUEST_LIMIT).await.unwrap();
+                let request: Value = serde_json::from_slice(&frame).unwrap();
+                assert_eq!(request["command"], "core-restart");
+                assert_eq!(request["bot"], "alpha");
+                assert_eq!(request["expect_bot_id"], "101");
+                assert_eq!(request["expect_total_shards"], 2);
+                assert_eq!(request["shard"], 1);
+                assert_eq!(request["core"], 0);
+                assert_eq!(request["core_recovery_version"], CORE_RECOVERY_VERSION);
+                assert_eq!(request["expect_empty"], true);
+                assert!(request.get("expect_incarnation").is_none());
+                let id = request["operation_id"].as_str().unwrap();
+                assert!(valid_operation_id(id));
+                if state == "failed" {
+                    mutation
+                        .write_all(b"{\"ok\":false,\"error\":\"shard_not_running\"}\n")
+                        .await
+                        .unwrap();
+                }
+                drop(mutation); // The other cases lose the reply after the request arrives.
+                let (mut query, _) = listener.accept().await.unwrap();
+                let frame = read_frame(&mut query, REQUEST_LIMIT).await.unwrap();
+                let request: Value = serde_json::from_slice(&frame).unwrap();
+                assert_eq!(request["command"], "operation");
+                assert_eq!(request["operation_id"], id);
+                assert!(request.get("expect_empty").is_none());
+                if state == "timeout" {
+                    assert_eq!(query.read(&mut [0]).await.unwrap(), 0);
+                    return;
+                }
+                let (reason, audit) = if state == "failed" {
+                    ("shard_not_running", "synced")
+                } else {
+                    ("terminal_audit_missing", "missing")
+                };
+                let reply = json!({"ok": false, "note": "/private/path", "operation": {
+                    "operation_id": id, "command": "core-restart", "bot_id": "101",
+                    "core_recovery_version": CORE_RECOVERY_VERSION, "source": "archive",
+                    "shard": 1, "core": 0, "state": state, "terminal_audit": audit,
+                    "incarnation": null, "reason": reason
+                }});
+                query
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let result = restart_core(
+                &bootstrap,
+                "alpha",
+                &preview,
+                0,
+                false,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await;
+            assert_eq!(result["state"], state, "{result}");
+            assert_eq!(result["ok"], false);
+            assert!(
+                result["operation_id"]
+                    .as_str()
+                    .is_some_and(valid_operation_id)
+            );
+            assert!(!result.to_string().contains("/private/path"));
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[test]
