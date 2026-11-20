@@ -378,6 +378,8 @@ struct StatusRequest {
     expect_incarnation: Option<String>,
     #[serde(default)]
     expect_empty: bool,
+    #[serde(default)]
+    core_recovery_version: Option<u32>,
 }
 
 struct Envelope {
@@ -504,6 +506,7 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
                     core: request.core,
                     expect_incarnation: request.expect_incarnation,
                     expect_empty: request.expect_empty,
+                    core_recovery_version: request.core_recovery_version,
                 },
                 None,
             ),
@@ -805,13 +808,24 @@ async fn run() -> Result<(), &'static str> {
         options.runtime_root.join("update-audit.jsonl"),
     );
     let mut control = ControlPlane::new(daemon, config.clone(), startup_ok);
-    control.set_gateway_update_audit(options.runtime_root.join("gateway-update-audit.jsonl"));
     #[cfg(unix)]
-    if options.separate_cores {
-        control
-            .set_core_recovery_audit(options.runtime_root.join("core-recovery-audit.jsonl"))
-            .await;
+    {
+        if control
+            .start_gateway_update_audit(options.runtime_root.join("gateway-update-audit.jsonl"))
+            .is_err()
+        {
+            eprintln!("Gateway update audit worker unavailable");
+        }
+        if options.separate_cores
+            && control
+                .start_core_recovery_audit(options.runtime_root.join("core-recovery-audit.jsonl"))
+                .is_err()
+        {
+            eprintln!("Core recovery audit worker unavailable");
+        }
     }
+    #[cfg(not(unix))]
+    control.set_gateway_update_audit(options.runtime_root.join("gateway-update-audit.jsonl"));
     let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
     let mut server = tokio::spawn(status_server(
         listener,
@@ -879,6 +893,11 @@ async fn run() -> Result<(), &'static str> {
                         control.dispatch_core_restart(&envelope.request, &envelope.access, envelope.response, audit.status());
                         continue;
                     }
+                    #[cfg(unix)]
+                    if envelope.request.command == "gateway-update" && envelope.update.is_none() {
+                        control.dispatch_gateway_update(envelope.request, &envelope.access, envelope.response, audit.status());
+                        continue;
+                    }
                     let mut response = if let Some(update) = envelope.update {
                         if control.operation_exists(&update.operation_id) {
                             json!({"ok":false,"error":"operation ID conflicts with an earlier request"})
@@ -917,6 +936,10 @@ async fn run() -> Result<(), &'static str> {
                 STOP_CHILDREN_DEADLINE.as_secs()
             );
         }
+    }
+    #[cfg(unix)]
+    if !control.shutdown_control_audits().await {
+        eprintln!("Control audit shutdown deadline reached; some records may be unconfirmed");
     }
     result
 }
@@ -1773,11 +1796,14 @@ mod tests {
             "secret": vec![7; 32], "command": "core-restart", "bot": "bot",
             "shard": 1, "core": 0, "expect_total_shards": 2, "expect_bot_id": "7",
             "expect_incarnation": "fedcba9876543210", "force": true,
+            "core_recovery_version": src::daemon::control::CORE_RECOVERY_VERSION,
             "operation_id": "0123456789abcdef0123456789abcdef",
         });
         for (field, value) in [
             ("secret", json!(vec![3; 32])),
             ("expect_incarnation", json!(123)),
+            ("core_recovery_version", json!(1)),
+            ("core_recovery_version", json!(null)),
             ("shards", json!([1])),
             ("command", json!("start")),
             ("extra", json!(true)),
@@ -1789,6 +1815,12 @@ mod tests {
             assert!(result.is_err(), "{field}");
             assert!(response.is_empty());
         }
+
+        let mut old = wire.clone();
+        old.as_object_mut().unwrap().remove("core_recovery_version");
+        let (result, response) = status_session(format!("{old}\n").as_bytes(), json!(null)).await;
+        assert!(result.is_err());
+        assert!(response.is_empty());
 
         let (mut client, server) = duplex(8192);
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);

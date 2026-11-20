@@ -4,6 +4,9 @@
 //! `--port`. Never argv values, environment variables or an endpoint file.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use src::daemon::control::{
+    CORE_RECOVERY_VERSION, core_recovery_failure_reason, core_recovery_incarnation,
+};
 use src::local_control::DaemonControlEnvelope;
 use src::update_rollback::{self, Action, Component, UpdateControlRequest};
 use src::{botref, placement::Config};
@@ -605,42 +608,117 @@ fn operation_state<'a>(value: &'a Value, id: &str, command: &str) -> Result<&'a 
     {
         return Err("daemon response operation does not match request");
     }
-    let core_recovery = command == "operation" && operation["command"] == "core-restart";
+    if command == "operation" && operation["command"] == "core-restart" {
+        return core_recovery_state(value);
+    }
     if !operation["bot_id"].is_string()
-        || if core_recovery {
-            operation["shard"]
-                .as_u64()
-                .is_none_or(|shard| shard > u64::from(u32::MAX))
-                || operation["core"]
-                    .as_u64()
-                    .is_none_or(|core| core > u64::from(u32::MAX))
-        } else {
-            operation["elapsed_ms"].as_u64().is_none()
-                || !operation["shards"].is_array()
-                || !operation["failed_shards"].is_array()
-                || !matches!(
-                    operation["command"].as_str(),
-                    Some("start" | "stop" | "restart" | "update" | "rollback" | "gateway-update")
-                )
-        }
+        || operation["elapsed_ms"].as_u64().is_none()
+        || !operation["shards"].is_array()
+        || !operation["failed_shards"].is_array()
+        || !matches!(
+            operation["command"].as_str(),
+            Some("start" | "stop" | "restart" | "update" | "rollback" | "gateway-update")
+        )
     {
         return Err("daemon operation has no valid result metadata");
     }
     if operation["state"] == "succeeded"
-        && (!core_recovery || operation["failed_shards"].is_array())
-        && !operation["failed_shards"]
-            .as_array()
-            .is_some_and(Vec::is_empty)
+        && !operation["failed_shards"].as_array().unwrap().is_empty()
     {
         return Err("daemon operation claims success with failed shards");
     }
     match operation["state"].as_str() {
         Some(state @ ("running" | "succeeded" | "failed")) => Ok(state),
-        Some("unknown") if core_recovery && operation["terminal_audit"] == "missing" => {
-            Ok("unknown")
-        }
         _ => Err("invalid daemon operation state"),
     }
+}
+
+fn core_recovery_state(value: &Value) -> Result<&str, &'static str> {
+    let op = &value["operation"];
+    let invalid = "invalid Core recovery result";
+    if op["core_recovery_version"] != CORE_RECOVERY_VERSION
+        || op["bot_id"]
+            .as_str()
+            .is_none_or(|id| id.parse::<u64>().ok().is_none_or(|n| n.to_string() != id))
+        || op["core"].as_u64().is_none_or(|core| core >= 2)
+        || !op
+            .get("incarnation")
+            .is_some_and(|id| id.is_null() || id.as_str().is_some_and(core_recovery_incarnation))
+    {
+        return Err(invalid);
+    }
+    let shard = op["shard"]
+        .as_u64()
+        .and_then(|id| u32::try_from(id).ok())
+        .ok_or(invalid)?;
+    let state = op["state"].as_str().ok_or(invalid)?;
+    let ok = match state {
+        "running" | "succeeded" => op.get("reason") == Some(&Value::Null),
+        "failed" => op["reason"]
+            .as_str()
+            .is_some_and(core_recovery_failure_reason),
+        "unknown" => op["reason"] == "terminal_audit_missing",
+        _ => false,
+    };
+    if !ok || value["ok"].as_bool() != Some(matches!(state, "running" | "succeeded")) {
+        return Err(invalid);
+    }
+    match op["source"].as_str() {
+        Some("archive") => {
+            let terminal = match state {
+                "unknown" => "missing",
+                "failed" | "succeeded" => "synced",
+                _ => return Err(invalid),
+            };
+            if op["terminal_audit"] != terminal
+                || ["elapsed_ms", "shards", "failed_shards"]
+                    .iter()
+                    .any(|key| op.get(*key).is_some())
+            {
+                return Err(invalid);
+            }
+        }
+        Some("live") => {
+            let terminal_valid = match state {
+                "running" => op.get("terminal_audit").is_none(),
+                "succeeded" | "failed" => matches!(
+                    op["terminal_audit"].as_str(),
+                    Some("synced" | "pending_or_failed")
+                ),
+                _ => false,
+            };
+            let key = json!({"bot_id": op["bot_id"], "shard_id": shard});
+            let shards = op["shards"].as_array().ok_or(invalid)?;
+            let [process] = shards.as_slice() else {
+                return Err(invalid);
+            };
+            let snapshot: src::daemon::ProcessSnapshot =
+                serde_json::from_value(process.clone()).map_err(|_| invalid)?;
+            let failed = op["failed_shards"].as_array().ok_or(invalid)?;
+            let failed_valid = if state == "failed" {
+                failed.as_slice() == std::slice::from_ref(&key)
+            } else {
+                failed.is_empty()
+            };
+            if !terminal_valid
+                || op["elapsed_ms"].as_u64().is_none()
+                || !failed_valid
+                || process["key"] != key
+                || snapshot.total_shards <= shard
+                || !process.get("error").is_some_and(|error| {
+                    if state == "failed" {
+                        serde_json::from_value::<src::daemon::DaemonError>(error.clone()).is_ok()
+                    } else {
+                        error.is_null()
+                    }
+                })
+            {
+                return Err(invalid);
+            }
+        }
+        _ => return Err(invalid),
+    }
+    Ok(state)
 }
 
 fn validate_update_result(
@@ -1314,7 +1392,9 @@ mod default_wait_tests {
     fn operation_query_accepts_core_recovery_results_and_the_crash_unknown_state() {
         let mut value = json!({"ok": false, "operation": {
             "operation_id": "id", "command": "core-restart", "bot_id": "7",
-            "shard": 1, "core": 0, "state": "unknown", "terminal_audit": "missing"
+            "core_recovery_version": CORE_RECOVERY_VERSION, "source": "archive",
+            "shard": 1, "core": 0, "state": "unknown", "terminal_audit": "missing",
+            "incarnation": "fedcba9876543210", "reason": "terminal_audit_missing"
         }});
         assert_eq!(operation_state(&value, "id", "operation"), Ok("unknown"));
         assert!(operation_state(&value, "wrong-id", "operation").is_err());
@@ -1322,9 +1402,60 @@ mod default_wait_tests {
         value["operation"]["terminal_audit"] = json!("synced");
         assert!(operation_state(&value, "id", "operation").is_err());
         value["operation"]["state"] = json!("succeeded");
+        value["operation"]["reason"] = Value::Null;
+        value["ok"] = Value::Bool(true);
         assert_eq!(operation_state(&value, "id", "operation"), Ok("succeeded"));
         value["operation"]["shard"] = Value::Null;
         assert!(operation_state(&value, "id", "operation").is_err());
+    }
+
+    #[test]
+    fn core_recovery_requires_versioned_live_or_archived_result_shapes() {
+        let key = json!({"bot_id": "7", "shard_id": 1});
+        let live = json!({"ok": true, "operation": {
+            "operation_id": "id", "command": "core-restart", "bot_id": "7",
+            "core_recovery_version": CORE_RECOVERY_VERSION, "source": "live",
+            "shard": 1, "core": 0, "state": "succeeded", "terminal_audit": "synced",
+            "incarnation": null, "reason": null, "elapsed_ms": 5, "failed_shards": [],
+            "shards": [{
+                "key": key, "total_shards": 2, "state": {"state": "Running"},
+                "desired_running": true, "identity": null, "restarts": 0,
+                "retry_at_ms": null, "restart_exhausted": false, "error": null
+            }]
+        }});
+        assert_eq!(operation_state(&live, "id", "operation"), Ok("succeeded"));
+        for (field, value) in [
+            ("core_recovery_version", json!(1)),
+            ("source", json!("archive")),
+            ("failed_shards", json!({})),
+            ("failed_shards", json!([key])),
+            ("shards", json!([])),
+            ("terminal_audit", json!("missing")),
+            ("incarnation", json!("/foreign/")),
+            ("reason", json!("launch_failed")),
+        ] {
+            let mut bad = live.clone();
+            bad["operation"][field] = value;
+            assert!(operation_state(&bad, "id", "operation").is_err(), "{field}");
+        }
+        let mut old = live.clone();
+        old["operation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("core_recovery_version");
+        assert!(operation_state(&old, "id", "operation").is_err());
+
+        let mut archived = live.clone();
+        for field in ["elapsed_ms", "shards", "failed_shards"] {
+            archived["operation"].as_object_mut().unwrap().remove(field);
+        }
+        archived["operation"]["source"] = json!("archive");
+        assert_eq!(
+            operation_state(&archived, "id", "operation"),
+            Ok("succeeded")
+        );
+        archived["operation"]["failed_shards"] = Value::Null;
+        assert!(operation_state(&archived, "id", "operation").is_err());
     }
 
     #[test]

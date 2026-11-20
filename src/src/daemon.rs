@@ -978,6 +978,35 @@ pub mod control {
     pub const OPERATION_LIMIT: usize = 1024;
     pub const OPERATION_SHARD_LIMIT: usize = 64;
     pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+    pub const CORE_RECOVERY_VERSION: u32 = 2;
+
+    pub fn core_recovery_incarnation(id: &str) -> bool {
+        id.len() == 16
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && id != "0000000000000000"
+    }
+
+    pub fn core_recovery_failure_reason(reason: &str) -> bool {
+        matches!(
+            reason,
+            "audit_unavailable"
+                | "audit_timeout"
+                | "daemon_shutdown"
+                | "shard_not_running"
+                | "core_out_of_range"
+                | "core_status_unavailable"
+                | "incarnation_required"
+                | "incarnation_mismatch"
+                | "last_running_core"
+                | "core_not_suspected_stalled"
+                | "rate_limited"
+                | "separate_cores_required"
+                | "termination_unconfirmed"
+                | "launch_failed"
+        )
+    }
     fn update_timeout(shards: usize) -> Duration {
         Duration::from_secs(120 + 45 * shards as u64)
     }
@@ -1014,6 +1043,8 @@ pub mod control {
         pub expect_incarnation: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub expect_empty: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub core_recovery_version: Option<u32>,
     }
 
     impl CommandRequest {
@@ -1095,6 +1126,7 @@ pub mod control {
                         && self.core.is_some()
                         && self.expect_bot_id.is_some()
                         && self.expect_total_shards.is_some()
+                        && self.core_recovery_version == Some(CORE_RECOVERY_VERSION)
                         && (self.expect_incarnation.is_none() || self.incarnation().is_some())
                         && !(self.expect_empty && self.expect_incarnation.is_some())
                 }
@@ -1103,6 +1135,7 @@ pub mod control {
                 _ => false,
             };
             base && self.shards_valid()
+                && (self.command == "core-restart" || self.core_recovery_version.is_none())
                 && (matches!(self.command.as_str(), "core-restart" | "core-preview")
                     || self.shard.is_none())
                 && (self.command == "core-restart"
@@ -1181,6 +1214,12 @@ pub mod control {
     const CORE_RESTART_WINDOW: Duration = Duration::from_secs(15 * 60);
     #[cfg(unix)]
     const CORE_RESTART_LIMIT: usize = 3;
+    #[cfg(unix)]
+    const AUDIT_QUEUE_LIMIT: usize = 64;
+    #[cfg(unix)]
+    const AUDIT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+    #[cfg(unix)]
+    const AUDIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
     const CORE_RESTART_NOTE: &str = "succeeded は、旧 Core があれば終了を確認し、新しい Core を起動して stdin へ IPC capability を書き込んだことを示します。IPC の再接続と処理の状態は別途確認してください。中断したイベントの処理や未受領の REST 結果は不明になり得ます。";
 
     #[cfg(unix)]
@@ -1199,12 +1238,16 @@ pub mod control {
         actor: (String, String),
         reason: Option<&'static str>,
         pending: Option<PendingCoreRestart>,
+        charge_clock: Option<CoreAuditClock>,
+        charged: bool,
     }
 
     #[cfg(unix)]
-    #[derive(Deserialize)]
+    #[derive(Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
     struct CoreAuditRow {
-        ts: u64,
+        #[serde(rename = "ts")]
+        _ts: u64,
         event: String,
         operation_id: String,
         bot_id: Option<String>,
@@ -1218,13 +1261,49 @@ pub mod control {
         #[serde(default)]
         expect_empty: bool,
         reason: Option<String>,
+        charge_clock: Option<CoreAuditClock>,
+    }
+
+    #[cfg(unix)]
+    #[derive(Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct CoreAuditClock {
+        boot_id: String,
+        boot_ms: u64,
     }
 
     #[cfg(unix)]
     struct ArchivedCoreRestart {
         requested: CoreAuditRow,
-        state: &'static str,
-        reason: Option<String>,
+        terminal: Option<CoreAuditRow>,
+    }
+
+    #[cfg(unix)]
+    impl ArchivedCoreRestart {
+        fn state(&self) -> &str {
+            self.terminal
+                .as_ref()
+                .map_or("unknown", |row| row.event.as_str())
+        }
+    }
+
+    #[cfg(unix)]
+    type CoreRestartBudget = BTreeMap<(ShardKey, u32), std::collections::VecDeque<Instant>>;
+
+    #[cfg(unix)]
+    struct CoreAuditStartup {
+        replay: CoreAuditReplay,
+        boot_id: Option<String>,
+        budget: CoreRestartBudget,
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct CoreAuditReplay {
+        archived: BTreeMap<String, ArchivedCoreRestart>,
+        orphaned: Vec<CoreAuditRow>,
+        reserved: HashSet<String>,
+        invalid: bool,
     }
 
     #[cfg(unix)]
@@ -1247,16 +1326,85 @@ pub mod control {
                 && self.total_shards == other.total_shards
                 && self.expect_empty == other.expect_empty
         }
+
+        fn valid(&self) -> bool {
+            let bot_valid = self.bot_id.as_ref().is_some_and(|id| {
+                id.parse::<u64>()
+                    .is_ok_and(|value| value.to_string() == *id)
+            });
+            let actor = super::update_control::ControlAccess {
+                subject: self.subject.clone(),
+                role: self.role.clone(),
+                scope: None,
+            };
+            let common = actor.valid()
+                && self.total_shards.is_some_and(|total| total > 0)
+                && self
+                    .incarnation
+                    .as_deref()
+                    .is_none_or(core_recovery_incarnation)
+                && !(self.expect_empty && self.incarnation.is_some());
+            if !common {
+                return false;
+            }
+            if self.event == "rejected" {
+                return (self.bot_id.is_none() || bot_valid)
+                    && self.charge_clock.is_none()
+                    && self.reason.as_deref().is_some_and(|reason| {
+                        core_recovery_failure_reason(reason)
+                            || matches!(
+                                reason,
+                                "permission_denied"
+                                    | "bot_not_found"
+                                    | "bot_id_mismatch"
+                                    | "total_shards_mismatch"
+                                    | "operation_id_conflict"
+                                    | "shard_not_local"
+                                    | "busy"
+                                    | "operation_history_full"
+                            )
+                    });
+            }
+            bot_valid
+                && self.role == "admin"
+                && self.total_shards.is_some_and(|total| self.shard < total)
+                && self.core < crate::core_attach::SLOTS as u32
+                && (self.expect_empty || self.incarnation.is_some())
+                && self
+                    .charge_clock
+                    .as_ref()
+                    .is_none_or(|clock| Self::valid_boot_id(&clock.boot_id))
+                && match self.event.as_str() {
+                    "requested" => self.reason.is_none() && self.charge_clock.is_none(),
+                    "succeeded" => self.reason.is_none(),
+                    "failed" => self
+                        .reason
+                        .as_deref()
+                        .is_some_and(core_recovery_failure_reason),
+                    _ => false,
+                }
+        }
+
+        fn valid_boot_id(id: &str) -> bool {
+            id.len() == 36
+                && id.bytes().enumerate().all(|(index, byte)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        byte == b'-'
+                    } else {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                    }
+                })
+        }
     }
 
     #[cfg(unix)]
-    struct CoreRestartReply {
+    struct ControlReply {
         response: tokio::sync::oneshot::Sender<Value>,
         recovery_audit: Value,
     }
 
     #[cfg(unix)]
-    impl CoreRestartReply {
+    impl ControlReply {
         fn send(self, mut value: Value) {
             value["recovery_audit"] = self.recovery_audit;
             let _ = self.response.send(value);
@@ -1275,7 +1423,18 @@ pub mod control {
     #[cfg(unix)]
     struct PendingCoreRestart {
         audit: AuditResult,
-        reply: CoreRestartReply,
+        // None after cancellation. A later acknowledgement can only record an outcome.
+        reply: Option<ControlReply>,
+    }
+
+    #[cfg(unix)]
+    struct PendingGatewayUpdate {
+        request: CommandRequest,
+        bot: Option<String>,
+        actor: (String, String),
+        audit: AuditResult,
+        reply: ControlReply,
+        deadline: Instant,
     }
 
     struct Operation {
@@ -1362,13 +1521,32 @@ pub mod control {
         #[cfg(unix)]
         core_audit_worker: Option<tokio::sync::mpsc::Sender<CoreAuditJob>>,
         #[cfg(unix)]
-        core_audit_writes: Vec<AuditResult>,
+        core_audit_replay:
+            Option<tokio::sync::oneshot::Receiver<std::io::Result<CoreAuditStartup>>>,
+        #[cfg(unix)]
+        core_audit_ready: bool,
+        #[cfg(unix)]
+        core_audit_boot_id: Option<String>,
+        #[cfg(unix)]
+        core_audit_failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        #[cfg(unix)]
+        gateway_audit_worker: Option<tokio::sync::mpsc::Sender<CoreAuditJob>>,
+        #[cfg(unix)]
+        gateway_audit_failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        #[cfg(unix)]
+        pending_gateway_updates: Vec<PendingGatewayUpdate>,
+        #[cfg(unix)]
+        audit_worker_exits: Vec<tokio::sync::oneshot::Receiver<()>>,
+        #[cfg(unix)]
+        audit_writes: Vec<(AuditKind, AuditResult)>,
         #[cfg(unix)]
         core_audit_synced: HashSet<String>,
         #[cfg(unix)]
         archived_core_restarts: BTreeMap<String, ArchivedCoreRestart>,
         #[cfg(unix)]
-        core_restart_history: BTreeMap<(ShardKey, u32), std::collections::VecDeque<Instant>>,
+        reserved_core_ids: HashSet<String>,
+        #[cfg(unix)]
+        core_restart_history: CoreRestartBudget,
         #[cfg(unix)]
         core_status_history: CoreStatusHistory,
     }
@@ -1436,35 +1614,109 @@ pub mod control {
         }
 
         #[cfg(unix)]
-        pub async fn set_core_recovery_audit(&mut self, path: PathBuf) {
-            let read_path = path.clone();
-            let Ok(Ok(archived)) =
-                tokio::task::spawn_blocking(move || Self::read_core_recovery_audit(&read_path))
-                    .await
-            else {
-                eprintln!("Core recovery audit history unavailable; manual Core recovery disabled");
-                return;
-            };
-            self.restore_core_restart_budget(&archived, Instant::now(), Self::audit_timestamp());
-            self.archived_core_restarts = archived;
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<CoreAuditJob>(64);
-            // Gateway 更新と同じ追記処理を使う。Core の監査 I/O は所有者ループの外で直列化する。
-            tokio::task::spawn_blocking(move || {
-                let tail = std::sync::Mutex::new(None);
-                while let Some(mut job) = rx.blocking_recv() {
-                    let ok = Self::write_audit_file(&path, &tail, &mut job.record).is_ok();
-                    if let Some(completion) = job.completion {
-                        let _ = completion.send((job.record, ok));
-                    }
-                }
-            });
-            self.core_audit_worker = Some(tx);
+        pub fn start_gateway_update_audit(&mut self, path: PathBuf) -> std::io::Result<()> {
+            self.gateway_audit_worker =
+                Some(self.start_audit_worker(path, |_| {}, self.gateway_audit_failures.clone())?);
+            Ok(())
         }
 
         #[cfg(unix)]
-        fn read_core_recovery_audit(
-            path: &Path,
-        ) -> std::io::Result<BTreeMap<String, ArchivedCoreRestart>> {
+        pub fn start_core_recovery_audit(&mut self, path: PathBuf) -> std::io::Result<()> {
+            self.start_core_recovery_audit_with(path, Self::read_core_recovery_audit)
+        }
+
+        #[cfg(unix)]
+        fn start_core_recovery_audit_with(
+            &mut self,
+            path: PathBuf,
+            read: impl FnOnce(&Path) -> std::io::Result<CoreAuditReplay> + Send + 'static,
+        ) -> std::io::Result<()> {
+            let (replay, receive) = tokio::sync::oneshot::channel();
+            self.core_audit_ready = false;
+            self.core_audit_worker = Some(self.start_audit_worker(
+                path,
+                move |path| {
+                    let startup = read(path).map(|replay| {
+                        let boot_id = Self::boot_id();
+                        let clock = boot_id.as_deref().zip(crate::core_status::try_boot_ms());
+                        let budget =
+                            Self::replayed_core_restart_budget(&replay, Instant::now(), clock);
+                        CoreAuditStartup {
+                            replay,
+                            boot_id,
+                            budget,
+                        }
+                    });
+                    let _ = replay.send(startup);
+                },
+                self.core_audit_failures.clone(),
+            )?);
+            self.core_audit_replay = Some(receive);
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        fn start_audit_worker(
+            &mut self,
+            path: PathBuf,
+            initialize: impl FnOnce(&Path) + Send + 'static,
+            failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        ) -> std::io::Result<tokio::sync::mpsc::Sender<CoreAuditJob>> {
+            let (send, mut jobs) = tokio::sync::mpsc::channel::<CoreAuditJob>(AUDIT_QUEUE_LIMIT);
+            let (done, exited) = tokio::sync::oneshot::channel();
+            // A filesystem call may never return. Keep it off the Tokio runtime so
+            // dropping the runtime cannot join a stalled worker after the shutdown deadline.
+            std::thread::Builder::new()
+                .name("control-audit".into())
+                .spawn(move || {
+                    initialize(&path);
+                    let tail = std::sync::Mutex::new(None);
+                    while let Some(mut job) = jobs.blocking_recv() {
+                        let ok = Self::write_audit_file(&path, &tail, &mut job.record).is_ok();
+                        if let Some(completion) = job.completion {
+                            let _ = completion.send((job.record, ok));
+                        } else if !ok {
+                            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    let _ = done.send(());
+                })?;
+            self.audit_worker_exits.push(exited);
+            Ok(send)
+        }
+
+        #[cfg(unix)]
+        fn boot_id() -> Option<String> {
+            let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+            let id = id.trim();
+            CoreAuditRow::valid_boot_id(id).then(|| id.to_owned())
+        }
+
+        #[cfg(unix)]
+        fn poll_core_audit_replay(&mut self) {
+            use tokio::sync::oneshot::error::TryRecvError;
+            let Some(replay) = self.core_audit_replay.as_mut() else {
+                return;
+            };
+            match replay.try_recv() {
+                Err(TryRecvError::Empty) => return,
+                Ok(Ok(startup)) => {
+                    self.core_restart_history = startup.budget;
+                    self.archived_core_restarts = startup.replay.archived;
+                    self.reserved_core_ids = startup.replay.reserved;
+                    self.core_audit_ready = !startup.replay.invalid;
+                    self.core_audit_boot_id = startup.boot_id;
+                }
+                _ => {}
+            }
+            self.core_audit_replay = None;
+            if !self.core_audit_ready {
+                eprintln!("Core recovery audit history unavailable; manual Core recovery disabled");
+            }
+        }
+
+        #[cfg(unix)]
+        fn read_core_recovery_audit(path: &Path) -> std::io::Result<CoreAuditReplay> {
             use std::io::{BufRead, BufReader, Read};
             let file = Self::open_audit_file(path)?;
             if let Some(parent) = path
@@ -1475,98 +1727,189 @@ pub mod control {
             }
             let mut reader = BufReader::new(file);
             let mut row = Vec::new();
-            let mut history = BTreeMap::<String, ArchivedCoreRestart>::new();
+            let mut replay = CoreAuditReplay::default();
+            let mut rows = BTreeMap::<String, (Option<CoreAuditRow>, Option<CoreAuditRow>)>::new();
+            let mut invalid_ids = HashSet::new();
             loop {
                 row.clear();
                 if reader.by_ref().take(4097).read_until(b'\n', &mut row)? == 0 {
                     break;
                 }
                 if row.len() > 4096 {
-                    return Err(std::io::Error::other("Core audit row too large"));
-                }
-                // The writer repairs a torn final append before the next record.
-                if row.last() != Some(&b'\n') {
-                    break;
-                }
-                let record: CoreAuditRow =
-                    serde_json::from_slice(&row).map_err(std::io::Error::other)?;
-                match record.event.as_str() {
-                    "requested" => {
-                        if !record.bot_id.as_ref().is_some_and(|id| {
-                            id.parse::<u64>()
-                                .is_ok_and(|value| value.to_string() == *id)
-                        }) || record.operation_id.len() != 32
-                            || !record
-                                .operation_id
-                                .bytes()
-                                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-                        {
-                            return Err(std::io::Error::other("invalid Core audit admission"));
-                        }
-                        history
-                            .entry(record.operation_id.clone())
-                            .or_insert(ArchivedCoreRestart {
-                                requested: record,
-                                state: "unknown",
-                                reason: Some("terminal_audit_missing".into()),
-                            });
+                    // Keep scanning whole records to retain recognizable IDs after this row.
+                    for id in Self::compact_audit_ids(&row) {
+                        replay.reserved.insert(id.clone());
+                        invalid_ids.insert(id);
                     }
-                    "succeeded" | "failed" => {
-                        if let Some(op) = history.get_mut(&record.operation_id)
-                            && op.requested.same_admission(&record)
-                        {
-                            op.state = if record.event == "succeeded" {
-                                "succeeded"
-                            } else {
-                                "failed"
-                            };
-                            op.reason = record.reason;
+                    if row.last() != Some(&b'\n') {
+                        reader.skip_until(b'\n')?;
+                    }
+                    replay.invalid = true;
+                    continue;
+                }
+                let complete = row.last() == Some(&b'\n');
+                let Ok(value) = serde_json::from_slice::<Value>(&row) else {
+                    // The writer repairs a torn final append before the next record.
+                    for id in Self::compact_audit_ids(&row) {
+                        replay.reserved.insert(id.clone());
+                        if complete {
+                            invalid_ids.insert(id);
                         }
                     }
-                    // A rejected retry may share an ID with an accepted operation.
-                    "rejected" => {}
-                    _ => return Err(std::io::Error::other("unknown Core audit event")),
+                    replay.invalid |= complete;
+                    continue;
+                };
+                let Some(id) = value["operation_id"]
+                    .as_str()
+                    .filter(|id| Self::valid_audit_id(id))
+                    .map(str::to_owned)
+                else {
+                    replay.invalid |= complete;
+                    continue;
+                };
+                replay.reserved.insert(id.clone());
+                if !complete {
+                    continue;
+                }
+                let required = ["bot_id", "incarnation", "reason", "expect_empty"];
+                let record = if required.iter().all(|key| value.get(*key).is_some()) {
+                    serde_json::from_slice::<CoreAuditRow>(&row).ok()
+                } else {
+                    None
+                };
+                let Some(record) = record.filter(CoreAuditRow::valid) else {
+                    for id in Self::compact_audit_ids(&row) {
+                        replay.reserved.insert(id.clone());
+                        invalid_ids.insert(id);
+                    }
+                    invalid_ids.insert(id);
+                    replay.invalid = true;
+                    continue;
+                };
+                if record.event == "rejected" {
+                    continue;
+                }
+                let (requested, terminal) = rows.entry(id.clone()).or_default();
+                if record.event == "requested" && requested.is_none() && terminal.is_some() {
+                    invalid_ids.insert(id);
+                    replay.invalid = true;
+                    continue;
+                }
+                let slot = if record.event == "requested" {
+                    requested
+                } else {
+                    terminal
+                };
+                match slot {
+                    Some(existing) if *existing != record => {
+                        invalid_ids.insert(id);
+                        replay.invalid = true;
+                    }
+                    Some(_) => {}
+                    None => *slot = Some(record),
                 }
             }
-            Ok(history)
+            for (id, (requested, terminal)) in rows {
+                if invalid_ids.contains(&id) {
+                    continue;
+                }
+                match (requested, terminal) {
+                    (Some(requested), terminal) => {
+                        if terminal
+                            .as_ref()
+                            .is_some_and(|row| !requested.same_admission(row))
+                        {
+                            replay.invalid = true;
+                            continue;
+                        }
+                        replay.archived.insert(
+                            id,
+                            ArchivedCoreRestart {
+                                requested,
+                                terminal,
+                            },
+                        );
+                    }
+                    (None, Some(terminal)) => replay.orphaned.push(terminal),
+                    (None, None) => {}
+                }
+            }
+            Ok(replay)
         }
 
         #[cfg(unix)]
-        fn restore_core_restart_budget(
-            &mut self,
-            archived: &BTreeMap<String, ArchivedCoreRestart>,
+        fn valid_audit_id(id: &str) -> bool {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+
+        #[cfg(unix)]
+        fn compact_audit_ids(row: &[u8]) -> impl Iterator<Item = String> {
+            // A torn append can contain the complete ID followed by an incomplete
+            // field. Reserve it, but never interpret the record as an outcome.
+            const KEY: &[u8] = b"\"operation_id\":\"";
+            row.windows(KEY.len() + 34).filter_map(|bytes| {
+                if !matches!(bytes[0], b'{' | b',')
+                    || &bytes[1..=KEY.len()] != KEY
+                    || bytes.last() != Some(&b'"')
+                {
+                    return None;
+                }
+                let id = std::str::from_utf8(&bytes[KEY.len() + 1..bytes.len() - 1]).ok()?;
+                Self::valid_audit_id(id).then(|| id.to_owned())
+            })
+        }
+
+        #[cfg(unix)]
+        fn replayed_core_restart_budget(
+            replay: &CoreAuditReplay,
             now: Instant,
-            wall_ms: u128,
-        ) {
-            let mut recent: Vec<_> = archived
+            boot_clock: Option<(&str, u64)>,
+        ) -> CoreRestartBudget {
+            let rows = replay
+                .archived
                 .values()
-                .map(|op| &op.requested)
-                .filter_map(|row| {
-                    let age = wall_ms.saturating_sub(u128::from(row.ts));
-                    if age >= CORE_RESTART_WINDOW.as_millis() {
-                        return None;
-                    }
-                    let offset = Duration::from_millis(age as u64);
-                    Some((now.checked_sub(offset).unwrap_or(now), row))
+                .map(|op| (&op.requested, op.terminal.as_ref()))
+                .chain(replay.orphaned.iter().map(|row| (row, Some(row))));
+            let mut recent: Vec<_> = rows
+                .filter_map(|(row, terminal)| {
+                    let age = terminal
+                        .and_then(|row| row.charge_clock.as_ref())
+                        .zip(boot_clock)
+                        .filter(|(stamp, (boot_id, _))| stamp.boot_id == *boot_id)
+                        .and_then(|(stamp, (_, ms))| ms.checked_sub(stamp.boot_ms))
+                        .map_or(Duration::ZERO, Duration::from_millis);
+                    (age < CORE_RESTART_WINDOW).then(|| (now.checked_sub(age).unwrap_or(now), row))
                 })
                 .collect();
             recent.sort_by_key(|(at, _)| *at);
+            let mut budget = CoreRestartBudget::new();
             for (at, row) in recent {
-                self.charge_core_restart(&row.key(), row.core, at);
+                let history = budget.entry((row.key(), row.core)).or_default();
+                if history.len() == CORE_RESTART_LIMIT {
+                    history.pop_front();
+                }
+                history.push_back(at);
             }
+            budget
         }
 
         #[cfg(unix)]
         fn archived_core_view(op: &ArchivedCoreRestart) -> Value {
             let row = &op.requested;
+            let state = op.state();
+            let terminal = op.terminal.as_ref();
             json!({
-                "ok": op.state == "succeeded", "offline": false,
+                "ok": state == "succeeded", "offline": false,
                 "operation": {
                     "operation_id": row.operation_id, "command": "core-restart",
+                    "core_recovery_version": CORE_RECOVERY_VERSION, "source": "archive",
                     "bot_id": row.bot_id, "shard": row.shard, "core": row.core,
-                    "incarnation": row.incarnation, "state": op.state,
-                    "reason": op.reason,
-                    "terminal_audit": if op.state == "unknown" { "missing" } else { "synced" },
+                    "incarnation": row.incarnation, "state": state,
+                    "reason": terminal.map_or(Some("terminal_audit_missing"), |row| row.reason.as_deref()),
+                    "terminal_audit": if terminal.is_none() { "missing" } else { "synced" },
                 },
                 "note": CORE_RESTART_NOTE,
             })
@@ -1576,7 +1919,7 @@ pub mod control {
             &self,
             event: &str,
             operation_id: &str,
-            bot: &str,
+            bot: Option<&str>,
             actor: &(String, String),
             error: Option<DaemonError>,
         ) -> std::io::Result<()> {
@@ -1587,7 +1930,7 @@ pub mod control {
         fn audit_record(
             event: &str,
             operation_id: &str,
-            bot: &str,
+            bot: Option<&str>,
             actor: &(String, String),
             error: Option<DaemonError>,
         ) -> std::io::Result<PendingAudit> {
@@ -1807,15 +2150,11 @@ pub mod control {
         }
 
         #[cfg(unix)]
-        fn submit_core_audit(
-            &self,
+        fn submit_audit(
+            worker: &tokio::sync::mpsc::Sender<CoreAuditJob>,
             record: PendingAudit,
             tracked: bool,
         ) -> Result<Option<AuditResult>, PendingAudit> {
-            let worker = self
-                .core_audit_worker
-                .as_ref()
-                .expect("configured Core audit worker");
             let (completion, result) = if tracked {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 (Some(tx), Some(rx))
@@ -1830,9 +2169,13 @@ pub mod control {
 
         fn write_terminal_audit(&mut self, mut record: PendingAudit) {
             #[cfg(unix)]
-            if record.kind == AuditKind::CoreRecovery && self.core_audit_worker.is_some() {
-                match self.submit_core_audit(record, true) {
-                    Ok(Some(result)) => self.core_audit_writes.push(result),
+            if let Some(worker) = match record.kind {
+                AuditKind::CoreRecovery => self.core_audit_worker.as_ref(),
+                AuditKind::GatewayUpdate => self.gateway_audit_worker.as_ref(),
+            } {
+                let kind = record.kind;
+                match Self::submit_audit(worker, record, true) {
+                    Ok(Some(result)) => self.audit_writes.push((kind, result)),
                     Ok(None) => unreachable!("tracked audit write"),
                     Err(record) => self.pending_audit.push(record),
                 }
@@ -1850,7 +2193,7 @@ pub mod control {
 
         fn retry_pending_audit(&mut self) {
             #[cfg(unix)]
-            self.core_audit_writes.retain_mut(|result| {
+            self.audit_writes.retain_mut(|(kind, result)| {
                 use tokio::sync::oneshot::error::TryRecvError;
                 match result.try_recv() {
                     Ok((record, false)) => {
@@ -1864,7 +2207,11 @@ pub mod control {
                     }
                     Err(TryRecvError::Empty) => return true,
                     Err(TryRecvError::Closed) => {
-                        eprintln!("Core 手動再起動の監査処理が終了しました")
+                        let failures = match kind {
+                            AuditKind::CoreRecovery => &self.core_audit_failures,
+                            AuditKind::GatewayUpdate => &self.gateway_audit_failures,
+                        };
+                        failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 false
@@ -1900,7 +2247,7 @@ pub mod control {
 
         #[cfg(unix)]
         fn archived_core_exists(&self, id: &str) -> bool {
-            self.archived_core_restarts.contains_key(id)
+            self.reserved_core_ids.contains(id) || self.archived_core_restarts.contains_key(id)
         }
 
         #[cfg(not(unix))]
@@ -2022,10 +2369,10 @@ pub mod control {
             }
             if request.command == "gateway-update" && request.valid() {
                 let id = request.operation_id.clone().unwrap_or_default();
-                let bot = request.bot.clone().unwrap_or_default();
+                let bot = target.as_deref();
                 let actor = (access.subject.clone(), access.role.clone());
                 if self
-                    .audit_gateway_update("requested", &id, &bot, &actor, None)
+                    .audit_gateway_update("requested", &id, bot, &actor, None)
                     .is_err()
                 {
                     return Self::error("audit unavailable; gateway-update refused");
@@ -2034,11 +2381,138 @@ pub mod control {
                 if response["ok"] == true {
                     self.gateway_update_actors.insert(id, actor);
                 } else {
-                    let _ = self.audit_gateway_update("rejected", &id, &bot, &actor, None);
+                    let _ = self.audit_gateway_update("rejected", &id, bot, &actor, None);
                 }
                 return response;
             }
             self.request(request)
+        }
+
+        #[cfg(unix)]
+        pub fn dispatch_gateway_update(
+            &mut self,
+            request: CommandRequest,
+            access: &super::update_control::ControlAccess,
+            response: tokio::sync::oneshot::Sender<Value>,
+            recovery_audit: Value,
+        ) {
+            let reply = ControlReply {
+                response,
+                recovery_audit,
+            };
+            if request.command != "gateway-update" || !request.valid() {
+                reply.send(Self::error("invalid control request"));
+                return;
+            }
+            let bot = request
+                .bot
+                .as_deref()
+                .and_then(|selector| botref::resolve(&self.config.bots, selector).ok())
+                .map(|bot| bot.bot_id.clone());
+            let filter = request.shard_filter();
+            let keys: Vec<_> = self
+                .daemon
+                .entries
+                .keys()
+                .filter(|key| {
+                    bot.as_ref().is_none_or(|bot| *bot == key.bot_id)
+                        && filter
+                            .as_ref()
+                            .is_none_or(|wanted| wanted.contains(&key.shard_id))
+                })
+                .cloned()
+                .collect();
+            if !access.allows_command(false, bot.as_deref(), &keys) {
+                reply.send(Self::error("control permission or scope denied"));
+                return;
+            }
+            let actor = (access.subject.clone(), access.role.clone());
+            let id = request.operation_id.as_deref().expect("validated ID");
+            if bot.is_none() || (!self.operations.contains_key(id) && self.core_restart_busy(&keys))
+            {
+                self.audit_gateway_rejection(id, bot.as_deref(), &actor);
+                let response = if bot.is_none() {
+                    self.request(&request)
+                } else {
+                    Self::error("busy")
+                };
+                reply.send(response);
+                return;
+            }
+            let Some(worker) = self
+                .gateway_audit_worker
+                .as_ref()
+                .filter(|_| self.pending_gateway_updates.len() < AUDIT_QUEUE_LIMIT)
+            else {
+                reply.send(Self::error("audit unavailable; gateway-update refused"));
+                return;
+            };
+            let Ok(record) = Self::audit_record("requested", id, bot.as_deref(), &actor, None)
+            else {
+                reply.send(Self::error("audit unavailable; gateway-update refused"));
+                return;
+            };
+            let Ok(Some(audit)) = Self::submit_audit(worker, record, true) else {
+                reply.send(Self::error("audit unavailable; gateway-update refused"));
+                return;
+            };
+            self.pending_gateway_updates.push(PendingGatewayUpdate {
+                request,
+                bot,
+                actor,
+                audit,
+                reply,
+                deadline: Instant::now() + AUDIT_ACK_TIMEOUT,
+            });
+        }
+
+        #[cfg(unix)]
+        fn audit_gateway_rejection(&self, id: &str, bot: Option<&str>, actor: &(String, String)) {
+            let submitted = Self::audit_record("rejected", id, bot, actor, None)
+                .ok()
+                .zip(self.gateway_audit_worker.as_ref())
+                .is_some_and(|(record, worker)| Self::submit_audit(worker, record, false).is_ok());
+            if !submitted {
+                self.gateway_audit_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        #[cfg(unix)]
+        fn settle_gateway_audits(&mut self, now: Instant) {
+            use tokio::sync::oneshot::error::TryRecvError;
+            for mut pending in std::mem::take(&mut self.pending_gateway_updates) {
+                let id = pending
+                    .request
+                    .operation_id
+                    .as_deref()
+                    .expect("validated ID");
+                let response = match pending.audit.try_recv() {
+                    Err(TryRecvError::Empty) if now < pending.deadline => {
+                        self.pending_gateway_updates.push(pending);
+                        continue;
+                    }
+                    Ok((_, true)) if now < pending.deadline => {
+                        let response = self.request(&pending.request);
+                        if response["ok"] == true {
+                            self.gateway_update_actors
+                                .insert(id.to_owned(), pending.actor);
+                        } else {
+                            self.audit_gateway_rejection(
+                                id,
+                                pending.bot.as_deref(),
+                                &pending.actor,
+                            );
+                        }
+                        response
+                    }
+                    _ => {
+                        self.audit_gateway_rejection(id, pending.bot.as_deref(), &pending.actor);
+                        Self::error("audit unavailable; gateway-update refused")
+                    }
+                };
+                pending.reply.send(response);
+            }
         }
 
         #[cfg(unix)]
@@ -2049,7 +2523,7 @@ pub mod control {
             response: tokio::sync::oneshot::Sender<Value>,
             recovery_audit: Value,
         ) {
-            let reply = CoreRestartReply {
+            let reply = ControlReply {
                 response,
                 recovery_audit,
             };
@@ -2063,13 +2537,13 @@ pub mod control {
             request: &CommandRequest,
             access: &super::update_control::ControlAccess,
             now: Instant,
-            mut reply: Option<CoreRestartReply>,
+            mut reply: Option<ControlReply>,
         ) -> Option<Value> {
             if !request.valid() {
-                return CoreRestartReply::respond(reply, Self::error("invalid control request"));
+                return ControlReply::respond(reply, Self::error("invalid control request"));
             }
             if !access.valid() {
-                return CoreRestartReply::respond(reply, Self::error("permission_denied"));
+                return ControlReply::respond(reply, Self::error("permission_denied"));
             }
             let bot = request
                 .bot
@@ -2091,6 +2565,8 @@ pub mod control {
                 actor: (access.subject.clone(), access.role.clone()),
                 reason: None,
                 pending: None,
+                charge_clock: None,
+                charged: false,
             };
             let id = request.operation_id.as_deref().expect("validated ID");
             let force = request.force;
@@ -2101,7 +2577,7 @@ pub mod control {
                     if let Some(retry) = retry {
                         value["retry_after_ms"] = json!(retry.as_millis().max(1));
                     }
-                    CoreRestartReply::respond(reply, value)
+                    ControlReply::respond(reply, value)
                 };
             let local_keys = self
                 .daemon
@@ -2134,7 +2610,7 @@ pub mod control {
                     })
                 {
                     let value = self.operation_view(old);
-                    return CoreRestartReply::respond(reply, value);
+                    return ControlReply::respond(reply, value);
                 }
                 return reject(self, reply, &recovery, "operation_id_conflict", None);
             }
@@ -2150,9 +2626,15 @@ pub mod control {
                     && row.subject == access.subject
                     && row.role == access.role
                 {
-                    return CoreRestartReply::respond(reply, Self::archived_core_view(old));
+                    return ControlReply::respond(reply, Self::archived_core_view(old));
                 }
                 return reject(self, reply, &recovery, "operation_id_conflict", None);
+            }
+            if self.reserved_core_ids.contains(id) {
+                return reject(self, reply, &recovery, "operation_id_conflict", None);
+            }
+            if !self.core_audit_ready {
+                return reject(self, reply, &recovery, "audit_unavailable", None);
             }
             let Some(entry) = self.daemon.entries.get(&key) else {
                 return reject(self, reply, &recovery, "shard_not_local", None);
@@ -2191,25 +2673,25 @@ pub mod control {
                 .as_mut()
                 .unwrap()
                 .reserve_manual_restart(core as usize);
-            if self.core_audit_worker.is_some() {
+            if let Some(worker) = self.core_audit_worker.as_ref() {
                 if reply.is_none() {
                     self.release_core_restart(&key, core);
                     return reject(self, reply, &recovery, "audit_unavailable", None);
                 }
-                let Ok(Some(audit)) = self.submit_core_audit(record, true) else {
+                let Ok(Some(audit)) = Self::submit_audit(worker, record, true) else {
                     self.release_core_restart(&key, core);
                     return reject(self, reply, &recovery, "audit_unavailable", None);
                 };
                 recovery.pending = Some(PendingCoreRestart {
                     audit,
-                    reply: reply.take().unwrap(),
+                    reply: reply.take(),
                 });
             } else {
                 if self.write_audit(&mut record).is_err() {
                     self.release_core_restart(&key, core);
                     return reject(self, reply, &recovery, "audit_unavailable", None);
                 }
-                if let Err(reason) = self.begin_core_restart(&key, &recovery, force, now, now) {
+                if let Err(reason) = self.begin_core_restart(&key, &mut recovery, force, now) {
                     self.release_core_restart(&key, core);
                     return reject(self, reply, &recovery, reason, None);
                 }
@@ -2226,40 +2708,96 @@ pub mod control {
             op.core_restart = Some(recovery);
             let response = (!pending).then(|| self.operation_view(&op));
             self.operations.insert(id.to_owned(), op);
-            response.and_then(|value| CoreRestartReply::respond(reply, value))
+            response.and_then(|value| ControlReply::respond(reply, value))
         }
 
         #[cfg(unix)]
         fn begin_core_restart(
             &mut self,
             key: &ShardKey,
-            recovery: &CoreRestart,
+            recovery: &mut CoreRestart,
             force: bool,
             now: Instant,
-            requested_at: Instant,
         ) -> Result<(), &'static str> {
             let checked = self.check_core_restart(key, recovery.target, force, now);
-            // A durable requested record is charged once, even if final checks reject it.
             let core = recovery.target.core;
-            self.charge_core_restart(key, core, requested_at);
-            let incarnation = checked.map_err(|(reason, _)| reason)?;
-            if incarnation != recovery.incarnation {
-                return Err("incarnation_mismatch");
+            let result = checked
+                .map_err(|(reason, _)| reason)
+                .and_then(|incarnation| {
+                    if incarnation != recovery.incarnation {
+                        return Err("incarnation_mismatch");
+                    }
+                    if !self.gateway_eligible_for_core_restart(key) {
+                        return Err("shard_not_running");
+                    }
+                    let started = self
+                        .daemon
+                        .entries
+                        .get_mut(key)
+                        .unwrap()
+                        .cores
+                        .as_mut()
+                        .unwrap()
+                        .begin_manual_restart(core as usize, incarnation, now, force)
+                        .map_err(|_| "core_status_unavailable")?;
+                    started.then_some(()).ok_or("incarnation_mismatch")
+                });
+            // A synced request consumes one attempt. Measure it at the final check/EOF,
+            // since the write-ahead acknowledgement can be delayed.
+            self.charge_core_attempt(key, recovery, now);
+            result
+        }
+
+        #[cfg(unix)]
+        fn charge_core_attempt(
+            &mut self,
+            key: &ShardKey,
+            recovery: &mut CoreRestart,
+            now: Instant,
+        ) {
+            if recovery.charged {
+                let history = self
+                    .core_restart_history
+                    .get_mut(&(key.clone(), recovery.target.core))
+                    .unwrap();
+                history.pop_back();
             }
-            let started = self
-                .daemon
-                .entries
-                .get_mut(key)
-                .unwrap()
-                .cores
-                .as_mut()
-                .unwrap()
-                .begin_manual_restart(core as usize, incarnation, now)
-                .map_err(|_| "core_status_unavailable")?;
-            if !started {
-                return Err("incarnation_mismatch");
-            }
-            Ok(())
+            self.charge_core_restart(key, recovery.target.core, now);
+            recovery.charged = true;
+            recovery.charge_clock = self
+                .core_audit_boot_id
+                .as_ref()
+                .zip(crate::core_status::try_boot_ms())
+                .map(|(boot_id, boot_ms)| CoreAuditClock {
+                    boot_id: boot_id.clone(),
+                    boot_ms,
+                });
+        }
+
+        #[cfg(unix)]
+        fn gateway_eligible_for_core_restart(&mut self, key: &ShardKey) -> bool {
+            let entry = &self.daemon.entries[key];
+            let recovery_key = entry.recovery_key;
+            entry.snapshot.desired_running
+                && entry.snapshot.state == ProcessState::Running
+                && entry.stop_since.is_none()
+                && entry.candidate.is_none()
+                && entry.retiring.is_none()
+                && !entry.update_fallback_reserved
+                && self
+                    .daemon
+                    .recovery
+                    .snapshot(recovery_key)
+                    .is_ok_and(|snapshot| {
+                        snapshot.state == RecoveryState::Running && !snapshot.held
+                    })
+                && self
+                    .daemon
+                    .recovery
+                    .child_mut(recovery_key)
+                    .is_ok_and(|child| {
+                        child.is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+                    })
         }
 
         #[cfg(unix)]
@@ -2293,14 +2831,18 @@ pub mod control {
             recovery: &CoreRestart,
             reason: &'static str,
         ) {
-            if let Ok(mut record) =
+            let written =
                 Self::core_restart_record("rejected", id, key, force, recovery, Some(reason))
-            {
-                if self.core_audit_worker.is_some() {
-                    let _ = self.submit_core_audit(record, false);
-                } else {
-                    let _ = self.write_audit(&mut record);
-                }
+                    .is_ok_and(|mut record| {
+                        if let Some(worker) = self.core_audit_worker.as_ref() {
+                            Self::submit_audit(worker, record, false).is_ok()
+                        } else {
+                            self.write_audit(&mut record).is_ok()
+                        }
+                    });
+            if !written {
+                self.core_audit_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -2312,12 +2854,13 @@ pub mod control {
             force: bool,
             now: Instant,
         ) -> Result<Option<u64>, (&'static str, Option<Duration>)> {
+            let gateway_eligible = self.gateway_eligible_for_core_restart(key);
             let entry = self.daemon.entries.get_mut(key).expect("validated shard");
             let cores = entry
                 .cores
                 .as_mut()
                 .ok_or(("separate_cores_required", None))?;
-            if !entry.snapshot.desired_running || !cores.prepared() {
+            if !gateway_eligible || !cores.prepared() {
                 return Err(("shard_not_running", None));
             }
             let index = target.core as usize;
@@ -2373,21 +2916,23 @@ pub mod control {
             recovery: &CoreRestart,
             reason: Option<&'static str>,
         ) -> std::io::Result<PendingAudit> {
-            let mut record = PendingAudit::new(
-                AuditKind::CoreRecovery,
-                json!({
-                    "ts": Self::audit_timestamp(), "event": event,
-                    "subject": recovery.actor.0, "role": recovery.actor.1,
-                    "bot_id": key.bot_id.parse::<u64>().ok().map(|id| id.to_string()),
-                    "shard": key.shard_id, "core": recovery.target.core,
-                    "total_shards": recovery.target.total_shards,
-                    "expect_empty": recovery.target.expect_empty,
-                    "operation_id": id, "force": force,
-                    "incarnation": recovery.incarnation.map(|id| format!("{id:016x}")),
-                    "reason": reason,
-                }),
-            )?;
-            if matches!(event, "succeeded" | "failed") {
+            let terminal = matches!(event, "succeeded" | "failed");
+            let mut row = json!({
+                "ts": Self::audit_timestamp(), "event": event,
+                "subject": recovery.actor.0, "role": recovery.actor.1,
+                "bot_id": key.bot_id.parse::<u64>().ok().map(|id| id.to_string()),
+                "shard": key.shard_id, "core": recovery.target.core,
+                "total_shards": recovery.target.total_shards,
+                "expect_empty": recovery.target.expect_empty,
+                "operation_id": id, "force": force,
+                "incarnation": recovery.incarnation.map(|id| format!("{id:016x}")),
+                "reason": reason,
+            });
+            if terminal && let Some(clock) = &recovery.charge_clock {
+                row["charge_clock"] = json!(clock);
+            }
+            let mut record = PendingAudit::new(AuditKind::CoreRecovery, row)?;
+            if terminal {
                 record.core_terminal_id = Some(id.to_owned());
             }
             Ok(record)
@@ -2412,11 +2957,29 @@ pub mod control {
                 #[cfg(unix)]
                 core_audit_worker: None,
                 #[cfg(unix)]
-                core_audit_writes: Vec::new(),
+                core_audit_replay: None,
+                #[cfg(unix)]
+                core_audit_ready: false,
+                #[cfg(unix)]
+                core_audit_boot_id: None,
+                #[cfg(unix)]
+                core_audit_failures: Default::default(),
+                #[cfg(unix)]
+                gateway_audit_worker: None,
+                #[cfg(unix)]
+                gateway_audit_failures: Default::default(),
+                #[cfg(unix)]
+                pending_gateway_updates: Vec::new(),
+                #[cfg(unix)]
+                audit_worker_exits: Vec::new(),
+                #[cfg(unix)]
+                audit_writes: Vec::new(),
                 #[cfg(unix)]
                 core_audit_synced: HashSet::new(),
                 #[cfg(unix)]
                 archived_core_restarts: BTreeMap::new(),
+                #[cfg(unix)]
+                reserved_core_ids: HashSet::new(),
                 #[cfg(unix)]
                 core_restart_history: BTreeMap::new(),
                 #[cfg(unix)]
@@ -2545,10 +3108,16 @@ pub mod control {
             let value = json!({"ok": snapshot.state != OperationState::Failed, "offline": false, "operation": snapshot, "note": if op.command == "core-restart" { CORE_RESTART_NOTE } else { NOTE }});
             #[cfg(unix)]
             if let Some(recovery) = &op.core_restart {
-                if recovery.pending.is_some() {
+                if recovery
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.reply.is_some())
+                {
                     return Self::error("audit_pending");
                 }
                 let mut value = value;
+                value["operation"]["core_recovery_version"] = json!(CORE_RECOVERY_VERSION);
+                value["operation"]["source"] = json!("live");
                 value["operation"]["core"] = json!(recovery.target.core);
                 value["operation"]["shard"] = json!(op.targets[0].shard_id);
                 value["operation"]["incarnation"] =
@@ -2595,29 +3164,39 @@ pub mod control {
                 let event = if failed { "failed" } else { "succeeded" };
                 // The request was recorded before it started; a failure to record the
                 // outcome cannot undo it, so it is only reported.
-                if let Ok(mut record) =
-                    Self::audit_record(event, &op.id, &op.bot_id, actor, first_error)
-                    && self.write_audit(&mut record).is_err()
+                if let Ok(record) =
+                    Self::audit_record(event, &op.id, Some(&op.bot_id), actor, first_error)
                 {
-                    self.pending_audit.push(record);
-                    eprintln!(
-                        "gateway-update の完了を監査に記録できません（保留して再試行します）"
-                    );
+                    self.write_terminal_audit(record);
                 }
             }
             #[cfg(unix)]
-            if let Some(recovery) = &op.core_restart {
-                let event = if failed { "failed" } else { "succeeded" };
-                if let Ok(record) = Self::core_restart_record(
-                    event,
-                    &op.id,
-                    &op.targets[0],
-                    op.force,
-                    recovery,
-                    recovery.reason,
-                ) {
-                    self.write_terminal_audit(record);
-                }
+            if op
+                .core_restart
+                .as_ref()
+                .is_some_and(|recovery| recovery.pending.is_none())
+            {
+                self.record_core_terminal(op);
+            }
+        }
+
+        #[cfg(unix)]
+        fn record_core_terminal(&mut self, op: &Operation) {
+            let recovery = op.core_restart.as_ref().expect("Core restart operation");
+            let event = if op.errors.is_empty() {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            if let Ok(record) = Self::core_restart_record(
+                event,
+                &op.id,
+                &op.targets[0],
+                op.force,
+                recovery,
+                recovery.reason,
+            ) {
+                self.write_terminal_audit(record);
             }
         }
 
@@ -2697,12 +3276,50 @@ pub mod control {
                             .filter(|record| record.kind == kind)
                             .count();
                         #[cfg(unix)]
-                        let pending = if kind == AuditKind::CoreRecovery {
-                            pending + self.core_audit_writes.len()
-                        } else {
-                            pending
-                        };
-                        value["status"][name] = json!({"ok": pending == 0, "pending": pending});
+                        {
+                            let pending = pending
+                                + self
+                                    .audit_writes
+                                    .iter()
+                                    .filter(|(other, _)| *other == kind)
+                                    .count();
+                            let (available, failures, outstanding) = match kind {
+                                AuditKind::CoreRecovery => (
+                                    self.core_audit_ready
+                                        && self
+                                            .core_audit_worker
+                                            .as_ref()
+                                            .is_some_and(|worker| !worker.is_closed()),
+                                    &self.core_audit_failures,
+                                    self.operations
+                                        .values()
+                                        .filter(|op| {
+                                            op.core_restart
+                                                .as_ref()
+                                                .is_some_and(|recovery| recovery.pending.is_some())
+                                        })
+                                        .count(),
+                                ),
+                                AuditKind::GatewayUpdate => (
+                                    self.gateway_audit_worker
+                                        .as_ref()
+                                        .is_some_and(|worker| !worker.is_closed())
+                                        || self.gateway_update_audit.is_some(),
+                                    &self.gateway_audit_failures,
+                                    self.pending_gateway_updates.len(),
+                                ),
+                            };
+                            let pending = pending + outstanding;
+                            let failures = failures.load(std::sync::atomic::Ordering::Relaxed);
+                            value["status"][name] = json!({
+                                "ok": available && failures == 0 && pending == 0,
+                                "available": available, "pending": pending, "failed_or_dropped": failures,
+                            });
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            value["status"][name] = json!({"ok": pending == 0, "pending": pending});
+                        }
                     }
                     // Advisory observations only; no labels beyond Bot/shard/generation.
                     value["status"]["metrics"] = self
@@ -2737,6 +3354,14 @@ pub mod control {
                 }
                 _ => self.admit(request, selected.expect("validated selector").bot_id),
             }
+        }
+
+        fn core_restart_busy(&self, targets: &[ShardKey]) -> bool {
+            self.operations.values().any(|op| {
+                op.command == "core-restart"
+                    && op.finished.is_none()
+                    && op.targets.iter().any(|key| targets.contains(key))
+            })
         }
 
         fn admit(&mut self, request: &CommandRequest, bot_id: String) -> Value {
@@ -2784,11 +3409,7 @@ pub mod control {
             if targets.len() > OPERATION_SHARD_LIMIT {
                 return Self::error("operation exceeds local shard limit (64)");
             }
-            if self.operations.values().any(|op| {
-                op.command == "core-restart"
-                    && op.finished.is_none()
-                    && op.targets.iter().any(|key| targets.contains(key))
-            }) {
+            if self.core_restart_busy(&targets) {
                 return Self::error("busy");
             }
             let active: Vec<_> = self
@@ -2876,7 +3497,7 @@ pub mod control {
             deadline: Duration,
         ) -> Vec<ShardKey> {
             #[cfg(unix)]
-            self.cancel_core_restarts();
+            self.cancel_audit_admissions();
             self.retry_pending_audit();
             let keys: Vec<ShardKey> = self.daemon.snapshots().into_iter().map(|s| s.key).collect();
             #[cfg(unix)]
@@ -2906,12 +3527,27 @@ pub mod control {
         /// Observe actual exits before advancing operations. One command per
         /// Bot per tick bounds cooperative writes and keeps reads responsive.
         pub async fn tick(&mut self, credentials: &impl CredentialSource) {
+            #[cfg(unix)]
+            {
+                self.poll_core_audit_replay();
+                self.settle_gateway_audits(Instant::now());
+            }
             self.retry_pending_audit();
             self.monitor_ok = self.daemon.poll(credentials).is_ok();
             let mut ids: Vec<_> = self
                 .operations
                 .iter()
-                .filter(|(_, op)| op.finished.is_none())
+                .filter(|(_, op)| {
+                    #[cfg(unix)]
+                    if op
+                        .core_restart
+                        .as_ref()
+                        .is_some_and(|recovery| recovery.pending.is_some())
+                    {
+                        return true;
+                    }
+                    op.finished.is_none()
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             // Limit cumulative slow pipe writes across Bots as well as the
@@ -3141,33 +3777,54 @@ pub mod control {
         #[cfg(unix)]
         fn settle_core_restart_audit(&mut self, op: &mut Operation, now: Instant) -> bool {
             use tokio::sync::oneshot::error::TryRecvError;
-            let Some(recovery) = op.core_restart.as_mut() else {
+            let Some(pending) = op
+                .core_restart
+                .as_ref()
+                .and_then(|recovery| recovery.pending.as_ref())
+            else {
                 return true;
             };
-            let Some(mut pending) = recovery.pending.take() else {
-                return true;
-            };
+            if pending.reply.is_some() {
+                if now.saturating_duration_since(op.started) >= AUDIT_ACK_TIMEOUT {
+                    self.cancel_pending_core_restart(op, "audit_timeout");
+                } else if !self.gateway_eligible_for_core_restart(&op.targets[0]) {
+                    self.cancel_pending_core_restart(op, "shard_not_running");
+                }
+            }
+            let recovery = op.core_restart.as_mut().unwrap();
+            let mut pending = recovery.pending.take().unwrap();
             let key = &op.targets[0];
-            let (reason, recorded) = match pending.audit.try_recv() {
+            let result = match pending.audit.try_recv() {
                 Err(TryRecvError::Empty) => {
                     recovery.pending = Some(pending);
                     return true;
                 }
+                result => result,
+            };
+            let Some(reply) = pending.reply else {
+                // A late acknowledgement can only make the cancellation durable.
+                if result.is_ok_and(|(record, ok)| ok || record.written) {
+                    self.record_core_terminal(op);
+                } else {
+                    self.core_audit_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return true;
+            };
+            let (reason, recorded) = match result {
                 Ok((record, false)) if record.written => {
-                    self.charge_core_restart(key, recovery.target.core, op.started);
+                    self.charge_core_attempt(key, recovery, now);
                     ("audit_unavailable", true)
                 }
-                Ok((_, false)) | Err(TryRecvError::Closed) => ("audit_unavailable", false),
-                Ok((_, true)) => {
-                    match self.begin_core_restart(key, recovery, op.force, now, op.started) {
-                        Ok(()) => {
-                            op.started = now;
-                            pending.reply.send(self.operation_view(op));
-                            return true;
-                        }
-                        Err(reason) => (reason, true),
+                Ok((_, false)) | Err(_) => ("audit_unavailable", false),
+                Ok((_, true)) => match self.begin_core_restart(key, recovery, op.force, now) {
+                    Ok(()) => {
+                        op.started = now;
+                        reply.send(self.operation_view(op));
+                        return true;
                     }
-                }
+                    Err(reason) => (reason, true),
+                },
             };
             self.release_core_restart(key, recovery.target.core);
             if recorded {
@@ -3177,8 +3834,21 @@ pub mod control {
             } else {
                 self.audit_core_rejection(&op.id, key, op.force, recovery, reason);
             }
-            pending.reply.send(Self::error(reason));
+            reply.send(Self::error(reason));
             recorded
+        }
+
+        #[cfg(unix)]
+        fn cancel_pending_core_restart(&mut self, op: &mut Operation, reason: &'static str) {
+            let recovery = op.core_restart.as_mut().unwrap();
+            let reply = recovery.pending.as_mut().unwrap().reply.take().unwrap();
+            let key = &op.targets[0];
+            self.release_core_restart(key, recovery.target.core);
+            recovery.reason = Some(reason);
+            op.errors
+                .insert(key.clone(), DaemonError::OperationSuperseded);
+            self.finish(op);
+            reply.send(Self::error(reason));
         }
 
         #[cfg(unix)]
@@ -3189,15 +3859,11 @@ pub mod control {
                 return;
             }
             let key = &op.targets[0];
+            let wanted = self.gateway_eligible_for_core_restart(key);
             let entry = self.daemon.entries.get_mut(key).expect("owned shard");
             let program = Path::new(&entry.spec.gateway.program);
             let cores = entry.cores.as_mut().expect("owned Core units");
-            match cores.poll_manual_restart(
-                recovery.target.core as usize,
-                program,
-                now,
-                entry.snapshot.desired_running,
-            ) {
+            match cores.poll_manual_restart(recovery.target.core as usize, program, now, wanted) {
                 None => return,
                 Some(Ok(())) => {}
                 Some(Err(error)) => {
@@ -3211,16 +3877,30 @@ pub mod control {
                         ManualRestartError::LaunchFailed => {
                             ("launch_failed", DaemonError::SpawnFailed)
                         }
+                        ManualRestartError::LastRunningCore => {
+                            ("last_running_core", DaemonError::InvalidState)
+                        }
                     };
                     recovery.reason = Some(reason);
                     op.errors.insert(key.clone(), error);
                 }
             }
+            // If launch/backoff took time, also space the next attempt from completion.
+            self.charge_core_attempt(key, recovery, now);
             self.finish(op);
         }
 
         #[cfg(unix)]
-        fn cancel_core_restarts(&mut self) {
+        fn cancel_audit_admissions(&mut self) {
+            for pending in std::mem::take(&mut self.pending_gateway_updates) {
+                let id = pending
+                    .request
+                    .operation_id
+                    .as_deref()
+                    .expect("validated ID");
+                self.audit_gateway_rejection(id, pending.bot.as_deref(), &pending.actor);
+                pending.reply.send(Self::error("daemon_shutdown"));
+            }
             let ids: Vec<_> = self
                 .operations
                 .values()
@@ -3231,10 +3911,9 @@ pub mod control {
                 let mut op = self.operations.remove(&id).expect("active operation");
                 let key = &op.targets[0];
                 let recovery = op.core_restart.as_mut().expect("Core restart operation");
-                if let Some(pending) = recovery.pending.take() {
-                    self.release_core_restart(key, recovery.target.core);
-                    self.audit_core_rejection(&op.id, key, op.force, recovery, "daemon_shutdown");
-                    pending.reply.send(Self::error("daemon_shutdown"));
+                if recovery.pending.is_some() {
+                    self.cancel_pending_core_restart(&mut op, "daemon_shutdown");
+                    self.operations.insert(id, op);
                     continue;
                 }
                 let entry = self.daemon.entries.get_mut(key).expect("owned shard");
@@ -3249,6 +3928,55 @@ pub mod control {
                 self.finish(&mut op);
                 self.operations.insert(id, op);
             }
+        }
+        /// Resolve already-submitted admissions without starting new work, then close and
+        /// drain both writers within a single deadline.
+        #[cfg(unix)]
+        pub async fn shutdown_control_audits(&mut self) -> bool {
+            self.shutdown_control_audits_with_timeout(AUDIT_SHUTDOWN_TIMEOUT)
+                .await
+        }
+
+        #[cfg(unix)]
+        async fn shutdown_control_audits_with_timeout(&mut self, timeout: Duration) -> bool {
+            self.cancel_audit_admissions();
+            let drained = tokio::time::timeout(timeout, async {
+                loop {
+                    let ids: Vec<_> = self
+                        .operations
+                        .values()
+                        .filter(|op| {
+                            op.core_restart
+                                .as_ref()
+                                .is_some_and(|recovery| recovery.pending.is_some())
+                        })
+                        .map(|op| op.id.clone())
+                        .collect();
+                    let any_pending = !ids.is_empty();
+                    for id in ids {
+                        let mut op = self.operations.remove(&id).unwrap();
+                        self.settle_core_restart_audit(&mut op, Instant::now());
+                        self.operations.insert(id, op);
+                    }
+                    self.retry_pending_audit();
+                    if !any_pending && self.audit_writes.is_empty() && self.pending_audit.is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                self.core_audit_worker = None;
+                self.gateway_audit_worker = None;
+                while let Some(exited) = self.audit_worker_exits.last_mut() {
+                    let _ = exited.await;
+                    self.audit_worker_exits.pop();
+                }
+            })
+            .await
+            .is_ok();
+            self.core_audit_worker = None;
+            self.gateway_audit_worker = None;
+            drained
         }
     }
 
@@ -3373,6 +4101,7 @@ pub mod control {
             struct Fixture {
                 plane: ControlPlane,
                 dir: PathBuf,
+                status_dir: Option<PathBuf>,
                 key: ShardKey,
                 now: Instant,
             }
@@ -3387,16 +4116,17 @@ pub mod control {
                          [[bots.shard_placement]]\nshard_id=1\nprimary='one'\n",
                     )
                     .unwrap();
-                    // Diagnostics read status files only from tmpfs (P1), so a fixture with
-                    // diagnostics lives under /dev/shm when that is a tmpfs.
-                    let shm = std::path::Path::new("/dev/shm");
-                    let base = if diagnostics && crate::core_status::is_tmpfs(shm) {
-                        shm.to_path_buf()
-                    } else {
-                        std::env::temp_dir()
-                    };
-                    let dir = base.join(format!("cr-test-{:016x}", getrandom::u64().unwrap()));
+                    let name = format!("cr-test-{:016x}", getrandom::u64().unwrap());
+                    let dir = std::env::temp_dir().join(&name);
                     std::fs::create_dir(&dir).unwrap();
+                    // P1 reads only tmpfs, which may be mounted noexec.
+                    let status_dir = diagnostics.then(|| {
+                        let shm = Path::new("/dev/shm");
+                        assert!(crate::core_status::is_tmpfs(shm));
+                        let status = shm.join(&name);
+                        std::fs::create_dir(&status).unwrap();
+                        status
+                    });
                     let program = dir.join("private-program");
                     let exit = exited_slot.map_or_else(String::new, |slot| {
                         format!("case \"$2\" in */core-{slot}.sock) exit 0;; esac\n")
@@ -3420,13 +4150,37 @@ pub mod control {
                         bot_id: "7".into(),
                         shard_id: 0,
                     };
-                    let entry = daemon.entries.get_mut(&key).unwrap();
-                    entry.snapshot.desired_running = true;
-                    let cores = entry.cores.as_mut().unwrap();
-                    if diagnostics {
-                        cores.configure_status(Some(dir.clone()), true, None);
+                    daemon
+                        .enable_mock_discord("127.0.0.1:1".parse().unwrap())
+                        .unwrap();
+                    let cores = daemon
+                        .entries
+                        .get_mut(&key)
+                        .unwrap()
+                        .cores
+                        .as_mut()
+                        .unwrap();
+                    if let Some(path) = &status_dir {
+                        cores.configure_status(Some(path.clone()), false, None);
                     }
-                    cores.ensure(&program).unwrap();
+                    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+                        std::sync::OnceLock::new();
+                    let runtime = RUNTIME.get_or_init(|| {
+                        tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(1)
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                    });
+                    let _entered = runtime.enter();
+                    daemon.start(&key, &no_credentials).unwrap();
+                    let cores = daemon
+                        .entries
+                        .get_mut(&key)
+                        .unwrap()
+                        .cores
+                        .as_mut()
+                        .unwrap();
                     if let Some(slot) = exited_slot {
                         let deadline = Instant::now() + Duration::from_secs(2);
                         while cores.manual_restart_status(slot).unwrap().running {
@@ -3436,9 +4190,11 @@ pub mod control {
                     }
                     let mut plane = ControlPlane::new(daemon, config, true);
                     plane.core_recovery_audit = Some(dir.join("core-recovery-audit.jsonl"));
+                    plane.core_audit_ready = true;
                     Self {
                         plane,
                         dir,
+                        status_dir,
                         key,
                         now: Instant::now(),
                     }
@@ -3453,6 +4209,7 @@ pub mod control {
                         core: Some(core),
                         expect_bot_id: Some("7".into()),
                         expect_total_shards: Some(2),
+                        core_recovery_version: Some(CORE_RECOVERY_VERSION),
                         expect_incarnation: self
                             .plane
                             .daemon
@@ -3471,6 +4228,30 @@ pub mod control {
                         force,
                         ..Default::default()
                     }
+                }
+
+                fn stop_gateway(&mut self) {
+                    let recovery_key = self.plane.daemon.entries[&self.key].recovery_key;
+                    let Some(child) = self.plane.daemon.recovery.child_mut(recovery_key).unwrap()
+                    else {
+                        return;
+                    };
+                    if child.try_wait().unwrap().is_none() {
+                        child.start_kill().unwrap();
+                        let until = Instant::now() + Duration::from_secs(2);
+                        while child.try_wait().unwrap().is_none() {
+                            assert!(Instant::now() < until);
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+
+                fn load_replay(&mut self, replay: CoreAuditReplay, clock: Option<(&str, u64)>) {
+                    self.plane.core_restart_history =
+                        ControlPlane::replayed_core_restart_budget(&replay, self.now, clock);
+                    self.plane.archived_core_restarts = replay.archived;
+                    self.plane.reserved_core_ids = replay.reserved;
+                    self.plane.core_audit_ready = !replay.invalid;
                 }
 
                 fn submit(&mut self, request: &CommandRequest, at: Duration) -> Value {
@@ -3501,6 +4282,7 @@ pub mod control {
 
             impl Drop for Fixture {
                 fn drop(&mut self) {
+                    self.stop_gateway();
                     for entry in self.plane.daemon.entries.values_mut() {
                         if let Some(cores) = entry.cores.as_mut() {
                             cores.kill();
@@ -3509,6 +4291,9 @@ pub mod control {
                                 std::thread::yield_now();
                             }
                         }
+                    }
+                    if let Some(path) = &self.status_dir {
+                        let _ = std::fs::remove_dir_all(path);
                     }
                     let _ = std::fs::remove_dir_all(&self.dir);
                 }
@@ -3860,6 +4645,164 @@ pub mod control {
             }
 
             #[test]
+            fn recovering_gateway_is_ineligible_at_admission_and_before_eof() {
+                let mut f = Fixture::new(false, None);
+                let first = f.request(1, 0, true);
+                let before = f.plane.daemon.core_status(&f.key).unwrap();
+                f.stop_gateway();
+                f.plane.daemon.poll(&no_credentials).unwrap();
+                assert!(f.plane.daemon.entries[&f.key].snapshot.desired_running);
+                let recovery_key = f.plane.daemon.entries[&f.key].recovery_key;
+                assert_eq!(
+                    f.plane
+                        .daemon
+                        .recovery
+                        .snapshot(recovery_key)
+                        .unwrap()
+                        .state,
+                    RecoveryState::Waiting
+                );
+                assert_eq!(
+                    f.submit(&first, Duration::ZERO)["error"],
+                    "shard_not_running"
+                );
+                assert!(f.plane.operations.is_empty());
+                assert_eq!(f.plane.daemon.core_status(&f.key).unwrap(), before);
+
+                let mut f = Fixture::new(false, None);
+                let (queue, mut jobs) = tokio::sync::mpsc::channel(4);
+                f.plane.core_audit_worker = Some(queue);
+                let request = f.request(1, 0, true);
+                let before = f.plane.daemon.core_status(&f.key).unwrap();
+                let (response, mut reply) = tokio::sync::oneshot::channel();
+                f.plane.dispatch_core_restart(
+                    &request,
+                    &ControlAccess::default(),
+                    response,
+                    json!({}),
+                );
+                let mut job = jobs.try_recv().unwrap();
+                f.plane.write_audit(&mut job.record).unwrap();
+                assert!(job.completion.unwrap().send((job.record, true)).is_ok());
+                let id = request.operation_id.as_deref().unwrap();
+                let mut op = f.plane.operations.remove(id).unwrap();
+                f.stop_gateway();
+                let now = op.started;
+                assert!(f.plane.settle_core_restart_audit(&mut op, now));
+                assert_eq!(reply.try_recv().unwrap()["error"], "shard_not_running");
+                assert_eq!(f.plane.operation_view(&op)["operation"]["state"], "failed");
+                assert_eq!(f.plane.daemon.core_status(&f.key).unwrap(), before);
+                assert!(
+                    !f.plane.daemon.entries[&f.key]
+                        .cores
+                        .as_ref()
+                        .unwrap()
+                        .manual_restart_reserved()
+                );
+            }
+
+            #[test]
+            fn expired_audit_releases_the_shard_and_late_success_cannot_start_restart() {
+                let mut f = Fixture::new(false, None);
+                let (queue, mut jobs) = tokio::sync::mpsc::channel(4);
+                f.plane.core_audit_worker = Some(queue);
+                let request = f.request(1, 0, true);
+                let (response, mut reply) = tokio::sync::oneshot::channel();
+                f.plane.dispatch_core_restart(
+                    &request,
+                    &ControlAccess::default(),
+                    response,
+                    json!({}),
+                );
+                let id = request.operation_id.as_deref().unwrap();
+                let mut op = f.plane.operations.remove(id).unwrap();
+                let before = f.plane.daemon.core_status(&f.key).unwrap();
+                let due = op.started + AUDIT_ACK_TIMEOUT;
+                assert!(
+                    f.plane
+                        .settle_core_restart_audit(&mut op, due - Duration::from_millis(1))
+                );
+                assert!(op.finished.is_none());
+                assert!(f.plane.settle_core_restart_audit(&mut op, due));
+                assert_eq!(reply.try_recv().unwrap()["error"], "audit_timeout");
+                assert_eq!(f.plane.operation_view(&op)["operation"]["state"], "failed");
+                assert!(
+                    !f.plane.daemon.entries[&f.key]
+                        .cores
+                        .as_ref()
+                        .unwrap()
+                        .manual_restart_reserved()
+                );
+                f.plane.operations.insert(id.to_owned(), op);
+                let stop = CommandRequest {
+                    command: "stop".into(),
+                    bot: request.bot.clone(),
+                    operation_id: Some(format!("{:032x}", 2)),
+                    shards: Some(vec![0]),
+                    force: true,
+                    yes: true,
+                    ..Default::default()
+                };
+                assert_eq!(f.plane.request(&stop)["ok"], true);
+
+                let mut job = jobs.try_recv().unwrap();
+                f.plane.write_audit(&mut job.record).unwrap();
+                assert!(job.completion.unwrap().send((job.record, true)).is_ok());
+                let mut op = f.plane.operations.remove(id).unwrap();
+                assert!(f.plane.settle_core_restart_audit(&mut op, due));
+                let terminal = jobs.try_recv().unwrap();
+                let row: Value = serde_json::from_slice(&terminal.record.bytes).unwrap();
+                assert_eq!(row["event"], "failed");
+                assert_eq!(row["reason"], "audit_timeout");
+                assert_eq!(f.plane.daemon.core_status(&f.key).unwrap(), before);
+            }
+
+            #[test]
+            fn delayed_audit_starts_the_interval_at_the_action_boundary() {
+                let mut f = Fixture::new(false, None);
+                let (queue, mut jobs) = tokio::sync::mpsc::channel(4);
+                f.plane.core_audit_worker = Some(queue);
+                let request = f.request(1, 0, true);
+                let (response, mut reply) = tokio::sync::oneshot::channel();
+                f.plane.dispatch_core_restart(
+                    &request,
+                    &ControlAccess::default(),
+                    response,
+                    json!({}),
+                );
+                let id = request.operation_id.as_deref().unwrap();
+                let mut op = f.plane.operations.remove(id).unwrap();
+                let action_at = op.started + AUDIT_ACK_TIMEOUT - Duration::from_millis(1);
+                let mut job = jobs.try_recv().unwrap();
+                f.plane.write_audit(&mut job.record).unwrap();
+                assert!(job.completion.unwrap().send((job.record, true)).is_ok());
+                assert!(f.plane.settle_core_restart_audit(&mut op, action_at));
+                assert_eq!(reply.try_recv().unwrap()["operation"]["state"], "running");
+                assert_eq!(
+                    f.plane.core_restart_history[&(f.key.clone(), 0)].back(),
+                    Some(&action_at)
+                );
+                f.plane.operations.insert(id.to_owned(), op);
+                assert_eq!(
+                    f.complete(1, action_at.duration_since(f.now))["operation"]["state"],
+                    "succeeded"
+                );
+                f.plane.core_audit_worker = None;
+                let next = f.request(2, 0, true);
+                assert_eq!(
+                    f.submit(
+                        &next,
+                        (action_at - f.now) + CORE_RESTART_INTERVAL - Duration::from_millis(1)
+                    )["retry_after_ms"],
+                    1
+                );
+                assert_eq!(
+                    f.submit(&next, (action_at - f.now) + CORE_RESTART_INTERVAL)["operation"]["state"],
+                    "running"
+                );
+            }
+
+            #[test]
             fn already_exited_child_obeys_backoff_and_spawn_success_precedes_readiness() {
                 let mut f = Fixture::new(true, Some(0));
                 let old = f.request(1, 0, true);
@@ -3997,6 +4940,80 @@ pub mod control {
             }
 
             #[test]
+            fn peer_loss_during_grace_withholds_non_force_sigkill() {
+                let mut f = Fixture::new(true, None);
+                let status = f.plane.daemon.core_status(&f.key).unwrap();
+                let target = &status[0];
+                let boot_ms = crate::core_status::try_boot_ms().unwrap();
+                let mut writer = crate::core_status::StatusWriter::open_checked_with_id(
+                    target.status_path.as_deref().unwrap(),
+                    false,
+                    target.status_id,
+                )
+                .unwrap();
+                writer.write(&crate::core_status::StatusRecord {
+                    pending: 1,
+                    oldest_age_s: 30,
+                    warned: 0,
+                    threshold_s: 30,
+                    boot_ms: boot_ms.saturating_sub(31_000),
+                    pid: target.pid.unwrap(),
+                    generation: target.status_id.unwrap(),
+                    seq: 1,
+                });
+                let target_pid = target.pid.unwrap() as libc::pid_t;
+                let peer_pid = status[1].pid.unwrap() as libc::pid_t;
+                assert_eq!(unsafe { libc::kill(target_pid, libc::SIGSTOP) }, 0);
+                let until = Instant::now() + Duration::from_secs(2);
+                while !std::fs::read_to_string(format!("/proc/{target_pid}/stat"))
+                    .unwrap()
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, stat)| stat.starts_with("T "))
+                {
+                    assert!(Instant::now() < until);
+                    std::thread::yield_now();
+                }
+                let request = f.request(1, 0, false);
+                assert_eq!(
+                    f.submit(&request, Duration::ZERO)["operation"]["state"],
+                    "running"
+                );
+                assert_eq!(unsafe { libc::kill(peer_pid, libc::SIGSTOP) }, 0);
+                let until = Instant::now() + Duration::from_secs(2);
+                while f
+                    .plane
+                    .daemon
+                    .entries
+                    .get_mut(&f.key)
+                    .unwrap()
+                    .cores
+                    .as_mut()
+                    .unwrap()
+                    .peer_available(0)
+                {
+                    assert!(Instant::now() < until);
+                    std::thread::yield_now();
+                }
+                let id = request.operation_id.as_deref().unwrap();
+                let mut op = f.plane.operations.remove(id).unwrap();
+                f.plane
+                    .advance_core_restart(&mut op, f.now + Duration::from_millis(4_999));
+                assert!(op.finished.is_none());
+                f.plane
+                    .advance_core_restart(&mut op, f.now + Duration::from_secs(5));
+                let result = f.plane.operation_view(&op);
+                assert_eq!(result["operation"]["state"], "failed");
+                assert_eq!(result["operation"]["reason"], "last_running_core");
+                let after = f.plane.daemon.core_status(&f.key).unwrap();
+                assert_eq!(after[0].pid, target.pid);
+                assert_eq!(after[0].status_id, target.status_id);
+                assert!(!after[0].running);
+                assert_eq!(after[1], status[1]);
+                assert_eq!(unsafe { libc::kill(target_pid, libc::SIGCONT) }, 0);
+                assert_eq!(unsafe { libc::kill(peer_pid, libc::SIGCONT) }, 0);
+            }
+
+            #[test]
             fn dropped_reply_does_not_cancel_durable_admission_and_retry_is_actor_bound() {
                 let mut f = Fixture::new(false, None);
                 let (queue, mut jobs) = tokio::sync::mpsc::channel(4);
@@ -4046,13 +5063,7 @@ pub mod control {
                 f.plane.write_audit(&mut job.record).unwrap();
                 // The original owner never consumes the fsync acknowledgment or closes stdin.
                 let mut restarted = Fixture::new(false, None);
-                let now = restarted.now;
-                let archived = ControlPlane::read_core_recovery_audit(&path).unwrap();
-                let wall = u128::from(archived.values().next().unwrap().requested.ts);
-                restarted
-                    .plane
-                    .restore_core_restart_budget(&archived, now, wall);
-                restarted.plane.archived_core_restarts = archived;
+                restarted.load_replay(ControlPlane::read_core_recovery_audit(&path).unwrap(), None);
                 let target = restarted.plane.daemon.core_status(&restarted.key).unwrap();
                 assert_eq!(
                     restarted
@@ -4099,7 +5110,7 @@ pub mod control {
                 let path = f.dir.join("core-recovery-audit.jsonl");
                 let archived = ControlPlane::read_core_recovery_audit(&path).unwrap();
                 let mut restarted = Fixture::new(false, None);
-                restarted.plane.archived_core_restarts = archived;
+                restarted.load_replay(archived, None);
                 let before = restarted.plane.daemon.core_status(&restarted.key).unwrap();
                 let result = restarted.submit(&request, Duration::ZERO);
                 assert_eq!(result["operation"]["state"], "unknown");
@@ -4128,11 +5139,9 @@ pub mod control {
                 writeln!(file, "{}", data.lines().next().unwrap()).unwrap();
                 file.sync_data().unwrap();
                 let archived = ControlPlane::read_core_recovery_audit(&path).unwrap();
-                let wall = u128::from(archived.values().map(|op| op.requested.ts).max().unwrap());
+                assert!(!archived.invalid);
                 let mut restarted = Fixture::new(false, None);
-                restarted
-                    .plane
-                    .restore_core_restart_budget(&archived, restarted.now, wall);
+                restarted.load_replay(archived, None);
                 assert_eq!(
                     restarted.plane.core_restart_history[&(restarted.key.clone(), 0)].len(),
                     3
@@ -4141,6 +5150,355 @@ pub mod control {
                 assert_eq!(
                     restarted.submit(&request, Duration::from_secs(60))["error"],
                     "rate_limited"
+                );
+            }
+
+            #[test]
+            fn replay_ages_written_charges_only_with_a_matching_monotonic_clock() {
+                let mut f = Fixture::new(false, None);
+                f.plane.core_audit_boot_id = Some(ControlPlane::boot_id().unwrap());
+                let req = f.request(1, 0, true);
+                assert_eq!(f.submit(&req, Duration::ZERO)["ok"], true);
+                assert_eq!(f.complete(1, Duration::ZERO)["ok"], true);
+                let path = f.dir.join("core-recovery-audit.jsonl");
+                let data = std::fs::read_to_string(&path).unwrap();
+                let mut rows: Vec<Value> = data
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                rows[0]["ts"] = json!(1);
+                rows[1]["ts"] = json!(1);
+                std::fs::write(&path, format!("{}\n{}\n{}\n", rows[0], rows[1], rows[1])).unwrap();
+                let replay = ControlPlane::read_core_recovery_audit(&path).unwrap();
+                assert!(!replay.invalid);
+                let terminal = replay
+                    .archived
+                    .values()
+                    .next()
+                    .unwrap()
+                    .terminal
+                    .as_ref()
+                    .unwrap();
+                let stamp = terminal.charge_clock.as_ref().unwrap();
+                let key = (f.key.clone(), 0);
+                let now = f.now + CORE_RESTART_WINDOW;
+                for clock in [
+                    None,
+                    Some(("different boot", stamp.boot_ms + 999_999)),
+                    Some((stamp.boot_id.as_str(), stamp.boot_ms.saturating_sub(1))),
+                ] {
+                    let budget = ControlPlane::replayed_core_restart_budget(&replay, now, clock);
+                    assert_eq!(budget[&key].iter().copied().collect::<Vec<_>>(), [now]);
+                }
+                let clock = Some((stamp.boot_id.as_str(), stamp.boot_ms + 30_000));
+                let budget = ControlPlane::replayed_core_restart_budget(&replay, now, clock);
+                assert_eq!(
+                    budget[&key].iter().copied().collect::<Vec<_>>(),
+                    [now - Duration::from_secs(30)]
+                );
+                let clock = Some((stamp.boot_id.as_str(), stamp.boot_ms + 900_000));
+                assert!(ControlPlane::replayed_core_restart_budget(&replay, now, clock).is_empty());
+            }
+
+            #[test]
+            fn replay_reserves_orphan_and_rejected_ids_without_returning_foreign_data() {
+                let mut f = Fixture::new(false, None);
+                let req = f.request(1, 0, true);
+                assert_eq!(f.submit(&req, Duration::ZERO)["ok"], true);
+                assert_eq!(f.complete(1, Duration::ZERO)["ok"], true);
+                let path = f.dir.join("core-recovery-audit.jsonl");
+                let data = std::fs::read_to_string(&path).unwrap();
+                let mut rows = data.lines();
+                let requested: Value = serde_json::from_str(rows.next().unwrap()).unwrap();
+                let terminal: Value = serde_json::from_str(rows.next().unwrap()).unwrap();
+                let mut rejected = requested.clone();
+                rejected["operation_id"] = json!(format!("{:032x}", 2));
+                rejected["event"] = json!("rejected");
+                rejected["reason"] = json!("busy");
+                let torn = format!("{{\"operation_id\":\"{:032x}\",\"reason\":", 3);
+                std::fs::write(&path, format!("{terminal}\n{rejected}\n{torn}")).unwrap();
+                let mut restarted = Fixture::new(false, None);
+                let replay = ControlPlane::read_core_recovery_audit(&path).unwrap();
+                assert!(!replay.invalid);
+                assert_eq!(replay.orphaned.len(), 1);
+                restarted.load_replay(replay, None);
+                for id in 1..=3 {
+                    let request = restarted.request(id, 0, true);
+                    assert!(
+                        restarted
+                            .plane
+                            .operation_exists(request.operation_id.as_deref().unwrap())
+                    );
+                    assert!(
+                        restarted
+                            .plane
+                            .request_as(&query(id), &ControlAccess::default())
+                            .get("operation")
+                            .is_none()
+                    );
+                    assert_eq!(
+                        restarted.submit(&request, Duration::ZERO)["error"],
+                        "operation_id_conflict"
+                    );
+                }
+
+                let mut foreign_incarnation = requested.clone();
+                foreign_incarnation["incarnation"] = json!("/foreign/incarnation");
+                let mut foreign_reason = terminal.clone();
+                foreign_reason["event"] = json!("failed");
+                foreign_reason["reason"] = json!("/foreign/reason");
+                let mut conflicting_admission = requested.clone();
+                conflicting_admission["force"] = json!(false);
+                let mut conflicting_terminal = terminal.clone();
+                conflicting_terminal["event"] = json!("failed");
+                conflicting_terminal["reason"] = json!("launch_failed");
+                for text in [
+                    format!("{foreign_incarnation}\n"),
+                    format!("{requested}\n{foreign_reason}\n"),
+                    format!("{requested}\n{conflicting_admission}\n"),
+                    format!("{requested}\n{terminal}\n{conflicting_terminal}\n"),
+                ] {
+                    std::fs::write(&path, text).unwrap();
+                    let replay = ControlPlane::read_core_recovery_audit(&path).unwrap();
+                    assert!(replay.invalid);
+                    assert!(
+                        replay
+                            .reserved
+                            .contains(req.operation_id.as_deref().unwrap())
+                    );
+                    restarted.load_replay(replay, None);
+                    let reply = restarted
+                        .plane
+                        .request_as(&query(1), &ControlAccess::default());
+                    assert!(reply.get("operation").is_none());
+                    assert!(!reply.to_string().contains("/foreign/"));
+                    let fresh = restarted.request(3, 0, true);
+                    assert_eq!(
+                        restarted.submit(&fresh, Duration::ZERO)["error"],
+                        "audit_unavailable"
+                    );
+                }
+            }
+
+            #[tokio::test]
+            async fn supervision_runs_during_stalled_replay_and_worker_shutdown_is_bounded() {
+                let mut f = Fixture::new(false, None);
+                let path = f.dir.join("core-recovery-audit.jsonl");
+                let (entered, reading) = tokio::sync::oneshot::channel();
+                let (resume, release) = std::sync::mpsc::channel();
+                f.plane
+                    .start_core_recovery_audit_with(path, move |path| {
+                        let _ = entered.send(());
+                        let _ = release.recv_timeout(Duration::from_secs(5));
+                        ControlPlane::read_core_recovery_audit(path)
+                    })
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), reading)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let request = f.request(1, 0, true);
+                assert_eq!(
+                    f.submit(&request, Duration::ZERO)["error"],
+                    "audit_unavailable"
+                );
+                assert_eq!(
+                    f.plane.request(&CommandRequest {
+                        command: "status".into(),
+                        ..Default::default()
+                    })["status"]["core_recovery_audit"]["available"],
+                    false
+                );
+                f.stop_gateway();
+                tokio::time::timeout(Duration::from_secs(1), f.plane.tick(&no_credentials))
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    f.plane.daemon.entries[&f.key].snapshot.state,
+                    ProcessState::Running
+                );
+                assert!(
+                    !f.plane
+                        .shutdown_control_audits_with_timeout(Duration::from_millis(20))
+                        .await
+                );
+                assert!(f.plane.core_audit_worker.is_none());
+                resume.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), &mut f.plane.audit_worker_exits[0])
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+
+            #[test]
+            fn gateway_audit_rejections_are_canonical_and_admission_waits_for_sync() {
+                let mut f = Fixture::new(false, None);
+                let core = f.request(1, 0, true);
+                assert_eq!(f.submit(&core, Duration::ZERO)["ok"], true);
+                let (writer, mut jobs) = tokio::sync::mpsc::channel(8);
+                f.plane.gateway_audit_worker = Some(writer);
+                let request = CommandRequest {
+                    command: "gateway-update".into(),
+                    bot: core.bot,
+                    operation_id: Some(format!("{:032x}", 2)),
+                    shards: Some(vec![0]),
+                    ..Default::default()
+                };
+                for (selector, expected) in [
+                    (request.bot.clone(), json!("7")),
+                    (Some("/secret/selector".into()), Value::Null),
+                ] {
+                    let (response, mut reply) = tokio::sync::oneshot::channel();
+                    f.plane.dispatch_gateway_update(
+                        CommandRequest {
+                            bot: selector,
+                            ..request.clone()
+                        },
+                        &ControlAccess::default(),
+                        response,
+                        json!({}),
+                    );
+                    assert_eq!(
+                        reply.try_recv().unwrap()["error"],
+                        if expected.is_null() {
+                            "bot not found"
+                        } else {
+                            "busy"
+                        }
+                    );
+                    let job = jobs.try_recv().unwrap();
+                    assert!(job.completion.is_none());
+                    let row: Value = serde_json::from_slice(&job.record.bytes).unwrap();
+                    assert_eq!(row["event"], "rejected");
+                    assert_eq!(row["bot"], expected);
+                    assert!(!row.to_string().contains("selector"));
+                    assert!(jobs.try_recv().is_err());
+                }
+                assert_eq!(f.complete(1, Duration::ZERO)["ok"], true);
+                for synced in [false, true] {
+                    let (response, mut reply) = tokio::sync::oneshot::channel();
+                    f.plane.dispatch_gateway_update(
+                        request.clone(),
+                        &ControlAccess::default(),
+                        response,
+                        json!({}),
+                    );
+                    let job = jobs.try_recv().unwrap();
+                    let row: Value = serde_json::from_slice(&job.record.bytes).unwrap();
+                    assert_eq!(row["event"], "requested");
+                    assert_eq!(row["bot"], "7");
+                    let id = request.operation_id.as_deref().unwrap();
+                    let now =
+                        f.plane.pending_gateway_updates[0].deadline - Duration::from_millis(1);
+                    f.plane.settle_gateway_audits(now);
+                    assert!(!f.plane.operation_exists(id));
+                    assert!(reply.try_recv().is_err());
+                    assert!(job.completion.unwrap().send((job.record, synced)).is_ok());
+                    f.plane.settle_gateway_audits(now);
+                    assert_eq!(reply.try_recv().unwrap()["ok"], synced);
+                    assert_eq!(f.plane.operation_exists(id), synced);
+                    if !synced {
+                        assert!(jobs.try_recv().unwrap().completion.is_none());
+                    }
+                }
+            }
+
+            #[tokio::test]
+            async fn core_audit_status_exposes_rejection_drops_disk_failures_and_worker_state() {
+                let mut f = Fixture::new(false, None);
+                let mut req = f.request(1, 0, true);
+                req.core = Some(crate::core_attach::SLOTS as u32);
+                let status = CommandRequest {
+                    command: "status".into(),
+                    ..Default::default()
+                };
+                let (writer, jobs) = tokio::sync::mpsc::channel(1);
+                f.plane.core_audit_worker = Some(writer);
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "core_out_of_range");
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "core_out_of_range");
+                let health = f.plane.request(&status)["status"]["core_recovery_audit"].clone();
+                assert_eq!(health["ok"], false);
+                assert_eq!(health["available"], true);
+                assert_eq!(health["failed_or_dropped"], 1);
+                drop(jobs);
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "core_out_of_range");
+                let health = f.plane.request(&status)["status"]["core_recovery_audit"].clone();
+                assert_eq!(health["available"], false);
+                assert_eq!(health["failed_or_dropped"], 2);
+
+                let path = f.dir.join("core-recovery-audit.jsonl");
+                f.plane.start_core_recovery_audit(path.clone()).unwrap();
+                let until = Instant::now() + Duration::from_secs(2);
+                while !f.plane.core_audit_ready {
+                    f.plane.poll_core_audit_replay();
+                    assert!(Instant::now() < until);
+                    tokio::task::yield_now().await;
+                }
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                assert_eq!(f.submit(&req, Duration::ZERO)["error"], "core_out_of_range");
+                loop {
+                    let health = f.plane.request(&status)["status"]["core_recovery_audit"].clone();
+                    if health["failed_or_dropped"] == 3 {
+                        assert_eq!(health["ok"], false);
+                        assert_eq!(health["available"], true);
+                        break;
+                    }
+                    assert!(Instant::now() < until);
+                    tokio::task::yield_now().await;
+                }
+                assert!(f.plane.shutdown_control_audits().await);
+                let mut restarted = Fixture::new(false, None);
+                restarted.plane.start_core_recovery_audit(path).unwrap();
+                let until = Instant::now() + Duration::from_secs(2);
+                while restarted.plane.core_audit_replay.is_some() {
+                    restarted.plane.poll_core_audit_replay();
+                    assert!(Instant::now() < until);
+                    tokio::task::yield_now().await;
+                }
+                let health =
+                    restarted.plane.request(&status)["status"]["core_recovery_audit"].clone();
+                assert_eq!(health["failed_or_dropped"], 0);
+                assert_eq!(health["pending"], 0);
+                assert_eq!(health["ok"], false);
+                assert_eq!(health["available"], false);
+                assert!(restarted.plane.shutdown_control_audits().await);
+            }
+
+            #[tokio::test]
+            async fn shutdown_durably_cancels_an_admission_without_consuming_it_as_an_action() {
+                let mut f = Fixture::new(false, None);
+                let path = f.dir.join("core-recovery-audit.jsonl");
+                f.plane.start_core_recovery_audit(path.clone()).unwrap();
+                let until = Instant::now() + Duration::from_secs(2);
+                while !f.plane.core_audit_ready {
+                    f.plane.poll_core_audit_replay();
+                    assert!(Instant::now() < until);
+                    tokio::task::yield_now().await;
+                }
+                let req = f.request(1, 0, true);
+                let before = f.plane.daemon.core_status(&f.key).unwrap();
+                let (response, mut reply) = tokio::sync::oneshot::channel();
+                f.plane
+                    .dispatch_core_restart(&req, &ControlAccess::default(), response, json!({}));
+                let id = req.operation_id.as_deref().unwrap();
+                assert!(
+                    f.plane.operations[id]
+                        .core_restart
+                        .as_ref()
+                        .unwrap()
+                        .pending
+                        .is_some()
+                );
+                assert!(f.plane.shutdown_control_audits().await);
+                assert_eq!(reply.try_recv().unwrap()["error"], "daemon_shutdown");
+                assert_eq!(f.plane.daemon.core_status(&f.key).unwrap(), before);
+                let replay = ControlPlane::read_core_recovery_audit(&path).unwrap();
+                assert!(!replay.invalid);
+                assert_eq!(replay.archived[id].state(), "failed");
+                assert_eq!(
+                    ControlPlane::archived_core_view(&replay.archived[id])["operation"]["reason"],
+                    "daemon_shutdown"
                 );
             }
 
@@ -4207,7 +5565,7 @@ pub mod control {
                 assert_eq!(value["operation"]["terminal_audit"], "pending_or_failed");
                 let archived = ControlPlane::read_core_recovery_audit(&saved).unwrap();
                 let id = req.operation_id.as_deref().unwrap();
-                assert_eq!(archived[id].state, "unknown");
+                assert_eq!(archived.archived[id].state(), "unknown");
                 let after = f.plane.daemon.core_status(&f.key).unwrap();
                 assert_ne!(after[0].status_id, before[0].status_id);
                 assert_eq!(after[1], before[1]);
@@ -4221,7 +5579,7 @@ pub mod control {
                     "synced"
                 );
                 let archived = ControlPlane::read_core_recovery_audit(&path).unwrap();
-                assert_eq!(archived[id].state, "succeeded");
+                assert_eq!(archived.archived[id].state(), "succeeded");
                 let wrong = CommandRequest {
                     expect_bot_id: Some("8".into()),
                     ..req.clone()
@@ -4827,7 +6185,7 @@ pub mod control {
             let mut plane = plane(1, 1);
             let actor = ("subject".to_owned(), "admin".to_owned());
             let mut record =
-                ControlPlane::audit_record("succeeded", "id", "bot", &actor, None).unwrap();
+                ControlPlane::audit_record("succeeded", "id", Some("bot"), &actor, None).unwrap();
             let bytes = record.bytes.clone();
             plane.set_gateway_update_audit(dir.clone());
             assert!(plane.write_audit(&mut record).is_err());
@@ -4866,7 +6224,7 @@ pub mod control {
             plane.set_gateway_update_audit(path.clone());
             let actor = ("subject".to_owned(), "admin".to_owned());
             let mut record =
-                ControlPlane::audit_record("succeeded", "id", "bot", &actor, None).unwrap();
+                ControlPlane::audit_record("succeeded", "id", Some("bot"), &actor, None).unwrap();
             plane.write_audit(&mut record).unwrap();
             std::fs::write(&path, b"").unwrap();
             plane.write_audit(&mut record).unwrap();
@@ -4930,7 +6288,7 @@ pub mod control {
             let mut record = ControlPlane::audit_record(
                 "succeeded",
                 "id",
-                "bot",
+                Some("bot"),
                 &("subject".into(), "admin".into()),
                 None,
             )
@@ -4967,7 +6325,7 @@ pub mod control {
             let mut record = ControlPlane::audit_record(
                 "succeeded",
                 "id",
-                "bot",
+                Some("bot"),
                 &("subject".into(), "admin".into()),
                 None,
             )
@@ -5012,7 +6370,7 @@ pub mod control {
                 ControlPlane::audit_record(
                     "failed",
                     "id",
-                    "bot",
+                    Some("bot"),
                     &("subject".into(), "admin".into()),
                     None,
                 )
@@ -5044,7 +6402,7 @@ pub mod control {
             let mut record = ControlPlane::audit_record(
                 "succeeded",
                 "id",
-                "bot",
+                Some("bot"),
                 &("subject".into(), "admin".into()),
                 None,
             )
@@ -5237,7 +6595,7 @@ pub mod control {
             let actor = ("local-bootstrap".to_owned(), "admin".to_owned());
             // Unit fixtures have no separated Core, so admit and finish directly.
             plane
-                .audit_gateway_update("requested", &id, "id-0", &actor, None)
+                .audit_gateway_update("requested", &id, Some("id-0"), &actor, None)
                 .unwrap();
             assert_eq!(plane.admit(&req, "id-0".to_owned())["ok"], true);
             plane.gateway_update_actors.insert(id.clone(), actor);

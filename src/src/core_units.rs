@@ -137,7 +137,7 @@ struct Slot {
     // Management identity, also supplied to P1 when diagnostics are configured.
     status_id: Option<u64>,
     last_id: Option<u64>,
-    launch: Option<std::sync::mpsc::Receiver<std::io::Result<LaunchOutcome>>>,
+    launch: Option<ManualLaunch>,
     manual_restart: Option<ManualRestart>,
     // 起動失敗などで回収できていない Child は、終了を確認するまで保持する。
     reap_only: bool,
@@ -146,6 +146,12 @@ struct Slot {
 struct ManualRestart {
     kill_at: Option<Instant>,
     reap_by: Option<Instant>,
+    force: bool,
+}
+
+struct ManualLaunch {
+    result: std::sync::mpsc::Receiver<std::io::Result<LaunchOutcome>>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +159,7 @@ pub(crate) enum ManualRestartError {
     TerminationUnconfirmed,
     LaunchFailed,
     ShardStopped,
+    LastRunningCore,
 }
 
 impl Slot {
@@ -211,6 +218,9 @@ impl Slot {
             self.next_start = None;
         } else {
             drop(outcome.stdin.take());
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+            }
         }
         launched
     }
@@ -220,6 +230,21 @@ struct LaunchOutcome {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     id: u64,
+    secret: Option<Secret<[u8; SECRET_BYTES]>>,
+}
+
+impl LaunchOutcome {
+    fn bootstrap(
+        &mut self,
+        write: impl FnOnce(&mut ChildStdin, &Secret<[u8; SECRET_BYTES]>) -> std::io::Result<()>,
+    ) {
+        if let Some(secret) = self.secret.take() {
+            self.stdin = self.stdin.take().and_then(|mut stdin| {
+                write(&mut stdin, &secret).ok()?;
+                Some(stdin)
+            });
+        }
+    }
 }
 
 impl Drop for LaunchOutcome {
@@ -228,12 +253,14 @@ impl Drop for LaunchOutcome {
         drop(self.stdin.take());
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
-            let _ = child.try_wait();
+            // The owner has dropped its receiver. Reap on the launch thread.
+            let _ = child.wait();
         }
     }
 }
 
 struct CoreLaunch {
+    cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     dir: PathBuf,
     bot_id: BotId,
     shard: Shard,
@@ -362,6 +389,7 @@ impl CoreUnits {
         slot.manual_restart = Some(ManualRestart {
             kill_at: None,
             reap_by: None,
+            force: false,
         });
     }
 
@@ -374,6 +402,7 @@ impl CoreUnits {
         index: usize,
         expected: Option<u64>,
         now: Instant,
+        force: bool,
     ) -> std::io::Result<bool> {
         let slot = &mut self.slots[index];
         let restart = slot
@@ -393,6 +422,7 @@ impl CoreUnits {
             None => false,
         };
         restart.kill_at = Some(now + MANUAL_STOP_GRACE);
+        restart.force = force;
         if exited {
             // Exit preceded EOF. Preserve the same backoff as ordinary supervision.
             slot.record_exit(now);
@@ -404,6 +434,11 @@ impl CoreUnits {
 
     pub(crate) fn cancel_manual_restart(&mut self, index: usize) {
         let slot = &mut self.slots[index];
+        if let Some(launch) = &slot.launch {
+            launch
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let interrupted = slot
             .manual_restart
             .take()
@@ -425,7 +460,7 @@ impl CoreUnits {
             now,
             wanted,
             Child::try_wait,
-            CoreLaunch::run,
+            CoreLaunch::spawn,
         )
     }
 
@@ -444,7 +479,7 @@ impl CoreUnits {
             return Some(Err(ShardStopped));
         }
         let slot = &mut self.slots[index];
-        let restart = slot.manual_restart.as_mut().expect("manual restart active");
+        let restart = slot.manual_restart.as_ref().expect("manual restart active");
         let kill_at = restart.kill_at.expect("requested audit synced");
         if slot.launch.is_some() {
             let success = Self::collect_launch(slot, true, now)?;
@@ -462,8 +497,14 @@ impl CoreUnits {
                         }
                         true
                     } else if now >= kill_at {
-                        restart.reap_by = Some(now + MANUAL_REAP_GRACE);
-                        if child.kill().is_ok() {
+                        if !restart.force && !self.peer_available(index) {
+                            self.cancel_manual_restart(index);
+                            return Some(Err(LastRunningCore));
+                        }
+                        let slot = &mut self.slots[index];
+                        slot.manual_restart.as_mut().unwrap().reap_by =
+                            Some(now + MANUAL_REAP_GRACE);
+                        if slot.child.as_mut().unwrap().kill().is_ok() {
                             return None;
                         }
                         true
@@ -476,14 +517,17 @@ impl CoreUnits {
                 self.cancel_manual_restart(index);
                 return Some(Err(TerminationUnconfirmed));
             }
-            slot.clear_child();
+            self.slots[index].clear_child();
         }
+        let slot = &self.slots[index];
         if !slot.can_start(now) {
             return None;
         }
-        let launch = self.launch_config(index);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut launch = self.launch_config(index);
+        launch.cancelled = Some(cancelled.clone());
         let program = program.to_path_buf();
-        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let (send, receive) = std::sync::mpsc::sync_channel(0);
         let slot = &mut self.slots[index];
         match std::thread::Builder::new()
             .name("core-restart".into())
@@ -491,7 +535,10 @@ impl CoreUnits {
                 let _ = send.send(start(launch, index, &program));
             }) {
             Ok(_) => {
-                slot.launch = Some(receive);
+                slot.launch = Some(ManualLaunch {
+                    result: receive,
+                    cancelled,
+                });
                 None
             }
             Err(_) => {
@@ -504,15 +551,19 @@ impl CoreUnits {
 
     fn collect_launch(slot: &mut Slot, wanted: bool, now: Instant) -> Option<bool> {
         use std::sync::mpsc::TryRecvError;
-        let result = match slot.launch.as_ref()?.try_recv() {
+        let result = match slot.launch.as_ref()?.result.try_recv() {
             Err(TryRecvError::Empty) => return None,
             result => result,
         };
         slot.launch = None;
-        let launched = result
-            .ok()
-            .and_then(Result::ok)
-            .is_some_and(|outcome| slot.install(outcome, wanted, now));
+        let launched = result.ok().and_then(Result::ok).is_some_and(|mut outcome| {
+            if wanted {
+                // The owner is the only writer to this fresh pipe. The capability
+                // fits in one PIPE_BUF write, and cancellation cannot race delivery.
+                outcome.bootstrap(write_secret);
+            }
+            slot.install(outcome, wanted, now)
+        });
         if wanted && !launched {
             slot.launch_failed(now);
         }
@@ -539,6 +590,7 @@ impl CoreUnits {
 
     fn launch_config(&self, index: usize) -> CoreLaunch {
         CoreLaunch {
+            cancelled: None,
             dir: self.dir.clone(),
             bot_id: self.bot_id,
             shard: self.shard,
@@ -630,6 +682,9 @@ impl CoreUnits {
 
     /// Last resort after the stop deadline. Only signal owned, unreaped children.
     pub fn kill(&mut self) {
+        for index in 0..self.slots.len() {
+            self.cancel_manual_restart(index);
+        }
         for slot in &mut self.slots {
             drop(slot.stdin.take());
             if let Some(child) = slot.child.as_mut() {
@@ -664,6 +719,12 @@ impl CoreLaunch {
         program: &Path,
         write: impl FnOnce(&mut ChildStdin, &Secret<[u8; SECRET_BYTES]>) -> std::io::Result<()>,
     ) -> std::io::Result<LaunchOutcome> {
+        let mut outcome = self.spawn(index, program)?;
+        outcome.bootstrap(write);
+        Ok(outcome)
+    }
+
+    fn spawn(self, index: usize, program: &Path) -> std::io::Result<LaunchOutcome> {
         let secret = load_secret_file(&secret_path(&self.dir))
             .map_err(|_| std::io::Error::other("core secret"))?;
         let identity = serde_json::to_string(&identity(self.bot_id, self.shard))
@@ -725,18 +786,20 @@ impl CoreLaunch {
             .stderr(err)
             // Terminal Ctrl-C targets botd's foreground group; botd stops Cores itself.
             .process_group(0);
-        let mut child = command.spawn()?;
-        let stdin = child.stdin.take().and_then(|mut stdin| {
-            write(&mut stdin, &secret).ok()?;
-            Some(stdin)
-        });
-        if stdin.is_none() {
-            let _ = child.kill();
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(std::io::ErrorKind::Interrupted.into());
         }
+        let mut child = command.spawn()?;
+        let stdin = child.stdin.take();
         Ok(LaunchOutcome {
             child: Some(child),
             stdin,
             id,
+            secret: Some(secret),
         })
     }
 }
@@ -859,7 +922,7 @@ mod manual_restart_tests {
         f.cores.reserve_manual_restart(0);
         f.cores.ensure(&f.program).unwrap();
         assert!(f.cores.slots[0].child.is_none());
-        assert!(f.cores.begin_manual_restart(0, None, now).unwrap());
+        assert!(f.cores.begin_manual_restart(0, None, now, true).unwrap());
         assert_eq!(f.cores.poll_manual_restart(0, &f.program, now, true), None);
         assert!(f.cores.slots[0].launch.is_none());
         // Make ensure eligible regardless of wall clock, then verify the hold still wins.
@@ -886,7 +949,7 @@ mod manual_restart_tests {
         let now = Instant::now();
         let old = f.cores.slots[0].status_id;
         f.cores.reserve_manual_restart(0);
-        assert!(f.cores.begin_manual_restart(0, old, now).unwrap());
+        assert!(f.cores.begin_manual_restart(0, old, now, true).unwrap());
         assert_eq!(
             f.cores.poll_manual_restart(0, &f.program, now, false),
             Some(Err(ManualRestartError::ShardStopped))
@@ -903,6 +966,77 @@ mod manual_restart_tests {
     }
 
     #[test]
+    fn cancelled_launch_cannot_bootstrap_and_late_child_is_killed_and_reaped() {
+        for spawned in [false, true] {
+            let mut f = Fixture::new();
+            f.empty_slot(0);
+            let marker = socket_path(f.cores.dir(), 0).with_extension("sock.capability");
+            let program = f.dir.join("late-child");
+            std::fs::write(
+                &program,
+                "#!/bin/sh\nif IFS= read -r capability; then : > \"$2.capability\"; fi\nexec /bin/sleep 30\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let now = Instant::now();
+            f.cores.reserve_manual_restart(0);
+            assert!(f.cores.begin_manual_restart(0, None, now, true).unwrap());
+            let (ready, entered) = std::sync::mpsc::channel();
+            let (resume, release) = std::sync::mpsc::channel();
+            let (checked, check) = std::sync::mpsc::channel();
+            assert_eq!(
+                f.cores.poll_manual_restart_with(
+                    0,
+                    &program,
+                    now,
+                    true,
+                    Child::try_wait,
+                    move |launch, index, program| {
+                        if spawned {
+                            let result = launch.spawn(index, program)?;
+                            ready.send(result.child.as_ref().map(Child::id)).unwrap();
+                            release.recv_timeout(Duration::from_secs(2)).unwrap();
+                            checked.send(true).unwrap();
+                            Ok(result)
+                        } else {
+                            ready.send(None).unwrap();
+                            release.recv_timeout(Duration::from_secs(2)).unwrap();
+                            let result = launch.spawn(index, program);
+                            checked
+                                .send(
+                                    result.as_ref().is_err_and(|e| {
+                                        e.kind() == std::io::ErrorKind::Interrupted
+                                    }),
+                                )
+                                .unwrap();
+                            result
+                        }
+                    },
+                ),
+                None
+            );
+            let pid = entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(pid.is_some(), spawned);
+            f.cores.begin_stop();
+            // Shutdown's kill sweep precedes the launch result.
+            f.cores.kill();
+            assert!(f.cores.slots[0].launch.is_some());
+            resume.send(()).unwrap();
+            assert!(check.recv_timeout(Duration::from_secs(2)).unwrap());
+            let until = Instant::now() + Duration::from_secs(2);
+            while f.cores.any_alive() {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            if let Some(pid) = pid {
+                assert!(!Path::new(&format!("/proc/{pid}")).exists());
+            }
+            assert!(!marker.exists());
+            assert!(f.cores.slots[0].launch.is_none());
+        }
+    }
+
+    #[test]
     fn pending_launch_leaves_other_supervision_live_and_bootstrap_failure_is_counted() {
         let mut f = Fixture::new();
         let mut other = Fixture::new();
@@ -911,7 +1045,7 @@ mod manual_restart_tests {
         f.cores.set_epoch_floor(17);
         let now = Instant::now();
         f.cores.reserve_manual_restart(0);
-        assert!(f.cores.begin_manual_restart(0, None, now).unwrap());
+        assert!(f.cores.begin_manual_restart(0, None, now, true).unwrap());
         let (release, paused) = std::sync::mpsc::channel();
         let (entered, launch_entered) = std::sync::mpsc::channel();
         assert_eq!(
@@ -966,7 +1100,7 @@ mod manual_restart_tests {
             let id = f.cores.slots[0].status_id;
             let pid = f.cores.slots[0].child.as_ref().unwrap().id();
             f.cores.reserve_manual_restart(0);
-            assert!(f.cores.begin_manual_restart(0, id, now).unwrap());
+            assert!(f.cores.begin_manual_restart(0, id, now, true).unwrap());
             let deadline = now + MANUAL_STOP_GRACE + MANUAL_REAP_GRACE;
             f.cores.slots[0].manual_restart.as_mut().unwrap().reap_by = Some(deadline);
             let observe = |_: &mut Child| {
@@ -1049,7 +1183,7 @@ mod manual_restart_tests {
         cores.reserve_manual_restart(0);
         assert!(
             cores
-                .begin_manual_restart(0, before[0].status_id, now)
+                .begin_manual_restart(0, before[0].status_id, now, true)
                 .unwrap()
         );
         assert!(cores.slots[0].stdin.is_none());
