@@ -530,7 +530,28 @@ fn contains_control_secret(value: &Value, secret: &[u8; 32]) -> bool {
     walk(value, &secret_value, &encoded, &hex)
 }
 
+/// While botd replays its audit journal at startup it answers `audit_replay_pending`
+/// before any action has started, so the request is safe to repeat. The wait is bounded.
 async fn exchange(bootstrap: &Bootstrap, request: &impl Serialize) -> Result<Value, &'static str> {
+    let started = std::time::Instant::now();
+    loop {
+        let value = exchange_once(bootstrap, request).await?;
+        if value["error"] != "audit_replay_pending" || started.elapsed() >= Duration::from_secs(10)
+        {
+            return Ok(value);
+        }
+        let wait = value["retry_after_ms"]
+            .as_u64()
+            .unwrap_or(100)
+            .clamp(25, 500);
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+    }
+}
+
+async fn exchange_once(
+    bootstrap: &Bootstrap,
+    request: &impl Serialize,
+) -> Result<Value, &'static str> {
     let frame = encode_request(request)?;
     // No hostname, endpoint file or arbitrary remote address is accepted.
     let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, bootstrap.port))

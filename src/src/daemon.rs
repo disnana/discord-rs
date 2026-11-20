@@ -2910,7 +2910,7 @@ pub mod control {
                     .is_ok_and(|mut record| {
                         if let Some(worker) = self.core_audit_worker.as_ref() {
                             // The queue can hold 64 jobs while the worker writes one.
-                            if self.core_audit_rejections.len() >= AUDIT_QUEUE_LIMIT + 1 {
+                            if self.core_audit_rejections.len() > AUDIT_QUEUE_LIMIT {
                                 return false;
                             }
                             let Ok(Some(result)) = Self::submit_audit(worker, record, true) else {
@@ -4780,8 +4780,13 @@ pub mod control {
                     json!({}),
                 );
                 let mut op = f.plane.operations.remove(id).unwrap();
+                // Earlier rejections also carry a completion; pick this request's own row.
                 let job = std::iter::from_fn(|| jobs.try_recv().ok())
-                    .find(|job| job.completion.is_some())
+                    .find(|job| {
+                        job.completion.is_some()
+                            && serde_json::from_slice::<Value>(&job.record.bytes)
+                                .is_ok_and(|row| row["event"] == "requested")
+                    })
                     .unwrap();
                 assert!(job.completion.unwrap().send((job.record, true)).is_ok());
                 assert!(f.plane.settle_core_restart_audit(&mut op, f.now));

@@ -286,7 +286,20 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-async fn control(port: u16, mut value: Value) -> Value {
+/// botd answers `audit_replay_pending` (nothing started) while it replays its audit journal
+/// at startup; repeat the request until it is ready.
+async fn control(port: u16, value: Value) -> Value {
+    for _ in 0..200 {
+        let reply = control_once(port, value.clone()).await;
+        if reply["error"] != "audit_replay_pending" {
+            return reply;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("audit replay did not finish");
+}
+
+async fn control_once(port: u16, mut value: Value) -> Value {
     value["secret"] = json!(SECRET);
     let mut stream = bounded(tokio::net::TcpStream::connect(("127.0.0.1", port)))
         .await
