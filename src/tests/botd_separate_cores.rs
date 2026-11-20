@@ -22,7 +22,12 @@ use tokio::{
 };
 
 const WAIT: Duration = Duration::from_secs(40);
-const SECRET: [u8; 32] = [83; 32];
+// botctl refuses weak secrets (few distinct bytes, monotonic runs), so the shared test secret
+// is a varied value.
+const SECRET: [u8; 32] = [
+    11, 200, 3, 77, 150, 42, 9, 231, 18, 64, 99, 5, 180, 250, 31, 120, 66, 7, 140, 222, 55, 13,
+    170, 90, 38, 201, 24, 111, 76, 189, 4, 133,
+];
 const CONFIG: &str = r#"
 [cluster]
 id = "separate-cores-test"
@@ -39,6 +44,10 @@ total_shards = 1
 shard_id = 0
 primary = "local"
 "#;
+
+fn secret_hex() -> String {
+    SECRET.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(WAIT, future)
@@ -850,7 +859,7 @@ impl CoreRecoveryFixture {
         )
         .await;
         let secret_file = daemon.root.join("ctl.secret");
-        src::fs_perms::create_secret_file(&secret_file, "53".repeat(32).as_bytes()).unwrap();
+        src::fs_perms::create_secret_file(&secret_file, secret_hex().as_bytes()).unwrap();
         Some(Self {
             daemon,
             status_dir,
@@ -1154,7 +1163,7 @@ async fn botctl_core_recovery_refuses_a_daemon_without_preview() {
         return;
     };
     let secret = dir.0.join("ctl.secret");
-    src::fs_perms::create_secret_file(&secret, "53".repeat(32).as_bytes()).unwrap();
+    src::fs_perms::create_secret_file(&secret, secret_hex().as_bytes()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = async {
