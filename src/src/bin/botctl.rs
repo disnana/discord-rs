@@ -579,7 +579,10 @@ async fn exchange(bootstrap: &Bootstrap, request: &impl Serialize) -> Result<Val
     let started = std::time::Instant::now();
     loop {
         let value = exchange_once(bootstrap, request).await?;
-        if value["error"] != "audit_replay_pending" || started.elapsed() >= Duration::from_secs(10)
+        if value["ok"] != false
+            || value.get("operation").is_some()
+            || value["error"] != "audit_replay_pending"
+            || started.elapsed() >= Duration::from_secs(10)
         {
             return Ok(value);
         }
@@ -889,6 +892,17 @@ fn core_outcome(state: &str, error: Option<&str>, id: Option<&str>) -> Value {
     value
 }
 
+// Call only after operation_state has validated the Core recovery reply.
+fn core_operation_fields(op: &Value) -> Value {
+    json!({
+        "operation_id": op["operation_id"], "command": op["command"],
+        "core_recovery_version": op["core_recovery_version"],
+        "bot_id": op["bot_id"], "shard": op["shard"], "core": op["core"],
+        "incarnation": op["incarnation"], "state": op["state"], "reason": op["reason"],
+        "source": op["source"], "terminal_audit": op["terminal_audit"],
+    })
+}
+
 async fn run_core(options: Options, mut deadline: Instant) -> Value {
     let restart = options.command == "core-restart";
     let preview_error = |state, error| {
@@ -1029,7 +1043,7 @@ async fn restart_core(
     }
     let query = json!({"secret": bootstrap.secret, "command": "operation", "operation_id": id});
     let mut sending = true;
-    let mut rejection = None;
+    eprintln!("Core restart operation ID {id}");
     loop {
         let response = match timeout_at(
             deadline,
@@ -1048,17 +1062,17 @@ async fn restart_core(
             }
             Err(_) => return core_outcome("timeout", Some("operation_wait_timed_out"), Some(&id)),
         };
-        if sending && let Some(reason) = core_restart_rejection(&response) {
+        // A bare failure reason can follow audit admission. Query those replies
+        // unless the daemon explicitly rejected the request.
+        if sending
+            && let Some(reason) = core_restart_rejection(&response)
+            && (response["rejected"] == true || !core_recovery_failure_reason(reason))
+        {
             let mut result = core_outcome("rejected", Some(reason), Some(&id));
             if let Some(wait) = response["retry_after_ms"].as_u64() {
                 result["retry_after_ms"] = json!(wait);
             }
-            if !core_recovery_failure_reason(reason) {
-                return result;
-            }
-            // Revalidation after the audit write may return the same reason as a
-            // pre-admission rejection, but leave a failed operation to query.
-            rejection = Some(result);
+            return result;
         }
         let op = &response["operation"];
         let bound = op["bot_id"] == preview.bot_id
@@ -1073,13 +1087,7 @@ async fn restart_core(
         match state {
             Some(state @ ("succeeded" | "failed" | "unknown")) => {
                 let mut result = core_outcome(state, op["reason"].as_str(), Some(&id));
-                result["operation"] = json!({
-                    "operation_id": id, "command": "core-restart",
-                    "core_recovery_version": CORE_RECOVERY_VERSION,
-                    "bot_id": preview.bot_id, "shard": preview.shard, "core": core,
-                    "incarnation": slot.incarnation, "state": state, "reason": op["reason"],
-                    "source": op["source"], "terminal_audit": op["terminal_audit"],
-                });
+                result["operation"] = core_operation_fields(op);
                 return result;
             }
             Some("running") => {}
@@ -1090,9 +1098,11 @@ async fn restart_core(
                     "operation not found in this daemon incarnation"
                     | "control permission or scope denied",
                 ) => {
-                    return rejection.unwrap_or_else(|| {
-                        core_outcome("unknown", Some("operation_not_found_or_denied"), Some(&id))
-                    });
+                    return core_outcome(
+                        "unknown",
+                        Some("operation_not_found_or_denied"),
+                        Some(&id),
+                    );
                 }
                 _ => {
                     return core_outcome("unknown", Some("invalid_operation_reply"), Some(&id));
@@ -1587,6 +1597,24 @@ async fn run_live_inner(
                 && let Err(error) = validate_update_result(&response, update.as_ref())
             {
                 return failure(error, Some(id), last.as_ref());
+            }
+            if options.command == "operation" && response["operation"]["command"] == "core-restart"
+            {
+                if let Err(error) = state {
+                    return failure(error, Some(id), None);
+                }
+                let operation = core_operation_fields(&response["operation"]);
+                response = json!({
+                    "ok": response["ok"], "offline": false, "operation_id": id,
+                    "operation": operation, "note": CORE_RESTART_NOTE,
+                });
+                if operation["state"] == "running" {
+                    response["ok"] = json!(false);
+                    response["pending"] = json!(true);
+                    response["error"] =
+                        json!("operation is still running; query the operation ID again");
+                }
+                return response;
             }
             match state {
                 Ok("succeeded") if response["ok"] == true => return response,

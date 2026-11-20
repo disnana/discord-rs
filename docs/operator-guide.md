@@ -173,17 +173,17 @@ botctl core restart BOT --shard N --core K --expect-incarnation ID --yes --json 
 
 プレビューの世代または空スロットを再起動要求に固定します。`--expect-incarnation ID` を指定する場合は、表示済みの 16 桁の 16 進 ID を渡してください。プレビュー時点で ID が異なれば要求を送らず拒否し、確認後に対象が変わった場合は botd が拒否します。`core-preview` に対応していない botd では再起動要求を送りません。
 
-要求を受理すると同じ操作 ID で `operation` を照会します。`--timeout` の既定は 30 秒で、認証情報の読み取り、プレビュー、要求、照会に共通です。対話確認の入力待ちは含みません。`--json` では結果を単一の JSON オブジェクトとして標準出力に返します。再起動の結果には `state` と、要求を組み立てた場合は `operation_id` が入ります。
+送信直前に操作 ID を標準エラーへ表示し、結果の確認が必要な場合は同じ ID で `operation` を照会します。`--timeout` の既定は 30 秒で、認証情報の読み取り、プレビュー、要求、照会に共通です。対話確認の入力待ちは含みません。`--json` では結果を単一の JSON オブジェクトとして標準出力に返します。再起動の結果には `state` と、要求を組み立てた場合は `operation_id` が入ります。例外として、`core status` と `core restart` の引数の解析・検証エラーは接続前に終了コード 1 を返し、`--json` の出力は `ok: false`、`offline: false`、`error` の 3 項目です。
 
 | 終了コード | `state` | 意味 |
 |---:|---|---|
 | 0 | `succeeded` | 旧 Core があれば回収し、置換を起動して IPC capability を渡した |
-| 1 | `rejected` | CLI の事前確認または botd の受付で拒否された。引数エラーも 1 |
+| 1 | `rejected` | CLI の事前確認または botd の受付で拒否された |
 | 2 | `failed` | 操作の失敗を確認した。理由は `operation.reason` |
-| 3 | `unknown` | 記録または通信から終端結果を確認できなかった |
+| 3 | `unknown` | 応答と照会結果から受理の有無や終端結果を確定できなかった |
 | 4 | `timeout` | CLI の待機期限に達した。送信済みの操作は続く場合がある |
 
-P3 の最小クライアントバージョンは **Core 復旧プロトコル v2** です。操作の照会には v2 対応の botd と同じビルドの `botctl operation` を使用します。応答の `operation.core_recovery_version` は `2` で、`source` は `live` または `archive` です。各 `core-restart` 要求には `core_recovery_version: 2`、`bot`、`shard`、`core`、`expect_bot_id`、`expect_total_shards`、32 桁の小文字 16 進の `operation_id` が必要です。旧 Core がある場合は、P1 の有効・無効にかかわらず、プレビューの 16 桁の `incarnation` を `expect_incarnation` に指定します。空スロットは `expect_empty: true` で指定します。
+P3 の最小クライアントバージョンは **Core 復旧プロトコル v2** です。操作の照会には v2 対応の botd と同じビルドの `botctl operation` を使用します。Core の操作結果は、自動照会と手動照会で同じ許可済みフィールドを表示します。応答の `operation.core_recovery_version` は `2` で、`source` は `live` または `archive` です。各 `core-restart` 要求には `core_recovery_version: 2`、`bot`、`shard`、`core`、`expect_bot_id`、`expect_total_shards`、32 桁の小文字 16 進の `operation_id` が必要です。旧 Core がある場合は、P1 の有効・無効にかかわらず、プレビューの 16 桁の `incarnation` を `expect_incarnation` に指定します。空スロットは `expect_empty: true` で指定します。
 
 Gateway が稼働中のシャードで、停滞の疑いがある Core または空スロットを対象にできます。稼働中の Core を止める際は、もう一方の Core の稼働を確認できることが必要です。正常な Core や peer の稼働を確認できない Core を対象にするには `--force` が必要で、使用は監査ログに残ります。対象の固定と回数制限は `--force` にも適用されます。同じシャードの競合は `busy` になります。同じスロットの手動操作は 60 秒以上空け、15 分に 3 回までです。開始時に 1 回分を計上し、完了まで長引いた場合は次の操作までの間隔を完了時点から測ります。監査ログの `charge_clock` は Linux の起動 ID と起動後の経過時間です。再生時に経過時間を確認できない操作は直近の試行として扱います。
 

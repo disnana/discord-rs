@@ -2642,6 +2642,7 @@ pub mod control {
                           retry: Option<Duration>| {
                 plane.audit_core_rejection(id, &key, force, recovery, reason);
                 let mut value = Self::error(reason);
+                value["rejected"] = json!(true);
                 if let Some(retry) = retry {
                     value["retry_after_ms"] = json!(retry.as_millis().max(1));
                 }
@@ -2763,11 +2764,16 @@ pub mod control {
             } else {
                 if self.write_audit(&mut record).is_err() {
                     self.release_core_restart(&key, core);
+                    if record.written {
+                        self.audit_core_rejection(id, &key, force, &recovery, "audit_unavailable");
+                        return ControlReply::respond(reply, Self::error("audit_unavailable"));
+                    }
                     return reject(self, reply, &recovery, "audit_unavailable", None);
                 }
                 if let Err(reason) = self.begin_core_restart(&key, &mut recovery, force, now) {
                     self.release_core_restart(&key, core);
-                    return reject(self, reply, &recovery, reason, None);
+                    self.audit_core_rejection(id, &key, force, &recovery, reason);
+                    return ControlReply::respond(reply, Self::error(reason));
                 }
             }
             let mut op = Operation::new(
@@ -3899,6 +3905,7 @@ pub mod control {
                 }
                 return true;
             };
+            let confirmed_rejection = matches!(&result, Ok((record, false)) if !record.written);
             let (reason, recorded) = match result {
                 Ok((record, false)) if record.written => {
                     self.charge_core_attempt(key, recovery, now);
@@ -3919,10 +3926,15 @@ pub mod control {
                 recovery.reason = Some(reason);
                 op.errors.insert(key.clone(), DaemonError::InvalidState);
                 self.finish(op);
+                reply.send(self.operation_view(op));
             } else {
                 self.audit_core_rejection(&op.id, key, op.force, recovery, reason);
+                let mut response = Self::error(reason);
+                if confirmed_rejection {
+                    response["rejected"] = json!(true);
+                }
+                reply.send(response);
             }
-            reply.send(Self::error(reason));
             recorded
         }
 
@@ -5092,7 +5104,11 @@ pub mod control {
                 }
                 assert!(job.completion.unwrap().send((job.record, true)).is_ok());
                 assert!(f.plane.settle_core_restart_audit(&mut op, f.now));
-                assert_eq!(reply.try_recv().unwrap()["error"], "last_running_core");
+                let response = reply.try_recv().unwrap();
+                assert_eq!(response["ok"], false);
+                assert_eq!(response["operation"]["operation_id"], id);
+                assert_eq!(response["operation"]["state"], "failed");
+                assert_eq!(response["operation"]["reason"], "last_running_core");
                 assert_eq!(f.plane.operation_view(&op)["operation"]["state"], "failed");
                 assert_eq!(f.plane.daemon.core_status(&f.key).unwrap(), statuses);
                 assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);

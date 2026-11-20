@@ -668,3 +668,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `botctl core status` で 1 シャードをプレビューし、`botctl core restart` で確認した世代または空スロットを固定する。非対話入力では `--yes` を必須にした。操作 ID と v2 を付け、応答切断後も同じ ID を照会する。Stage A が監査同期前後で同じ理由を返す場合も、照会できた終端結果を優先する。
 - 実 botctl と botd、模擬 Discord を使う結合テストを追加した。tmpfs 上の診断を有効にし、SIGSTOP された Core の置換と peer の PID、診断の正常化、監査、古い世代の拒否、権限、回数制限、Gateway 更新時の競合、正常 Core の `--force` を検査する。非対話確認の拒否と旧 daemon の切断も対象にした。
 - Windows 上で変更した Rust ファイルの rustfmt、差分、UTF-8 を検査。Ubuntu／WSL の cargo ビルド・テスト、対話端末での確認、実際の botd 強制終了をまたぐ照会、systemd、実 Discord での処理再開は未検証。
+
+### P3 stage B の第4回レビュー対応
+
+- botd は受理前の拒否を明示し、監査処理後に確定した失敗を操作結果付きで返す。旧 v2 応答に対して照会で受理の有無を確認できない場合は CLI が `unknown` を返す。送信直前に操作 ID を標準エラーへ出し、手動の操作照会にも Core の出力制限を適用した。監査再生での再試行は操作情報を含まない `ok: false` 応答に限定した。引数エラーの JSON 形式は運用手順に明記した。
+- 停滞試験では疑似端末の確認入力を保留し、Core の置換後に同じプレビューを送信して世代不一致の監査と置換 PID を検査する。この試験は CI で `/dev/shm` の tmpfs を必須とする。診断を利用しない試験には通常の一時領域を使い、機密値の検査は現在の試験用 secret の 16 進表現とバイト配列を対象とした。
+- Windows 上で変更した Rust ファイルの rustfmt、差分、UTF-8 を検査。Ubuntu／WSL の Cargo ビルド・テスト、実際の botd 再起動をまたぐ照会、systemd、実 Discord は未検証。

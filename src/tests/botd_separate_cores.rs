@@ -10,6 +10,8 @@
 use serde_json::{Value, json};
 use std::{
     future::Future,
+    io::Write,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -813,28 +815,23 @@ async fn daemon_core_views(port: u16) -> Vec<Value> {
         .clone()
 }
 
-struct RecoveryStatusDir(PathBuf);
+struct RecoveryTempDir(PathBuf);
 
-impl RecoveryStatusDir {
-    fn new() -> Option<Self> {
+impl RecoveryTempDir {
+    fn new(base: &Path) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let shm = Path::new("/dev/shm");
-        if !src::core_status::is_tmpfs(shm) {
-            eprintln!("skipping: /dev/shm is not tmpfs");
-            return None;
-        }
-        let dir = shm.join(format!(
+        let dir = base.join(format!(
             "bsc-p3-{}-{}-{}",
             std::process::id(),
             src::core_status::boot_ms(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&dir).unwrap();
-        Some(Self(dir))
+        Self(dir)
     }
 }
 
-impl Drop for RecoveryStatusDir {
+impl Drop for RecoveryTempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -842,7 +839,7 @@ impl Drop for RecoveryStatusDir {
 
 struct CoreRecoveryFixture {
     daemon: Fixture,
-    status_dir: RecoveryStatusDir,
+    status_dir: Option<RecoveryTempDir>,
     secret_file: PathBuf,
 }
 
@@ -850,29 +847,43 @@ impl CoreRecoveryFixture {
     async fn start(
         stub: Option<&dyn Fn(&Path) -> PathBuf>,
         access: Option<&Value>,
-    ) -> Option<Self> {
-        let status_dir = RecoveryStatusDir::new()?;
-        let daemon = Fixture::start_with_access(
-            stub,
-            &["--core-status-dir", status_dir.0.to_str().unwrap()],
-            access,
-        )
-        .await;
+        status_dir: Option<RecoveryTempDir>,
+    ) -> Self {
+        let diagnostics;
+        let extra: &[&str] = if let Some(dir) = &status_dir {
+            diagnostics = ["--core-status-dir", dir.0.to_str().unwrap()];
+            &diagnostics
+        } else {
+            &[]
+        };
+        let daemon = Fixture::start_with_access(stub, extra, access).await;
         let secret_file = daemon.root.join("ctl.secret");
         src::fs_perms::create_secret_file(&secret_file, secret_hex().as_bytes()).unwrap();
-        Some(Self {
+        Self {
             daemon,
             status_dir,
             secret_file,
-        })
+        }
     }
 
     async fn ctl(&self, args: &[&str], code: i32) -> Value {
         let output = core_botctl(self.daemon.port, &self.secret_file, args).await;
+        self.check_output(&output, code)
+    }
+
+    fn check_output(&self, output: &Output, code: i32) -> Value {
         self.assert_no_paths_or_secrets(&String::from_utf8_lossy(&output.stdout));
-        self.assert_no_paths_or_secrets(&String::from_utf8_lossy(&output.stderr));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        self.assert_no_paths_or_secrets(&stderr);
         let result: Value = serde_json::from_slice(&output.stdout).expect("botctl JSON output");
         assert_eq!(output.status.code(), Some(code), "{result}");
+        if let Some(id) = result["operation_id"].as_str() {
+            assert!(
+                stderr
+                    .lines()
+                    .any(|line| line == format!("Core restart operation ID {id}"))
+            );
+        }
         result
     }
 
@@ -886,13 +897,12 @@ impl CoreRecoveryFixture {
 
     fn assert_no_paths_or_secrets(&self, text: &str) {
         assert!(!text.contains(self.daemon.root.to_str().unwrap()));
-        assert!(!text.contains(self.status_dir.0.to_str().unwrap()));
+        if let Some(dir) = &self.status_dir {
+            assert!(!text.contains(dir.0.to_str().unwrap()));
+        }
         assert!(!text.contains(env!("CARGO_BIN_EXE_src")));
         assert!(!text.contains("separate-test-credential"));
-        assert!(!text.contains(&"53".repeat(32)));
-        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(!compact.contains(&json!(SECRET).to_string()));
-        assert!(!compact.contains("\"secret\""));
+        assert!(!contains_recovery_secret(text));
     }
 
     async fn audit_events(&self, id: &Value, count: usize) -> Vec<Value> {
@@ -927,19 +937,57 @@ impl CoreRecoveryFixture {
     }
 }
 
+fn contains_recovery_secret(text: &str) -> bool {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.to_ascii_lowercase().contains(&secret_hex())
+        || compact.contains(&json!(SECRET).to_string())
+        || compact.contains("\"secret\"")
+}
+
+#[test]
+fn core_recovery_leak_check_detects_the_current_test_secret() {
+    assert!(contains_recovery_secret(&secret_hex()));
+    assert!(contains_recovery_secret(&secret_hex().to_ascii_uppercase()));
+    assert!(contains_recovery_secret(
+        &serde_json::to_string_pretty(&SECRET).unwrap()
+    ));
+    assert!(!contains_recovery_secret("Core restart operation ID"));
+}
+
 async fn core_botctl(port: u16, secret_file: &Path, args: &[&str]) -> Output {
     bounded(
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_botctl"))
-            .args(args)
-            .arg("--secret-file")
-            .arg(secret_file)
-            .args(["--port", &port.to_string(), "--json", "--timeout", "20s"])
+        core_botctl_command(port, secret_file, args)
             .stdin(Stdio::null())
-            .kill_on_drop(true)
             .output(),
     )
     .await
     .unwrap()
+}
+
+fn core_botctl_command(port: u16, secret_file: &Path, args: &[&str]) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_botctl"));
+    command
+        .args(args)
+        .arg("--secret-file")
+        .arg(secret_file)
+        .args(["--port", &port.to_string(), "--json", "--timeout", "20s"])
+        .kill_on_drop(true);
+    command
+}
+
+fn confirmation_terminal() -> (std::fs::File, Stdio) {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: Successful calls return fresh file descriptors owned by the test.
+    let master = unsafe { libc::posix_openpt(flags) };
+    assert!(master >= 0, "{}", std::io::Error::last_os_error());
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    // SAFETY: master is an open PTY master, and TIOCGPTPEER takes open flags.
+    assert_eq!(unsafe { libc::grantpt(master.as_raw_fd()) }, 0);
+    assert_eq!(unsafe { libc::unlockpt(master.as_raw_fd()) }, 0);
+    let slave = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER, flags) };
+    assert!(slave >= 0, "{}", std::io::Error::last_os_error());
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    (master.into(), slave.into())
 }
 
 async fn wait_for_healthy_cores(port: u16) -> Vec<Value> {
@@ -961,9 +1009,16 @@ async fn wait_for_healthy_cores(port: u16) -> Vec<Value> {
 
 #[tokio::test]
 async fn botctl_core_recovery_replaces_only_the_stalled_core_and_pins_the_generation() {
-    let Some(fixture) = CoreRecoveryFixture::start(None, None).await else {
+    let shm = Path::new("/dev/shm");
+    if !src::core_status::is_tmpfs(shm) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "stalled Core test requires /dev/shm on tmpfs"
+        );
+        eprintln!("skipping stalled Core test: /dev/shm is missing or not tmpfs");
         return;
-    };
+    }
+    let fixture = CoreRecoveryFixture::start(None, None, Some(RecoveryTempDir::new(shm))).await;
     let mut gateway = fixture.daemon.accept().await;
     let pids = worker_pids(&gateway.ready);
     let port = fixture.daemon.port;
@@ -988,6 +1043,40 @@ async fn botctl_core_recovery_replaces_only_the_stalled_core_and_pins_the_genera
         .await;
     assert_eq!(preview["cores"][0]["incarnation"], old_id);
     assert_eq!(preview["cores"][0]["status"]["suspected_stalled"], true);
+
+    let (mut terminal, stdin) = confirmation_terminal();
+    let mut pending = core_botctl_command(
+        port,
+        &fixture.secret_file,
+        &[
+            "core", "restart", "alpha", "--shard", "0", "--core", "0", "--force",
+        ],
+    )
+    .stdin(stdin)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let mut stderr = BufReader::new(pending.stderr.take().unwrap());
+    let mut preview_text = String::new();
+    bounded(async {
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                stderr.read_line(&mut line).await.unwrap(),
+                0,
+                "{preview_text}"
+            );
+            preview_text.push_str(&line);
+            if line.trim() == "Restart this Core? Type yes to continue." {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(preview_text.contains(old_id));
+    assert!(!preview_text.contains("Core restart operation ID"));
+
     let restarted = fixture.restart(&["--expect-incarnation", old_id], 0).await;
     assert_eq!(restarted["state"], "succeeded");
     assert_eq!(restarted["operation"]["incarnation"], old_id);
@@ -1027,6 +1116,25 @@ async fn botctl_core_recovery_replaces_only_the_stalled_core_and_pins_the_genera
         assert_eq!(row["force"], false);
     }
 
+    terminal.write_all(b"yes\n").unwrap();
+    bounded(stderr.read_to_string(&mut preview_text))
+        .await
+        .unwrap();
+    let mut output = bounded(pending.wait_with_output()).await.unwrap();
+    output.stderr = preview_text.into_bytes();
+    let stale_confirmation = fixture.check_output(&output, 1);
+    assert_eq!(stale_confirmation["state"], "rejected");
+    assert_eq!(stale_confirmation["error"], "incarnation_mismatch");
+    assert_eq!(stale_confirmation["target"]["slot"]["incarnation"], old_id);
+    let rows = fixture
+        .audit_events(&stale_confirmation["operation_id"], 1)
+        .await;
+    assert_eq!(rows[0]["event"], "rejected");
+    assert_eq!(rows[0]["reason"], "incarnation_mismatch");
+    assert_eq!(rows[0]["incarnation"], old_id);
+    assert_eq!(worker_pids(&gateway.status().await), new_pids);
+    assert!(alive(new_pids[0]));
+
     let stale = fixture
         .restart(&["--expect-incarnation", old_id, "--force"], 1)
         .await;
@@ -1064,9 +1172,7 @@ async fn botctl_core_recovery_requires_admin_and_shard_scope() {
             "control permission or scope denied",
         ),
     ] {
-        let Some(fixture) = CoreRecoveryFixture::start(None, Some(&access)).await else {
-            return;
-        };
+        let fixture = CoreRecoveryFixture::start(None, Some(&access), None).await;
         let mut gateway = fixture.daemon.accept().await;
         let pids = worker_pids(&gateway.ready);
         let rejected = fixture.restart(&["--force"], 1).await;
@@ -1089,10 +1195,7 @@ async fn botctl_core_recovery_requires_admin_and_shard_scope() {
 
 #[tokio::test]
 async fn botctl_core_recovery_is_busy_during_gateway_update() {
-    let Some(fixture) = CoreRecoveryFixture::start(Some(&silent_standby_program), None).await
-    else {
-        return;
-    };
+    let fixture = CoreRecoveryFixture::start(Some(&silent_standby_program), None, None).await;
     let mut gateway = fixture.daemon.accept().await;
     let port = fixture.daemon.port;
     let pids = worker_pids(&gateway.ready);
@@ -1115,12 +1218,12 @@ async fn botctl_core_recovery_is_busy_during_gateway_update() {
 
 #[tokio::test]
 async fn botctl_core_recovery_requires_force_for_a_healthy_core_and_audits_it() {
-    let Some(fixture) = CoreRecoveryFixture::start(None, None).await else {
-        return;
-    };
-    let _gateway = fixture.daemon.accept().await;
+    let fixture = CoreRecoveryFixture::start(None, None, None).await;
+    let gateway = fixture.daemon.accept().await;
+    assert!(worker_pids(&gateway.ready).into_iter().all(alive));
     let port = fixture.daemon.port;
-    let before = wait_for_healthy_cores(port).await;
+    let before = daemon_core_views(port).await;
+    assert!(before.iter().all(|slot| slot["running"] == true));
     let old_id = before[0]["incarnation"].as_str().unwrap();
     let non_interactive = fixture
         .ctl(
@@ -1151,7 +1254,8 @@ async fn botctl_core_recovery_requires_force_for_a_healthy_core_and_audits_it() 
     assert_eq!(rows[0]["event"], "requested");
     assert_eq!(rows[1]["event"], "succeeded");
     assert!(rows.iter().all(|row| row["force"] == true));
-    let after = wait_for_healthy_cores(port).await;
+    let after = daemon_core_views(port).await;
+    assert!(after.iter().all(|slot| slot["running"] == true));
     assert_ne!(after[0]["incarnation"], old_id);
     assert_eq!(after[1]["incarnation"], before[1]["incarnation"]);
     fixture.finish().await;
@@ -1159,9 +1263,7 @@ async fn botctl_core_recovery_requires_force_for_a_healthy_core_and_audits_it() 
 
 #[tokio::test]
 async fn botctl_core_recovery_refuses_a_daemon_without_preview() {
-    let Some(dir) = RecoveryStatusDir::new() else {
-        return;
-    };
+    let dir = RecoveryTempDir::new(&std::env::temp_dir());
     let secret = dir.0.join("ctl.secret");
     src::fs_perms::create_secret_file(&secret, secret_hex().as_bytes()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1207,6 +1309,66 @@ async fn botctl_core_recovery_refuses_a_daemon_without_preview() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn botctl_core_recovery_prints_the_operation_id_before_the_mutation_reply() {
+    let dir = RecoveryTempDir::new(&std::env::temp_dir());
+    let secret = dir.0.join("ctl.secret");
+    src::fs_perms::create_secret_file(&secret, secret_hex().as_bytes()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut child = core_botctl_command(
+        port,
+        &secret,
+        &[
+            "core", "restart", "alpha", "--shard", "0", "--core", "0", "--yes",
+        ],
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    bounded(async {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        let preview: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(preview["command"], "core-preview");
+        let reply = json!({"ok": true, "bot_id": "101", "total_shards": 1, "shard": 0,
+            "cores": [
+                {"running": true, "empty": false, "incarnation": "fedcba9876543210", "status": null},
+                {"running": false, "empty": true, "incarnation": null, "status": null},
+            ]
+        });
+        stream.get_mut().write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        line.clear();
+        stream.read_line(&mut line).await.unwrap();
+        let mutation: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(mutation["command"], "core-restart");
+        let id = mutation["operation_id"].as_str().unwrap();
+        assert_eq!(id.len(), 32);
+        loop {
+            line.clear();
+            assert_ne!(stderr.read_line(&mut line).await.unwrap(), 0);
+            if let Some(printed) = line.trim().strip_prefix("Core restart operation ID ") {
+                assert_eq!(printed, id);
+                break;
+            }
+        }
+        stream.get_mut().write_all(b"{\"ok\":false,\"error\":\"incarnation_mismatch\",\"rejected\":true}\n").await.unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["state"], "rejected");
+        assert_eq!(result["operation_id"], id);
+    }).await;
 }
 
 #[tokio::test]
