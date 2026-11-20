@@ -395,7 +395,7 @@ struct Envelope {
 #[serde(untagged)]
 enum WireRequest {
     Update(Box<DaemonControlEnvelope<UpdateControlRequest>>),
-    Command(StatusRequest),
+    Command(Box<StatusRequest>),
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(reader: R) -> io::Result<Vec<u8>> {
