@@ -3387,8 +3387,15 @@ pub mod control {
                          [[bots.shard_placement]]\nshard_id=1\nprimary='one'\n",
                     )
                     .unwrap();
-                    let dir = std::env::temp_dir()
-                        .join(format!("cr-test-{:016x}", getrandom::u64().unwrap()));
+                    // Diagnostics read status files only from tmpfs (P1), so a fixture with
+                    // diagnostics lives under /dev/shm when that is a tmpfs.
+                    let shm = std::path::Path::new("/dev/shm");
+                    let base = if diagnostics && crate::core_status::is_tmpfs(shm) {
+                        shm.to_path_buf()
+                    } else {
+                        std::env::temp_dir()
+                    };
+                    let dir = base.join(format!("cr-test-{:016x}", getrandom::u64().unwrap()));
                     std::fs::create_dir(&dir).unwrap();
                     let program = dir.join("private-program");
                     let exit = exited_slot.map_or_else(String::new, |slot| {
