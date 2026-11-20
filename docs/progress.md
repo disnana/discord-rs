@@ -674,3 +674,13 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - botd は受理前の拒否を明示し、監査処理後に確定した失敗を操作結果付きで返す。旧 v2 応答に対して照会で受理の有無を確認できない場合は CLI が `unknown` を返す。送信直前に操作 ID を標準エラーへ出し、手動の操作照会にも Core の出力制限を適用した。監査再生での再試行は操作情報を含まない `ok: false` 応答に限定した。引数エラーの JSON 形式は運用手順に明記した。
 - 停滞試験では疑似端末の確認入力を保留し、Core の置換後に同じプレビューを送信して世代不一致の監査と置換 PID を検査する。この試験は CI で `/dev/shm` の tmpfs を必須とする。診断を利用しない試験には通常の一時領域を使い、機密値の検査は現在の試験用 secret の 16 進表現とバイト配列を対象とした。
 - Windows 上で変更した Rust ファイルの rustfmt、差分、UTF-8 を検査。Ubuntu／WSL の Cargo ビルド・テスト、実際の botd 再起動をまたぐ照会、systemd、実 Discord は未検証。
+
+## 2026-11-20 P3（Core の手動復旧）を統合（経過のまとめ）
+- **統合したもの：** `botctl core status` / `botctl core restart`（仮名）と、botd 側の `core-preview` / `core-restart`。対象は incarnation id で固定、`admin` ＋ shard の scope、シャード単位の排他、スロットごとの回数制限（間隔 60 秒・15 分に 3 回）、「最後の稼働中の Core」の確認、要求を先に `core-recovery-audit.jsonl` に記録、botd 自身の `Child` で終了（猶予 5 秒の後に強制終了）。DDR-0008 の方針どおり。
+- **進め方：** Sol（`gpt-6.2-sol`）が実装し、Astra（`gpt-6.2-astra`）が 4 回監査（第 1 回 10 件、第 2 回 10 件、第 3 回 8 件、第 4 回 8 件）。指摘は実コードで確認して修正し、私が WSL で fmt・clippy・試験を検証した。第 4 回に High はなかった。
+- **検証：** WSL で fmt・clippy 問題なし、lib 272、bin 14 と 24、`botd_separate_cores` 16、`shards` 3、`core_attach` 28、`botctl_update_*` 9+6、`tests/botctl` 22。CI は `4f25f23` で Rust CI・systemd smoke とも成功。
+- **観測した不安定さ（原因は未調査）：** `a_core_crash_during_a_gateway_update_leaves_a_working_system` が、全体を回した 1 回だけ時間切れで落ちた（その後の全体 4 回と単独 5 回は通過）。約 1/8 の頻度の可能性。
+- **未検証：** 実 Discord での復旧、botd が実際に落ちる場合、systemd 下の挙動、対話式の確認の実機操作、OS 再起動をまたぐ回数制限の復元の実機。「復旧できる」とは、実機で停滞した Core を復旧して `!count` が続くことを確認するまで書かない。
+- **決定済みの制約（#9）：** P3 が管理するのは Core の直接の子だけ。Core が起こした補助プロセスは管理しない（`docs/known-limitations.md`）。基盤が補助プロセスの起動 API を提供する案（`PDEATHSIG` ＋同一プロセスグループ。botd を子孫の回収役にする案、cgroup の案）は、将来の拡張として未設計。PID の自己申告での登録は、PID の再利用と、Core が任意の PID を指定できる危険のため採らない。
+- **Oracle：** 新版（31ee55e のコード）で放置中（起点 2026-11-17T13:51Z、8 時間で異常なし）。P3 は Oracle にまだ入れていない。
+- **Codex の運用：** 6.2 系（`gpt-6.2-sol`、`gpt-6.2-astra`）を使用。6.2 に Terra はないため 6.1 のまま。Sol の実装は Terra より完成度が高かった。Codex のサンドボックスからは WSL が使えないため、ビルドと試験は私が実行する。
