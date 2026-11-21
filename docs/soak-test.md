@@ -88,3 +88,4 @@ sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --secret-file 
 - **2026-11-16（WSL、実 Discord、新版）**：更新 ×4（うち 1 回は Core を落としながら）、Gateway・Core・botd の `kill -9`、`systemctl stop` を実施し、`!count` 61→79 が連続。詳細は `docs/progress.md`。Oracle での新版の入れ替えと再放置は未実施。
 - **2026-11-17（Oracle、e61d8d4 版、25.0 時間）**：RSS・fd・再起動・世代・警告は OK（Gateway RSS +28 kB/h、fd 増減 0、NRestarts 0）。`closes` 11→24（WATCH、13 件。Resume か否かはこの集計では未確認）。詳細は `docs/progress.md`。
 - **2026-11-17（Oracle、新版 31ee55e、8.0 時間、起点 13:51Z）**：RSS・fd・再起動・世代・警告・`closes` すべて OK（Gateway RSS +16 kB/h、fd 増減 0、NRestarts 0）。`closes` +2 と `resumed` +4 の不一致は未確認。詳細は `docs/progress.md`。
+- **2026-11-21（Oracle、新版、起点 2026-11-17T13:51Z、86 時間）**：OS 再起動（2026-11-17 22:23:45）をはさんで、botd の自動起動を確認（22:23:52 に起動、以後 78 スナップショットが連続）。RSS・fd・worker_unavailable・journal の警告に異常なし。再起動後だけの数値は未取得。詳細は `docs/progress.md`。
